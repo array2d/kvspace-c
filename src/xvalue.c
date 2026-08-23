@@ -25,39 +25,45 @@ static int32_t header_array_len(int32_t ndim, const int32_t *dims) {
     return n;
 }
 
-/* 形状段字节数：标量(ndim=0)=0，数组(ndim≥1)=X_MAX_NDIM×4=32。 */
-static int32_t shape_seg(int32_t ndim) {
-    return ndim == 0 ? 0 : X_MAX_NDIM * 4;
+int32_t kvspaceXvalueHeadLen(const xvalue_head_t *h) {
+    return 1 + h->kindexprlen + 1 + 4 + 4;
 }
 
-int32_t kvspaceXvalueHeadLen(const xvalue_head_t *h) {
-    return 1 + h->kind_len + 1 + 1 + 4 + shape_seg(h->ndim) + 4;
+static int32_t build_kindexpr(char *buf, int32_t cap, const char *kind, int32_t ref,
+                              const int32_t *dims, int32_t ndim) {
+    int32_t o = 0;
+    if (ref == 1) buf[o++] = '*';
+    else if (ref == 2) buf[o++] = '@';
+    if (ndim > 0) {
+        buf[o++] = '[';
+        for (int i = 0; i < ndim; i++) {
+            if (i > 0) buf[o++] = ',';
+            o += snprintf(buf + o, (size_t)(cap - o), "%d", dims[i]);
+        }
+        buf[o++] = ']';
+    }
+    int32_t kl = (int32_t)strlen(kind);
+    memcpy(buf + o, kind, (size_t)kl);
+    return o + kl;
 }
 
 static int32_t encode_head(const char *kind, int32_t ref, int32_t ro, uint32_t vid,
                            const int32_t *dims, int32_t ndim,
                            const uint8_t *raw, int32_t raw_len, uint8_t **out) {
-    int32_t kl = (int32_t)strlen(kind);
-    int32_t seg = shape_seg(ndim);
-    int32_t total = 1 + kl + 1 + 1 + 4 + seg + 4 + raw_len;
+    char kx[256];
+    int32_t kxl = build_kindexpr(kx, (int32_t)sizeof kx, kind, ref, dims, ndim);
+    int32_t slot = kxl + 1;
+    int32_t total = 1 + slot + 1 + 4 + 4 + raw_len;
     uint8_t *buf = (uint8_t *)malloc((size_t)total);
     if (!buf) return -1;
-    buf[0] = (uint8_t)kl;
-    memcpy(buf + 1, kind, (size_t)kl);
-    int32_t o = 1 + kl;
-    buf[o++] = (uint8_t)((ref & 0x03) | (ro ? 0x04 : 0));
-    buf[o++] = (uint8_t)ndim;
-    wr_u32(buf + o, vid); o += 4;
-    for (int i = 0; i < ndim; i++) {
-        wr_u32(buf + o, (uint32_t)dims[i]);
-        o += 4;
-    }
-    /* padding 段（seg - 4*ndim 字节）清零 */
-    if (seg > 4 * ndim) memset(buf + o, 0, (size_t)(seg - 4 * ndim));
-    o += seg - 4 * ndim;
-    wr_u32(buf + o, (uint32_t)raw_len);
-    o += 4;
-    if (raw_len > 0 && raw) memcpy(buf + o, raw, (size_t)raw_len);
+    buf[0] = (uint8_t)slot;
+    memcpy(buf + 1, kx, (size_t)kxl);
+    buf[1 + kxl] = 0; /* NUL（槽内 padding） */
+    int32_t o = 1 + slot;
+    buf[o] = (uint8_t)(ro ? 1 : 0);
+    wr_u32(buf + o + 1, vid);
+    wr_u32(buf + o + 5, (uint32_t)raw_len);
+    if (raw_len > 0 && raw) memcpy(buf + o + 9, raw, (size_t)raw_len);
     *out = buf;
     return total;
 }
@@ -113,24 +119,36 @@ static int32_t encode_al_ptr(const char *kind, const uint8_t *raw, int32_t raw_l
 
 xvalue_head_t kvspaceXvalueDecodeHead(const uint8_t *data, int32_t data_len) {
     xvalue_head_t h = {0};
-    if (!data || data_len < 4) return h;
-    h.kind_len = (int32_t)data[0];
-    int32_t o = 1 + h.kind_len;
-    if (data_len < o + 2 + 4 + 4) return h;
-    h.kind = (const char *)(data + 1);
-    uint8_t mode = data[o];
-    h.ref = mode & 0x03;
-    h.ro = (mode >> 2) & 0x01;
-    h.ndim = data[o + 1];
-    if (h.ndim > X_MAX_NDIM) return h;
-    h.vid = rd_u32(data + o + 2);
-    int32_t seg = shape_seg(h.ndim);
-    if (data_len < o + 6 + seg + 4) return h;
-    for (int i = 0; i < h.ndim; i++) h.dims[i] = (int32_t)rd_u32(data + o + 6 + 4 * i);
-    int32_t raw_off = o + 6 + seg;
-    h.raw_len = (int32_t)rd_u32(data + raw_off);
-    if (data_len < raw_off + 4 + h.raw_len) return h;
-    h.raw = data + raw_off + 4;
+    if (!data || data_len < 1) return h;
+    int32_t slot = (int32_t)data[0];
+    int32_t o = 1 + slot;
+    if (data_len < o + 9) return h;
+    const uint8_t *kx = data + 1;
+    int32_t kxl = 0;
+    while (kxl < slot && kx[kxl] != 0) kxl++;
+    int32_t i = 0;
+    if (kxl > 0 && kx[0] == '*') { h.ref = 1; i = 1; }
+    else if (kxl > 0 && kx[0] == '@') { h.ref = 2; i = 1; }
+    if (i < kxl && kx[i] == '[') {
+        i++;
+        while (i < kxl && kx[i] != ']' && h.ndim < X_MAX_NDIM) {
+            int32_t d = 0;
+            while (i < kxl && kx[i] >= '0' && kx[i] <= '9') { d = d * 10 + (kx[i] - '0'); i++; }
+            h.dims[h.ndim++] = d;
+            if (i < kxl && kx[i] == ',') i++;
+        }
+        if (i < kxl && kx[i] == ']') i++;
+    }
+    h.kind = (const char *)(kx + i);
+    h.kind_len = kxl - i;
+    h.kindexpr = (const char *)kx;
+    h.kindexpr_len = kxl;
+    h.kindexprlen = slot;
+    h.ro = data[o] & 0x01;
+    h.vid = rd_u32(data + o + 1);
+    h.raw_len = (int32_t)rd_u32(data + o + 5);
+    if (data_len < o + 9 + h.raw_len) return h;
+    h.raw = data + o + 9;
     h.array_len = header_array_len(h.ndim, h.dims);
     return h;
 }

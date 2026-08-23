@@ -1,14 +1,11 @@
 /*
  * xvalue.h — XValue 类型系统与 TLV 编解码（对齐 kvspace-durable 的 kindexp TLV）。
  *
- * TLV: [1B kind_len][kind][1B ref|ro][1B ndim][4B vid LE][ndim×4B dims LE][padding][4B raw_len LE][raw]
- *   ref|ro 字节：bit[1:0]=ref（0=内联 1=软链接(Ptr, raw=目标路径) 2=@扩展句柄），bit[2]=ro（1=只读），bit[7:3] 保留
- *   vid: vthread id（LE u32，默认 0）
- *   ndim: 0=标量(单值)，N=N 维数组；ndim 是唯一「是否数组」标志（无独立 arr_flag）
- *   dims: 各维长度（LE u32）
- *   padding: 形状段(dims+padding)恒 X_MAX_NDIM×4=32B（仅 ndim≥1），使 body 偏移与 ndim 无关，
- *            供 xv.reshape 原地改写 dims 不搬 body；ndim=0 标量无形状段(padding=0)
- *   char/* kind 恒为一维序列（ndim=1，含空串/单字符）
+ * TLV: [1B kindexprlen][kindexpr 含 0x00 padding][1B ro][4B vid LE][4B raw_len LE][raw]
+ *   kindexpr 串首字节 * =软链接(Ptr, raw=目标路径) / @ =扩展句柄 / 无 =内联，其后 [d0,d1]kind 承载 ndim+dims：
+ *   裸 kind=标量(ndim=0)、[n]kind=一维、[d0,d1]kind=多维。kindexprlen 为槽总长（含 padding），
+ *   reshape 时新 kindexpr 不超过槽长即可原地改写不搬 body；内容以首个 NUL 终止。
+ *   char/* kind 恒为一维序列（[n]，含空串/单字符）
  * None 编码为 NULL/len=0。
  */
 
@@ -40,6 +37,8 @@
 #define KVSPACE_KIND_EXT_INDEX  "extindex"
 #define KVSPACE_KIND_RWIR       "rwir"
 #define KVSPACE_KIND_RWFUNC     "rwfunc"
+#define KVSPACE_KIND_DEF_RWIR   "defrwir"
+#define KVSPACE_KIND_DEF_RWFUNC "defrwfunc"
 #define KVSPACE_KIND_SCOPE      "scope"
 #define KVSPACE_KIND_TIME       "time"
 #define KVSPACE_KIND_DURATION   "duration"
@@ -47,14 +46,17 @@
 #define X_MAX_NDIM 8
 
 typedef struct {
-    const char    *kind;      /* 非 NUL-terminated，用 kind_len */
+    const char    *kindexpr;     /* kindexpr 内容（data 内，含 ref 前缀与 [dims]，非 NUL 终止） */
+    int32_t        kindexpr_len; /* kindexpr 内容长度（去 padding，扫到 NUL） */
+    int32_t        kindexprlen;  /* wire 槽总长（内容 + NUL + padding） */
+    const char    *kind;         /* 派生：base kind（kindexpr 子串），非 NUL 终止 */
     int32_t        kind_len;
-    int32_t        ref;       /* 0=内联 1=软链接 2=扩展句柄 */
-    int32_t        ro;        /* 1=只读，0=可写 */
-    uint32_t       vid;       /* vthread id（默认 0） */
-    int32_t        ndim;      /* 0=标量，N=N 维数组（唯一「是否数组」标志） */
+    int32_t        ref;          /* 派生：0=内联 1=软链接 2=扩展句柄 */
+    int32_t        ro;           /* 1=只读，0=可写 */
+    uint32_t       vid;          /* vthread id（默认 0） */
+    int32_t        ndim;         /* 派生：0=标量，N=N 维数组 */
     int32_t        dims[X_MAX_NDIM];
-    int32_t        array_len; /* 派生：标量=1，定长=∏dims，变长=raw_len/elem_size */
+    int32_t        array_len;    /* 派生：标量=1，定长=∏dims */
     int32_t        raw_len;
     const uint8_t *raw;
 } xvalue_head_t;
