@@ -832,15 +832,16 @@ static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
   }
 }
 
-/* 解析 extindex body 的 extpath（body = "…extpath\nchild..."）。 */
+/* 解析 extindex body 的 extpath（body = [4B count LE]"…extpath\nchild..."）。 */
 static void decode_ext_path(const uint8_t *raw, int32_t rl, char *out, int osz) {
   out[0] = 0;
-  if (!raw || rl <= 0)
+  if (!raw || rl < 4)
     return;
-  const char *s = (const char *)raw;
+  const char *s = (const char *)raw + 4; /* 跳过 [4B count LE] */
+  rl -= 4;
   int start = 0;
   if (rl >= 3 && (uint8_t)s[0] == 0xE2 && (uint8_t)s[1] == 0x80 && (uint8_t)s[2] == 0xA6)
-    start = 3;
+    start = 3; /* 跳过 EXT_PREFIX "…" */
   int i;
   for (i = start; i < rl && s[i] != '\n'; i++)
     ;
@@ -915,7 +916,11 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve, int32_t *ol)
 
 int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
                 int32_t val_len) {
-  if (!kv || !key || !val || val_len <= 0)
+  if (!kv || !key)
+    return -1;
+  if (val_len <= 0)
+    return kvspaceShmDel(kv, key); /* None（空 value）→ 删 key，对齐 durable 空写 */
+  if (!val)
     return -1;
   char kbuf[1024];
   resolve_path(kv, key, kbuf, sizeof(kbuf)); // always resolve through link
@@ -989,6 +994,48 @@ int kvspaceShmMkindex(kvspace_t *kv, const char *path) {
   return r;
 }
 
+/* 读 dir（目录键）的 objindex/strkeymapindex 成员名（body = [4B count LE]name1\nname2...）。
+ * 命中返回 1 并填充 names/count；非 obj/map 或读失败返回 0（调用方回退 ART scan）。 */
+static int read_index_names(kvspace_t *kv, const char *dir, char ***on, int32_t *oc) {
+  *on = NULL;
+  *oc = 0;
+  art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)dir, (int)strlen(dir));
+  if (!h || !h->has_value)
+    return 0;
+  uint8_t *raw;
+  int32_t rl;
+  if (read_tlv(kv, h->box_offset, &raw, &rl) < 0)
+    return 0;
+  xvalue_head_t hh = kvspaceXvalueDecodeHead(raw, rl);
+  /* 仅 objindex/strkeymapindex（. 成员目录）：marker body 显式存成员名（json writeObj/writeArr）。
+   * index（/ 目录，kv.mkindex）在 shm 后端不自动维护，成员名以 ART scan 为准。 */
+  bool is_obj = hh.kind_len == (int32_t)strlen(KVSPACE_KIND_OBJ) && memcmp(hh.kind, KVSPACE_KIND_OBJ, hh.kind_len) == 0;
+  bool is_map = hh.kind_len == (int32_t)strlen(KVSPACE_KIND_MAP) && memcmp(hh.kind, KVSPACE_KIND_MAP, hh.kind_len) == 0;
+  if (!is_obj && !is_map)
+    return 0;
+  if (hh.raw_len < 4)
+    return 1;
+  const char *s = (const char *)hh.raw + 4;
+  int32_t slen = hh.raw_len - 4;
+  if (slen == 0)
+    return 1;
+  char **names = malloc(sizeof(char *) * 4096);
+  int32_t cnt = 0;
+  int start = 0;
+  for (int i = 0; i <= slen; i++) {
+    if (i == slen || s[i] == '\n') {
+      if (i > start) {
+        names[cnt] = strndup(s + start, (size_t)(i - start));
+        cnt++;
+      }
+      start = i + 1;
+    }
+  }
+  *on = names;
+  *oc = cnt;
+  return 1;
+}
+
 int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
                  char ***on, int32_t *oc) {
   if (!kv || !prefix || !on || !oc)
@@ -1001,6 +1048,9 @@ int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
     resolve_path(kv, prefix, tbuf, sizeof(tbuf));
     pfx = tbuf;
   }
+  /* objindex/strkeymapindex 目录：直接读 marker 成员名（对齐 durable read_dir_index）。 */
+  if (read_index_names(kv, pfx, on, oc))
+    return 0;
   int plen = (int)strlen(pfx);
   char **out = malloc(sizeof(char *) * 4096);
   int32_t n = 0;
