@@ -7,10 +7,6 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 include(GNUInstallDirs)
 
-# 依赖由 ci/deps.sh 下载到 libso/（不再 find_package）
-include_directories("${CMAKE_SOURCE_DIR}/libso/include")
-link_directories("${CMAKE_SOURCE_DIR}/libso/lib")
-
 add_library(kvspace-c SHARED
     src/xvalue.c
     src/kvspace.c
