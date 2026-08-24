@@ -23,14 +23,14 @@ struct KV {
 
     KV(const char *p, size_t sz = 32768) : path(p) {
         ::unlink(p);
-        kv = kvspace_open(p, sz);
+        kv = kvspaceShmOpen(p, sz);
         if (!kv) throw std::runtime_error("open failed");
     }
-    ~KV() { kvspace_close(kv); ::unlink(path.c_str()); }
+    ~KV() { kvspaceShmClose(kv); ::unlink(path.c_str()); }
 
-    void set(const char *key, const uint8_t *val, int32_t len) { kvspace_set(kv, key, val, len); }
+    void set(const char *key, const uint8_t *val, int32_t len) { kvspaceShmSet(kv, key, val, len); }
     bool get(const char *key, std::string &kind, std::string &raw) {
-        int32_t len; uint8_t *v = kvspace_get(kv, key, 1, &len);
+        int32_t len; uint8_t *v = kvspaceShmGet(kv, key, 1, &len);
         if (!v) return false;
         xvalue_head_t h = xvalue_decode_head(v, len);
         kind.assign(h.kind, h.kind_len);
@@ -38,12 +38,12 @@ struct KV {
         free(v);
         return true;
     }
-    void del(const char *key) { kvspace_del(kv, key); }
-    void deltree(const char *p) { kvspace_deltree(kv, p); }
-    void mkindex(const char *p) { kvspace_mkindex(kv, p); }
+    void del(const char *key) { kvspaceShmDel(kv, key); }
+    void deltree(const char *p) { kvspaceShmDeltree(kv, p); }
+    void mkindex(const char *p) { kvspaceShmMkindex(kv, p); }
     std::vector<std::string> list(const char *prefix) {
         char **ns; int32_t nc;
-        kvspace_list(kv, prefix, false, 1, &ns, &nc);
+        kvspaceShmList(kv, prefix, false, 1, &ns, &nc);
         std::vector<std::string> r;
         for (int i = 0; i < nc; i++) r.push_back(ns[i]);
         for (int i = 0; i < nc; i++) free(ns[i]); free(ns);

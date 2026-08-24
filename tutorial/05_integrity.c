@@ -44,7 +44,7 @@ static uint8_t *encode_bytes(const uint8_t *raw, int32_t rl, int32_t *len) {
 }
 
 static bool check(kvspace_t *kv, const char *key, int64_t expected, int round) {
-    int32_t len; uint8_t *v = kvspace_get(kv, key, 1, &len);
+    int32_t len; uint8_t *v = kvspaceShmGet(kv, key, 1, &len);
     if (!v) { printf("ROUND%d MISS  %s\n", round, key); return false; }
     xvalue_head_t h = xvalue_decode_head(v, len);
     if (h.raw_len < 8 || strncmp(h.kind, XK_INT64, h.kind_len) != 0) {
@@ -61,7 +61,7 @@ static bool check(kvspace_t *kv, const char *key, int64_t expected, int round) {
 }
 
 static bool check_str(kvspace_t *kv, const char *key, const char *expected, int round) {
-    int32_t len; uint8_t *v = kvspace_get(kv, key, 1, &len);
+    int32_t len; uint8_t *v = kvspaceShmGet(kv, key, 1, &len);
     if (!v) { printf("ROUND%d MISS  %s\n", round, key); return false; }
     xvalue_head_t h = xvalue_decode_head(v, len);
     if (strncmp(h.kind, XK_STRING, h.kind_len) != 0) {
@@ -79,9 +79,9 @@ int main() {
     const char *path = "/tmp/kvspace_integrity.shm";
     unlink(path);
 
-    kvspace_t *kv = kvspace_open(path, 8ULL * 64 * 64 * 64); // 8*64^3 = 2MB
+    kvspace_t *kv = kvspaceShmOpen(path, 8ULL * 64 * 64 * 64); // 8*64^3 = 2MB
     if (!kv) { printf("FAIL: open\n"); return 1; }
-    kvspace_mkindex(kv, "/it/");
+    kvspaceShmMkindex(kv, "/it/");
 
     srand((unsigned)time(NULL));
     char keys[N_KEYS][64];
@@ -97,7 +97,7 @@ int main() {
         snprintf(keys[i], sizeof(keys[i]), "/it/k%d", i);
         values[i] = ((int64_t)rand() << 32) | (int64_t)rand();
         int32_t len; uint8_t *v = encode_int(values[i], &len);
-        kvspace_set(kv, keys[i], v, len);
+        kvspaceShmSet(kv, keys[i], v, len);
         free(v); n++;
     }
     printf("  wrote %d keys\n", n);
@@ -112,7 +112,7 @@ int main() {
     int del_count = n * 3 / 10;
     for (int i = 0; i < del_count; i++) {
         int idx = rand() % n;
-        if (keys[idx][0]) { kvspace_del(kv, keys[idx]); keys[idx][0] = '\0'; }
+        if (keys[idx][0]) { kvspaceShmDel(kv, keys[idx]); keys[idx][0] = '\0'; }
     }
     // fill holes with new keys
     for (int i = 0; i < del_count; i++) {
@@ -120,7 +120,7 @@ int main() {
         snprintf(keys[idx], sizeof(keys[idx]), "/it/new_k%d", i);
         values[idx] = (int64_t)i * 1000;
         int32_t len; uint8_t *v = encode_int(values[idx], &len);
-        kvspace_set(kv, keys[idx], v, len); free(v);
+        kvspaceShmSet(kv, keys[idx], v, len); free(v);
     }
     n += del_count;
 
@@ -136,7 +136,7 @@ int main() {
         if (!keys[i][0]) continue;
         values[i] = ((int64_t)rand() << 32) | (int64_t)rand();
         int32_t len; uint8_t *v = encode_int(values[i], &len);
-        kvspace_set(kv, keys[i], v, len); free(v);
+        kvspaceShmSet(kv, keys[i], v, len); free(v);
     }
 
     /* ── Round 3: 校验 ── */
@@ -150,7 +150,7 @@ int main() {
         snprintf(keys[str_base + i], sizeof(keys[0]), "/it/s%d", i);
         snprintf(strvals[i], sizeof(strvals[0]), "val_%d_%d", i, rand() % 1000);
         int32_t len; uint8_t *v = encode_str(strvals[i], &len);
-        kvspace_set(kv, keys[str_base + i], v, len); free(v);
+        kvspaceShmSet(kv, keys[str_base + i], v, len); free(v);
     }
 
     /* ── Round 4: 校验 string ── */
@@ -166,22 +166,22 @@ int main() {
         for (int j = 0; j < MAX_VAL_SZ; j++) big_vals[i][j] = (uint8_t)(rand() & 0xFF);
         char k[64]; snprintf(k, sizeof(k), "/it/big%d", i);
         int32_t len; uint8_t *v = encode_bytes(big_vals[i], MAX_VAL_SZ, &len);
-        kvspace_set(kv, k, v, len); free(v);
+        kvspaceShmSet(kv, k, v, len); free(v);
     }
 
     /* ── Round 5: 删除 big values 再写入小值（复用 slot） ── */
     for (int i = 0; i < 10; i++) {
         char k[64]; snprintf(k, sizeof(k), "/it/big%d", i);
-        kvspace_del(kv, k);
+        kvspaceShmDel(kv, k);
         snprintf(k, sizeof(k), "/it/reuse%d", i);
         int32_t len; uint8_t *v = encode_int((int64_t)i, &len);
-        kvspace_set(kv, k, v, len); free(v);
+        kvspaceShmSet(kv, k, v, len); free(v);
     }
 
     /* ── Round 5: 校验大 value 和复用后的小 value ── */
     for (int i = 10; i < 20; i++) {
         char k[64]; snprintf(k, sizeof(k), "/it/big%d", i);
-        int32_t len; uint8_t *v = kvspace_get(kv, k, 1, &len);
+        int32_t len; uint8_t *v = kvspaceShmGet(kv, k, 1, &len);
         if (!v) { printf("ROUND5 MISS  big%d\n", i); errors++; continue; }
         xvalue_head_t h = xvalue_decode_head(v, len);
         if (h.raw_len != MAX_VAL_SZ || memcmp(h.raw, big_vals[i], MAX_VAL_SZ) != 0) {
@@ -197,11 +197,11 @@ int main() {
     /* ── 最终全量扫描 ── */
     printf("=== final: list and verify all ===\n");
     char **ns; int32_t nc;
-    kvspace_list(kv, "/it/", false, 1, &ns, &nc);
+    kvspaceShmList(kv, "/it/", false, 1, &ns, &nc);
     printf("  total children: %d\n", nc);
     for (int i = 0; i < nc; i++) free(ns[i]); free(ns);
 
-    kvspace_close(kv);
+    kvspaceShmClose(kv);
     unlink(path);
 
     if (errors == 0) printf("\nALL OK (0 errors)\n");

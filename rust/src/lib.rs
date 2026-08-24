@@ -17,16 +17,16 @@ use std::ptr;
 mod ffi {
     use super::*;
     extern "C" {
-        pub fn kvspace_open(path: *const c_char, data_size: usize) -> *mut std::ffi::c_void;
-        pub fn kvspace_close(kv: *mut std::ffi::c_void);
-        pub fn kvspace_get(kv: *mut std::ffi::c_void, key: *const c_char, resolve: i32, out_len: *mut i32) -> *const u8;
-        pub fn kvspace_set(kv: *mut std::ffi::c_void, key: *const c_char, val: *const u8, val_len: i32) -> i32;
-        pub fn kvspace_del(kv: *mut std::ffi::c_void, key: *const c_char) -> i32;
-        pub fn kvspace_deltree(kv: *mut std::ffi::c_void, prefix: *const c_char) -> i32;
-        pub fn kvspace_mkindex(kv: *mut std::ffi::c_void, path: *const c_char) -> i32;
-        pub fn kvspace_list(kv: *mut std::ffi::c_void, prefix: *const c_char, expand_ext: bool, resolve: i32, out_names: *mut *mut *const c_char, out_count: *mut i32) -> i32;
-        pub fn kvspace_extindex(kv: *mut std::ffi::c_void, path: *const c_char, extpath: *const c_char) -> i32;
-        pub fn kvspace_delextindex(kv: *mut std::ffi::c_void, path: *const c_char) -> i32;
+        pub fn kvspaceShmOpen(path: *const c_char, data_size: usize) -> *mut std::ffi::c_void;
+        pub fn kvspaceShmClose(kv: *mut std::ffi::c_void);
+        pub fn kvspaceShmGet(kv: *mut std::ffi::c_void, key: *const c_char, resolve: i32, out_len: *mut i32) -> *const u8;
+        pub fn kvspaceShmSet(kv: *mut std::ffi::c_void, key: *const c_char, val: *const u8, val_len: i32) -> i32;
+        pub fn kvspaceShmDel(kv: *mut std::ffi::c_void, key: *const c_char) -> i32;
+        pub fn kvspaceShmDeltree(kv: *mut std::ffi::c_void, prefix: *const c_char) -> i32;
+        pub fn kvspaceShmMkindex(kv: *mut std::ffi::c_void, path: *const c_char) -> i32;
+        pub fn kvspaceShmList(kv: *mut std::ffi::c_void, prefix: *const c_char, expand_ext: bool, resolve: i32, out_names: *mut *mut *const c_char, out_count: *mut i32) -> i32;
+        pub fn kvspaceShmExtindex(kv: *mut std::ffi::c_void, path: *const c_char, extpath: *const c_char) -> i32;
+        pub fn kvspaceShmDelextindex(kv: *mut std::ffi::c_void, path: *const c_char) -> i32;
     }
 }
 
@@ -80,15 +80,15 @@ impl KVSpace {
     pub fn open(path: &str, data_size: usize) -> Result<Self, String> {
         let _ = std::fs::remove_file(path);
         let cpath = CString::new(path).map_err(|e| e.to_string())?;
-        let ptr = unsafe { ffi::kvspace_open(cpath.as_ptr(), data_size) };
-        if ptr.is_null() { return Err("kvspace_open failed".into()); }
+        let ptr = unsafe { ffi::kvspaceShmOpen(cpath.as_ptr(), data_size) };
+        if ptr.is_null() { return Err("kvspaceShmOpen failed".into()); }
         Ok(KVSpace { ptr, path: path.to_string() })
     }
 
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         let ckey = CString::new(key).ok()?;
         let mut len: i32 = 0;
-        let p = unsafe { ffi::kvspace_get(self.ptr, ckey.as_ptr(), 1, &mut len) };
+        let p = unsafe { ffi::kvspaceShmGet(self.ptr, ckey.as_ptr(), 1, &mut len) };
         if p.is_null() || len <= 0 { return None; }
         let slice = unsafe { std::slice::from_raw_parts(p, len as usize) };
         Some(slice.to_vec())
@@ -96,22 +96,22 @@ impl KVSpace {
 
     pub fn set(&self, key: &str, val: &[u8]) {
         let ckey = CString::new(key).unwrap();
-        unsafe { ffi::kvspace_set(self.ptr, ckey.as_ptr(), val.as_ptr(), val.len() as i32); }
+        unsafe { ffi::kvspaceShmSet(self.ptr, ckey.as_ptr(), val.as_ptr(), val.len() as i32); }
     }
 
     pub fn delete(&self, key: &str) {
         let ckey = CString::new(key).unwrap();
-        unsafe { ffi::kvspace_del(self.ptr, ckey.as_ptr()); }
+        unsafe { ffi::kvspaceShmDel(self.ptr, ckey.as_ptr()); }
     }
 
     pub fn deltree(&self, prefix: &str) {
         let cprefix = CString::new(prefix).unwrap();
-        unsafe { ffi::kvspace_deltree(self.ptr, cprefix.as_ptr()); }
+        unsafe { ffi::kvspaceShmDeltree(self.ptr, cprefix.as_ptr()); }
     }
 
     pub fn mkindex(&self, path: &str) {
         let cpath = CString::new(path).unwrap();
-        unsafe { ffi::kvspace_mkindex(self.ptr, cpath.as_ptr()); }
+        unsafe { ffi::kvspaceShmMkindex(self.ptr, cpath.as_ptr()); }
     }
 
     pub fn list(&self, prefix: &str) -> Vec<String> {
@@ -119,7 +119,7 @@ impl KVSpace {
         let mut out: *mut *const c_char = ptr::null_mut();
         let mut count: i32 = 0;
         unsafe {
-            ffi::kvspace_list(self.ptr, cprefix.as_ptr(), false, 1, &mut out, &mut count);
+            ffi::kvspaceShmList(self.ptr, cprefix.as_ptr(), false, 1, &mut out, &mut count);
         }
         if count <= 0 || out.is_null() { return vec![]; }
         let ptrs = unsafe { std::slice::from_raw_parts(out, count as usize) };
@@ -132,13 +132,13 @@ impl KVSpace {
     pub fn extindex(&self, path: &str, extpath: &str) {
         let cp = CString::new(path).unwrap();
         let ce = CString::new(extpath).unwrap();
-        unsafe { ffi::kvspace_extindex(self.ptr, cp.as_ptr(), ce.as_ptr()); }
+        unsafe { ffi::kvspaceShmExtindex(self.ptr, cp.as_ptr(), ce.as_ptr()); }
     }
 }
 
 impl Drop for KVSpace {
     fn drop(&mut self) {
-        unsafe { ffi::kvspace_close(self.ptr); }
+        unsafe { ffi::kvspaceShmClose(self.ptr); }
         let _ = std::fs::remove_file(&self.path);
     }
 }

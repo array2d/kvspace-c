@@ -17,19 +17,19 @@ def _bind(fn, argtypes, restype):
     fn.restype = restype
 
 
-_bind(_lib.kvspace_open, [ctypes.c_char_p, ctypes.c_size_t], ctypes.c_void_p)
-_bind(_lib.kvspace_close, [ctypes.c_void_p], None)
-_bind(_lib.kvspace_get, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int32)], ctypes.POINTER(ctypes.c_uint8))
-_bind(_lib.kvspace_set, [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_int32], ctypes.c_int)
-_bind(_lib.kvspace_del, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
-_bind(_lib.kvspace_deltree, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
-_bind(_lib.kvspace_mkindex, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
-_bind(_lib.kvspace_list, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_bool, ctypes.c_int,
+_bind(_lib.kvspaceShmOpen, [ctypes.c_char_p, ctypes.c_size_t], ctypes.c_void_p)
+_bind(_lib.kvspaceShmClose, [ctypes.c_void_p], None)
+_bind(_lib.kvspaceShmGet, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int32)], ctypes.POINTER(ctypes.c_uint8))
+_bind(_lib.kvspaceShmSet, [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_int32], ctypes.c_int)
+_bind(_lib.kvspaceShmDel, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
+_bind(_lib.kvspaceShmDeltree, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
+_bind(_lib.kvspaceShmMkindex, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
+_bind(_lib.kvspaceShmList, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_bool, ctypes.c_int,
                            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_int32)], ctypes.c_int)
-_bind(_lib.kvspace_extindex, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p], ctypes.c_int)
-_bind(_lib.kvspace_delextindex, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
-_bind(_lib.kvspace_notify, [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_int32], ctypes.c_int)
-_bind(_lib.kvspace_watch, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32)], ctypes.POINTER(ctypes.c_uint8))
+_bind(_lib.kvspaceShmExtindex, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p], ctypes.c_int)
+_bind(_lib.kvspaceShmDelextindex, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
+_bind(_lib.kvspaceShmNotify, [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_int32], ctypes.c_int)
+_bind(_lib.kvspaceShmWatch, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32)], ctypes.POINTER(ctypes.c_uint8))
 
 
 # ── XValue TLV helpers ──────────────────────────────────────────
@@ -85,12 +85,12 @@ class KVSpace:
         except FileNotFoundError:
             pass
         self._path = path
-        self._kv = _lib.kvspace_open(path.encode(), data_size)
+        self._kv = _lib.kvspaceShmOpen(path.encode(), data_size)
         if not self._kv:
-            raise RuntimeError(f"kvspace_open({path}) failed")
+            raise RuntimeError(f"kvspaceShmOpen({path}) failed")
 
     def close(self):
-        _lib.kvspace_close(self._kv)
+        _lib.kvspaceShmClose(self._kv)
         try:
             os.unlink(self._path)
         except FileNotFoundError:
@@ -106,29 +106,29 @@ class KVSpace:
 
     def get(self, key: str, resolve: bool = True) -> Optional[bytes]:
         ol = ctypes.c_int32(0)
-        p = _lib.kvspace_get(self._kv, key.encode(), 1 if resolve else 0, ctypes.byref(ol))
+        p = _lib.kvspaceShmGet(self._kv, key.encode(), 1 if resolve else 0, ctypes.byref(ol))
         return ctypes.string_at(p, ol.value) if p and ol.value else None
 
     def set(self, key: str, val: bytes):
-        _lib.kvspace_set(self._kv, key.encode(),
+        _lib.kvspaceShmSet(self._kv, key.encode(),
                          ctypes.cast(ctypes.c_char_p(val), ctypes.POINTER(ctypes.c_uint8)),
                          len(val))
 
     def delete(self, key: str):
-        _lib.kvspace_del(self._kv, key.encode())
+        _lib.kvspaceShmDel(self._kv, key.encode())
 
     def deltree(self, prefix: str):
-        _lib.kvspace_deltree(self._kv, prefix.encode())
+        _lib.kvspaceShmDeltree(self._kv, prefix.encode())
 
     # ── Directory ────────────────────────────────────────────
 
     def mkindex(self, path: str):
-        _lib.kvspace_mkindex(self._kv, path.encode())
+        _lib.kvspaceShmMkindex(self._kv, path.encode())
 
     def list(self, prefix: str, resolve: bool = True) -> list[str]:
         out = ctypes.c_void_p()
         oc = ctypes.c_int32(0)
-        _lib.kvspace_list(self._kv, prefix.encode(), False, 1 if resolve else 0, ctypes.byref(out), ctypes.byref(oc))
+        _lib.kvspaceShmList(self._kv, prefix.encode(), False, 1 if resolve else 0, ctypes.byref(out), ctypes.byref(oc))
         if oc.value == 0:
             return []
         ptrs = ctypes.cast(out, ctypes.POINTER(ctypes.c_char_p))
@@ -137,7 +137,7 @@ class KVSpace:
     # ── Link / ExtIndex ──────────────────────────────────────
 
     def extindex(self, path: str, extpath: str):
-        _lib.kvspace_extindex(self._kv, path.encode(), extpath.encode())
+        _lib.kvspaceShmExtindex(self._kv, path.encode(), extpath.encode())
 
     def delextindex(self, path: str):
-        _lib.kvspace_delextindex(self._kv, path.encode())
+        _lib.kvspaceShmDelextindex(self._kv, path.encode())

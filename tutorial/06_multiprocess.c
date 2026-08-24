@@ -36,14 +36,14 @@ static uint8_t *enc_bytes(const uint8_t *raw, int32_t rl, int32_t *l) {
 static int writer(kvspace_t *kv, int64_t seed) {
     srand((unsigned)seed);
     int errors = 0;
-    kvspace_mkindex(kv, "/mp/");
+    kvspaceShmMkindex(kv, "/mp/");
 
     printf("[writer] round 1: write %d ints\n", N_KEYS);
     for (int i = 0; i < N_KEYS; i++) {
         char k[64]; snprintf(k, sizeof(k), "/mp/k%d", i);
         int64_t v = ((int64_t)rand() << 32) | rand();
         int32_t l; uint8_t *b = enc_int(v, &l);
-        if (kvspace_set(kv, k, b, l) != 0) { printf("[writer] FAIL set %s\n", k); errors++; }
+        if (kvspaceShmSet(kv, k, b, l) != 0) { printf("[writer] FAIL set %s\n", k); errors++; }
         free(b);
     }
 
@@ -52,13 +52,13 @@ static int writer(kvspace_t *kv, int64_t seed) {
     for (int i = 0; i < del_n; i++) {
         int idx = rand() % N_KEYS;
         char k[64]; snprintf(k, sizeof(k), "/mp/k%d", idx);
-        kvspace_del(kv, k);
+        kvspaceShmDel(kv, k);
     }
     for (int i = 0; i < 100; i++) {
         char k[64], s[64]; snprintf(k, sizeof(k), "/mp/s%d", i);
         snprintf(s, sizeof(s), "str_val_%d_%d", i, rand() % 1000);
         int32_t l; uint8_t *b = enc_str(s, &l);
-        if (kvspace_set(kv, k, b, l) != 0) { printf("[writer] FAIL set %s\n", k); errors++; }
+        if (kvspaceShmSet(kv, k, b, l) != 0) { printf("[writer] FAIL set %s\n", k); errors++; }
         free(b);
     }
 
@@ -68,18 +68,18 @@ static int writer(kvspace_t *kv, int64_t seed) {
     for (int i = 0; i < 20; i++) {
         char k[64]; snprintf(k, sizeof(k), "/mp/big%d", i);
         int32_t l; uint8_t *b = enc_bytes(big, 1024, &l);
-        kvspace_set(kv, k, b, l); free(b);
+        kvspaceShmSet(kv, k, b, l); free(b);
     }
     // write some additional ints (not updates)
     for (int j = 0; j < 50; j++) {
         char k[64]; snprintf(k, sizeof(k), "/mp/extra%d", j);
         int64_t v = ((int64_t)rand() << 32) | rand();
         int32_t l; uint8_t *b = enc_int(v, &l);
-        kvspace_set(kv, k, b, l); free(b);
+        kvspaceShmSet(kv, k, b, l); free(b);
     }
 
     printf("[writer] done, errors=%d\n", errors);
-    kvspace_close(kv);
+    kvspaceShmClose(kv);
     return errors;
 }
 
@@ -89,7 +89,7 @@ static int reader(kvspace_t *kv, int64_t seed) {
 
     printf("[reader] listing /mp/\n");
     char **ns; int32_t nc;
-    kvspace_list(kv, "/mp/", false, 1, &ns, &nc);
+    kvspaceShmList(kv, "/mp/", false, 1, &ns, &nc);
     printf("[reader]   total children: %d\n", nc);
 
     // verify some ints
@@ -99,7 +99,7 @@ static int reader(kvspace_t *kv, int64_t seed) {
     for (int i = 0; i < N_KEYS; i++) {
         char k[64]; snprintf(k, sizeof(k), "/mp/k%d", i);
         int64_t expected = ((int64_t)rand() << 32) | rand();
-        int32_t l; uint8_t *v = kvspace_get(kv, k, 1, &l);
+        int32_t l; uint8_t *v = kvspaceShmGet(kv, k, 1, &l);
         if (v) {
             xvalue_head_t h = xvalue_decode_head(v, l);
             if (h.raw_len >= 8 && strncmp(h.kind, XK_INT64, h.kind_len) == 0) {
@@ -119,7 +119,7 @@ static int reader(kvspace_t *kv, int64_t seed) {
     printf("[reader] verifying strings...\n");
     for (int i = 0; i < 100; i++) {
         char k[64]; snprintf(k, sizeof(k), "/mp/s%d", i);
-        int32_t l; uint8_t *v = kvspace_get(kv, k, 1, &l);
+        int32_t l; uint8_t *v = kvspaceShmGet(kv, k, 1, &l);
         if (!v) continue; // may have been overwritten
         xvalue_head_t h = xvalue_decode_head(v, l);
         if (strncmp(h.kind, XK_STRING, h.kind_len) != 0) {
@@ -134,7 +134,7 @@ static int reader(kvspace_t *kv, int64_t seed) {
     int big_ok = 0;
     for (int i = 0; i < 20; i++) {
         char k[64]; snprintf(k, sizeof(k), "/mp/big%d", i);
-        int32_t l; uint8_t *v = kvspace_get(kv, k, 1, &l);
+        int32_t l; uint8_t *v = kvspaceShmGet(kv, k, 1, &l);
         if (v) {
             xvalue_head_t h = xvalue_decode_head(v, l);
             if (h.raw_len == 1024) big_ok++;
@@ -143,7 +143,7 @@ static int reader(kvspace_t *kv, int64_t seed) {
     }
     printf("[reader]   big values found: %d/20\n", big_ok);
 
-    kvspace_close(kv);
+    kvspaceShmClose(kv);
     printf("[reader] done, errors=%d\n", errors);
     return errors;
 }
@@ -156,13 +156,13 @@ int main(int argc, char **argv) {
     unlink(path);
 
     printf("=== phase 1: writer ===\n");
-    kvspace_t *kv = kvspace_open(path, sz);
+    kvspace_t *kv = kvspaceShmOpen(path, sz);
     if (!kv) { printf("FAIL: writer open\n"); return 1; }
     int we = writer(kv, seed);
     // kv is already closed by writer
 
     printf("=== phase 2: reader (same SHM) ===\n");
-    kv = kvspace_open(path, sz);
+    kv = kvspaceShmOpen(path, sz);
     if (!kv) { printf("FAIL: reader open\n"); return 1; }
     int re = reader(kv, seed);
 
