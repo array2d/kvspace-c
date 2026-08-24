@@ -17,20 +17,27 @@ extern "C" {
 }
 
 fn xv_int(v: i64) -> Vec<u8> {
-    let kind = b"int64"; let kl = 5u8; let al = 1u32; let rl = 8u32;
-    let mut buf = vec![kl];
+    let kind = b"int64"; let slot = (kind.len() + 1) as u8;
+    let mut buf = vec![slot];
     buf.extend_from_slice(kind);
-    buf.extend_from_slice(&al.to_le_bytes());
-    buf.extend_from_slice(&rl.to_le_bytes());
+    buf.push(0);                                  // NUL pad
+    buf.push(0);                                  // ro
+    buf.extend_from_slice(&0u32.to_le_bytes());   // vid
+    buf.extend_from_slice(&8u32.to_le_bytes());   // raw_len
     buf.extend_from_slice(&v.to_le_bytes());
     buf
 }
 
 fn xv_str(s: &str) -> Vec<u8> {
-    let kind = b"string"; let b = s.as_bytes(); let kl = 6u8; let al = 1u32;
-    let mut buf = vec![kl];
-    buf.extend_from_slice(kind);
-    buf.extend_from_slice(&al.to_le_bytes());
+    let b = s.as_bytes();
+    let kx = format!("[{}]char/utf8", b.len());
+    let kb = kx.as_bytes();
+    let slot = (kb.len() + 1) as u8;
+    let mut buf = vec![slot];
+    buf.extend_from_slice(kb);
+    buf.push(0);
+    buf.push(0);
+    buf.extend_from_slice(&0u32.to_le_bytes());
     buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
     buf.extend_from_slice(b);
     buf
@@ -86,9 +93,11 @@ fn main() {
     kv.set("/rs/b", &xv_str("hello"));
 
     let v = kv.get("/rs/a").unwrap();
-    let kl = v[0] as usize;
-    let kind = std::str::from_utf8(&v[1..1+kl]).unwrap();
-    let raw = &v[1+kl+8..];
+    let slot = v[0] as usize;
+    let kx = &v[1..1 + slot];
+    let klen = kx.iter().position(|&b| b == 0).unwrap_or(kx.len());
+    let kind = std::str::from_utf8(&kx[..klen]).unwrap();
+    let raw = &v[1 + slot + 9..];
     let mut arr = [0u8; 8]; arr.copy_from_slice(&raw[..8]);
     let val = i64::from_le_bytes(arr);
     println!("/rs/a  kind={kind}  val={val}");

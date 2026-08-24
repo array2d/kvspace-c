@@ -37,7 +37,6 @@ static void get(kvspace_t *kv, const char *key) {
         else if (strncmp(h.kind, KVSPACE_KIND_FLOAT64, h.kind_len) == 0) printf("%.2f", kvspaceXvalueAtFloat64(&h, 0));
     }
     printf("\n");
-    free(v);
 }
 
 static void set_int(kvspace_t *kv, const char *key, int64_t v) {
@@ -60,7 +59,7 @@ static void list(kvspace_t *kv, const char *dir, bool show_kind) {
                 printf("%s\t%.*s", ns[i], h.kind_len, h.kind);
                 if (h.raw_len > 0 && strncmp(h.kind, KVSPACE_KIND_INT64, h.kind_len) == 0)
                     printf("\t%ld", kvspaceXvalueAtInt64(&h, 0));
-                printf("\n"); free(v);
+                printf("\n");
             }
         } else {
             printf("%s\n", ns[i]);

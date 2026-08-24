@@ -16,21 +16,13 @@
 #define N_ROUND 3
 
 static uint8_t *enc_int(int64_t v, int32_t *l) {
-    uint8_t *b = malloc(22); b[0] = 5; memcpy(b+1, "int64", 5);
-    int32_t a = 1, r = 8; memcpy(b+6, &a, 4); memcpy(b+10, &r, 4);
-    memcpy(b+14, &v, 8); *l = 22; return b;
+    uint8_t *b; *l = kvspaceXvalueNewInt641(v, &b); return b;
 }
 static uint8_t *enc_str(const char *s, int32_t *l) {
-    int32_t sl = strlen(s), t = 15 + sl; uint8_t *b = malloc(t);
-    b[0] = 6; memcpy(b+1, "string", 6);
-    int32_t a = 1; memcpy(b+7, &a, 4); memcpy(b+11, &sl, 4);
-    memcpy(b+15, s, sl); *l = t; return b;
+    uint8_t *b; *l = kvspaceXvalueNewCharUtf8(s, &b); return b;
 }
 static uint8_t *enc_bytes(const uint8_t *raw, int32_t rl, int32_t *l) {
-    int32_t t = 14 + rl; uint8_t *b = malloc(t);
-    b[0] = 5; memcpy(b+1, "bytes", 5);
-    int32_t a = 1; memcpy(b+6, &a, 4); memcpy(b+10, &rl, 4);
-    memcpy(b+14, raw, rl); *l = t; return b;
+    uint8_t *b; *l = kvspaceXvalueNewUint8(raw, rl, &b); return b;
 }
 
 static int writer(kvspace_t *kv, int64_t seed) {
@@ -109,7 +101,7 @@ static int reader(kvspace_t *kv, int64_t seed) {
                     errors++;
                 }
             }
-            free(v); checked++;
+            checked++;
         }
         // key may have been deleted in round 2 — that's fine
     }
@@ -122,10 +114,9 @@ static int reader(kvspace_t *kv, int64_t seed) {
         int32_t l; uint8_t *v = kvspaceShmGet(kv, k, 1, &l);
         if (!v) continue; // may have been overwritten
         xvalue_head_t h = kvspaceXvalueDecodeHead(v, l);
-        if (strncmp(h.kind, KVSPACE_KIND_CHAR, h.kind_len) != 0) {
+        if (strncmp(h.kind, KVSPACE_KIND_CHAR_UTF8, h.kind_len) != 0) {
             printf("[reader] BADKIND %s: %.*s\n", k, h.kind_len, h.kind); errors++;
         }
-        free(v);
     }
     printf("[reader]   string check done\n");
 
@@ -138,7 +129,6 @@ static int reader(kvspace_t *kv, int64_t seed) {
         if (v) {
             xvalue_head_t h = kvspaceXvalueDecodeHead(v, l);
             if (h.raw_len == 1024) big_ok++;
-            free(v);
         }
     }
     printf("[reader]   big values found: %d/20\n", big_ok);

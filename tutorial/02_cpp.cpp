@@ -35,7 +35,6 @@ struct KV {
         xvalue_head_t h = kvspaceXvalueDecodeHead(v, len);
         kind.assign(h.kind, h.kind_len);
         raw.assign((const char *)h.raw, h.raw_len);
-        free(v);
         return true;
     }
     void del(const char *key) { kvspaceShmDel(kv, key); }
@@ -52,34 +51,26 @@ struct KV {
 };
 
 int main() {
-    // xvalue encode (manual TLV)
-    auto xv_int = [](int64_t v) -> std::pair<std::vector<uint8_t>, int32_t> {
-        const char *k = "int64"; int32_t kl = 5;
-        std::vector<uint8_t> buf(1+kl+8+8);
-        buf[0] = kl; memcpy(&buf[1], k, kl);
-        int32_t al=1, rl=8;
-        memcpy(&buf[1+kl], &al, 4); memcpy(&buf[1+kl+4], &rl, 4);
-        memcpy(&buf[1+kl+8], &v, 8);
-        return {buf, (int32_t)buf.size()};
+    // xvalue encode（用库构造函数，非手工 TLV）
+    auto xv_int = [](int64_t v) {
+        uint8_t *b; int32_t n = kvspaceXvalueNewInt64(&v, 1, &b);
+        return std::pair<uint8_t *, int32_t>{b, n};
     };
-    auto xv_str = [](const char *s) -> std::pair<std::vector<uint8_t>, int32_t> {
-        int32_t sl = strlen(s), kl = 6;
-        std::vector<uint8_t> buf(1+kl+8+sl);
-        buf[0] = kl; memcpy(&buf[1], "string", kl);
-        int32_t al=1;
-        memcpy(&buf[1+kl], &al, 4); memcpy(&buf[1+kl+4], &sl, 4);
-        memcpy(&buf[1+kl+8], s, sl);
-        return {buf, (int32_t)buf.size()};
+    auto xv_str = [](const char *s) {
+        uint8_t *b; int32_t n = kvspaceXvalueNewCharUtf8(s, &b);
+        return std::pair<uint8_t *, int32_t>{b, n};
     };
 
     KV kv("/tmp/kvspace_cpp.shm");
     kv.mkindex("/cpp/");
 
     auto [vi, li] = xv_int(42);
-    kv.set("/cpp/a", vi.data(), li);
+    kv.set("/cpp/a", vi, li);
+    free(vi);
 
     auto [vs, ls] = xv_str("hello");
-    kv.set("/cpp/b", vs.data(), ls);
+    kv.set("/cpp/b", vs, ls);
+    free(vs);
 
     std::string kind, raw;
     if (kv.get("/cpp/a", kind, raw)) {

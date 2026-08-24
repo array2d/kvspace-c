@@ -34,20 +34,33 @@ _bind(_lib.kvspaceShmWatch, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, c
 
 # ── XValue TLV helpers ──────────────────────────────────────────
 
-def _xv_encode(kind: str, raw: bytes, al: int = 1) -> bytes:
-    kl = len(kind)
-    return struct.pack(f"<B{kl}sii{len(raw)}s", kl, kind.encode(), al, len(raw), raw)
+def _xv_encode(kind: str, raw: bytes, dims: tuple = (), ref: int = 0, ro: int = 0, vid: int = 0) -> bytes:
+    kx = ("*" if ref == 1 else "@" if ref == 2 else "") + ("[" + ",".join(map(str, dims)) + "]" if dims else "") + kind
+    kb = kx.encode()
+    return struct.pack(f"<B{len(kb)}sxBII", len(kb) + 1, kb, ro, vid, len(raw)) + raw
 
 
 def _xv_decode(data: Optional[bytes]) -> tuple[str, int, bytes]:
     if not data:
         return ("", 0, b"")
-    kl = data[0]
-    off = 1 + kl
-    al = struct.unpack_from("<i", data, off)[0]
-    rl = struct.unpack_from("<i", data, off + 4)[0]
-    raw = data[1 + kl + 8 : 1 + kl + 8 + rl]
-    return (data[1:1 + kl].decode(), al, raw)
+    slot = data[0]
+    kx = data[1:1 + slot].split(b"\x00", 1)[0].decode()
+    o = 1 + slot
+    rl = struct.unpack_from("<I", data, o + 5)[0]
+    raw = data[o + 9 : o + 9 + rl]
+    if kx.startswith("*"):
+        kx = kx[1:]
+    elif kx.startswith("@"):
+        kx = kx[1:]
+    dims = []
+    if kx.startswith("["):
+        end = kx.index("]")
+        dims = [int(d) for d in kx[1:end].split(",")]
+        kx = kx[end + 1:]
+    al = 1
+    for d in dims:
+        al *= d
+    return (kx, al, raw)
 
 
 def xv_int(v: int) -> bytes:
@@ -60,20 +73,19 @@ def xv_float(v: float) -> bytes:
 
 def xv_str(s: str) -> bytes:
     b = s.encode()
-    return _xv_encode("string", b, al=len(b))
+    return _xv_encode("char/utf8", b, dims=(len(b),))
 
 
 def xv_index() -> bytes:
-    return _xv_encode("index", b"")
+    return _xv_encode("index", struct.pack("<I", 0))
 
 
 def xv_link(target: str) -> bytes:
-    return _xv_encode("linkindex", target.encode())
+    return _xv_encode("index", target.encode(), ref=1)
 
 
 def xv_ext(extpath: str) -> bytes:
-    raw = ("…" + extpath).encode()
-    return _xv_encode("extindex", raw)
+    return _xv_encode("extindex", struct.pack("<I", 0) + ("…" + extpath).encode())
 
 
 # ── KVSpace ─────────────────────────────────────────────────────

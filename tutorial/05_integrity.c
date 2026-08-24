@@ -15,32 +15,15 @@
 #define MAX_VAL_SZ  1024
 
 static uint8_t *encode_int(int64_t v, int32_t *len) {
-    return (uint8_t *)memcpy(malloc(22), (uint8_t[]){
-        5,'i','n','t','6','4', 1,0,0,0, 8,0,0,0,
-        (uint8_t)(v),(uint8_t)(v>>8),(uint8_t)(v>>16),(uint8_t)(v>>24),
-        (uint8_t)(v>>32),(uint8_t)(v>>40),(uint8_t)(v>>48),(uint8_t)(v>>56)
-    }, *len = 22);
+    uint8_t *b; *len = kvspaceXvalueNewInt641(v, &b); return b;
 }
 
 static uint8_t *encode_str(const char *s, int32_t *len) {
-    int32_t sl = (int32_t)strlen(s);
-    int32_t total = 1 + 6 + 8 + sl;
-    uint8_t *b = malloc(total);
-    b[0] = 6; memcpy(b+1, "string", 6);
-    int32_t al=1; memcpy(b+7, &al, 4); memcpy(b+11, &sl, 4);
-    memcpy(b+15, s, sl);
-    *len = total;
-    return b;
+    uint8_t *b; *len = kvspaceXvalueNewCharUtf8(s, &b); return b;
 }
 
 static uint8_t *encode_bytes(const uint8_t *raw, int32_t rl, int32_t *len) {
-    int32_t total = 1 + 5 + 8 + rl;
-    uint8_t *b = malloc(total);
-    b[0] = 5; memcpy(b+1, "bytes", 5);
-    int32_t al=1; memcpy(b+6, &al, 4); memcpy(b+10, &rl, 4);
-    memcpy(b+14, raw, rl);
-    *len = total;
-    return b;
+    uint8_t *b; *len = kvspaceXvalueNewUint8(raw, rl, &b); return b;
 }
 
 static bool check(kvspace_t *kv, const char *key, int64_t expected, int round) {
@@ -49,14 +32,13 @@ static bool check(kvspace_t *kv, const char *key, int64_t expected, int round) {
     xvalue_head_t h = kvspaceXvalueDecodeHead(v, len);
     if (h.raw_len < 8 || strncmp(h.kind, KVSPACE_KIND_INT64, h.kind_len) != 0) {
         printf("ROUND%d CORRUPT %s: bad kind=%.*s raw_len=%d\n", round, key, h.kind_len, h.kind, h.raw_len);
-        free(v); return false;
+        return false;
     }
     int64_t got = kvspaceXvalueAtInt64(&h, 0);
     if (got != expected) {
         printf("ROUND%d MISMATCH %s: got=%ld expected=%ld\n", round, key, got, expected);
-        free(v); return false;
+        return false;
     }
-    free(v);
     return true;
 }
 
@@ -64,14 +46,13 @@ static bool check_str(kvspace_t *kv, const char *key, const char *expected, int 
     int32_t len; uint8_t *v = kvspaceShmGet(kv, key, 1, &len);
     if (!v) { printf("ROUND%d MISS  %s\n", round, key); return false; }
     xvalue_head_t h = kvspaceXvalueDecodeHead(v, len);
-    if (strncmp(h.kind, KVSPACE_KIND_CHAR, h.kind_len) != 0) {
-        printf("ROUND%d CORRUPT %s: bad kind\n", round, key); free(v); return false;
+    if (strncmp(h.kind, KVSPACE_KIND_CHAR_UTF8, h.kind_len) != 0) {
+        printf("ROUND%d CORRUPT %s: bad kind\n", round, key); return false;
     }
     if (h.raw_len != (int32_t)strlen(expected) || memcmp(h.raw, expected, h.raw_len) != 0) {
         printf("ROUND%d MISMATCH %s: got=%.*s expected=%s\n", round, key, h.raw_len, h.raw, expected);
-        free(v); return false;
+        return false;
     }
-    free(v);
     return true;
 }
 
@@ -187,7 +168,6 @@ int main() {
         if (h.raw_len != MAX_VAL_SZ || memcmp(h.raw, big_vals[i], MAX_VAL_SZ) != 0) {
             printf("ROUND5 CORRUPT big%d\n", i); errors++;
         }
-        free(v);
     }
     for (int i = 0; i < 10; i++) {
         char k[64]; snprintf(k, sizeof(k), "/it/reuse%d", i);
