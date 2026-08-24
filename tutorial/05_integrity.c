@@ -46,12 +46,12 @@ static uint8_t *encode_bytes(const uint8_t *raw, int32_t rl, int32_t *len) {
 static bool check(kvspace_t *kv, const char *key, int64_t expected, int round) {
     int32_t len; uint8_t *v = kvspaceShmGet(kv, key, 1, &len);
     if (!v) { printf("ROUND%d MISS  %s\n", round, key); return false; }
-    xvalue_head_t h = xvalue_decode_head(v, len);
-    if (h.raw_len < 8 || strncmp(h.kind, XK_INT64, h.kind_len) != 0) {
+    xvalue_head_t h = kvspaceXvalueDecodeHead(v, len);
+    if (h.raw_len < 8 || strncmp(h.kind, KVSPACE_KIND_INT64, h.kind_len) != 0) {
         printf("ROUND%d CORRUPT %s: bad kind=%.*s raw_len=%d\n", round, key, h.kind_len, h.kind, h.raw_len);
         free(v); return false;
     }
-    int64_t got = xvalue_at_int64(&h, 0);
+    int64_t got = kvspaceXvalueAtInt64(&h, 0);
     if (got != expected) {
         printf("ROUND%d MISMATCH %s: got=%ld expected=%ld\n", round, key, got, expected);
         free(v); return false;
@@ -63,8 +63,8 @@ static bool check(kvspace_t *kv, const char *key, int64_t expected, int round) {
 static bool check_str(kvspace_t *kv, const char *key, const char *expected, int round) {
     int32_t len; uint8_t *v = kvspaceShmGet(kv, key, 1, &len);
     if (!v) { printf("ROUND%d MISS  %s\n", round, key); return false; }
-    xvalue_head_t h = xvalue_decode_head(v, len);
-    if (strncmp(h.kind, XK_STRING, h.kind_len) != 0) {
+    xvalue_head_t h = kvspaceXvalueDecodeHead(v, len);
+    if (strncmp(h.kind, KVSPACE_KIND_CHAR, h.kind_len) != 0) {
         printf("ROUND%d CORRUPT %s: bad kind\n", round, key); free(v); return false;
     }
     if (h.raw_len != (int32_t)strlen(expected) || memcmp(h.raw, expected, h.raw_len) != 0) {
@@ -183,7 +183,7 @@ int main() {
         char k[64]; snprintf(k, sizeof(k), "/it/big%d", i);
         int32_t len; uint8_t *v = kvspaceShmGet(kv, k, 1, &len);
         if (!v) { printf("ROUND5 MISS  big%d\n", i); errors++; continue; }
-        xvalue_head_t h = xvalue_decode_head(v, len);
+        xvalue_head_t h = kvspaceXvalueDecodeHead(v, len);
         if (h.raw_len != MAX_VAL_SZ || memcmp(h.raw, big_vals[i], MAX_VAL_SZ) != 0) {
             printf("ROUND5 CORRUPT big%d\n", i); errors++;
         }

@@ -32,7 +32,7 @@ struct KV {
     bool get(const char *key, std::string &kind, std::string &raw) {
         int32_t len; uint8_t *v = kvspaceShmGet(kv, key, 1, &len);
         if (!v) return false;
-        xvalue_head_t h = xvalue_decode_head(v, len);
+        xvalue_head_t h = kvspaceXvalueDecodeHead(v, len);
         kind.assign(h.kind, h.kind_len);
         raw.assign((const char *)h.raw, h.raw_len);
         free(v);

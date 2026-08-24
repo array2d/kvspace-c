@@ -101,9 +101,9 @@ static int reader(kvspace_t *kv, int64_t seed) {
         int64_t expected = ((int64_t)rand() << 32) | rand();
         int32_t l; uint8_t *v = kvspaceShmGet(kv, k, 1, &l);
         if (v) {
-            xvalue_head_t h = xvalue_decode_head(v, l);
-            if (h.raw_len >= 8 && strncmp(h.kind, XK_INT64, h.kind_len) == 0) {
-                int64_t got = xvalue_at_int64(&h, 0);
+            xvalue_head_t h = kvspaceXvalueDecodeHead(v, l);
+            if (h.raw_len >= 8 && strncmp(h.kind, KVSPACE_KIND_INT64, h.kind_len) == 0) {
+                int64_t got = kvspaceXvalueAtInt64(&h, 0);
                 if (got != expected) {
                     printf("[reader] MISMATCH %s: got=%ld expected=%ld\n", k, got, expected);
                     errors++;
@@ -121,8 +121,8 @@ static int reader(kvspace_t *kv, int64_t seed) {
         char k[64]; snprintf(k, sizeof(k), "/mp/s%d", i);
         int32_t l; uint8_t *v = kvspaceShmGet(kv, k, 1, &l);
         if (!v) continue; // may have been overwritten
-        xvalue_head_t h = xvalue_decode_head(v, l);
-        if (strncmp(h.kind, XK_STRING, h.kind_len) != 0) {
+        xvalue_head_t h = kvspaceXvalueDecodeHead(v, l);
+        if (strncmp(h.kind, KVSPACE_KIND_CHAR, h.kind_len) != 0) {
             printf("[reader] BADKIND %s: %.*s\n", k, h.kind_len, h.kind); errors++;
         }
         free(v);
@@ -136,7 +136,7 @@ static int reader(kvspace_t *kv, int64_t seed) {
         char k[64]; snprintf(k, sizeof(k), "/mp/big%d", i);
         int32_t l; uint8_t *v = kvspaceShmGet(kv, k, 1, &l);
         if (v) {
-            xvalue_head_t h = xvalue_decode_head(v, l);
+            xvalue_head_t h = kvspaceXvalueDecodeHead(v, l);
             if (h.raw_len == 1024) big_ok++;
             free(v);
         }

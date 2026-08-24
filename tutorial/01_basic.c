@@ -29,23 +29,23 @@
 static void get(kvspace_t *kv, const char *key) {
     int32_t len; uint8_t *v = kvspaceShmGet(kv, key, 1, &len);
     if (!v || len == 0) { printf("%s\t(nil)\n", key); return; }
-    xvalue_head_t h = xvalue_decode_head(v, len);
+    xvalue_head_t h = kvspaceXvalueDecodeHead(v, len);
     printf("%s\t%.*s:", key, h.kind_len, h.kind);
     if (h.raw_len > 0) {
-        if (strncmp(h.kind, XK_INT64, h.kind_len) == 0) printf("%ld", xvalue_at_int64(&h, 0));
-        else if (strncmp(h.kind, XK_STRING, h.kind_len) == 0) printf("%.*s", h.raw_len, h.raw);
-        else if (strncmp(h.kind, XK_FLOAT64, h.kind_len) == 0) printf("%.2f", xvalue_at_float64(&h, 0));
+        if (strncmp(h.kind, KVSPACE_KIND_INT64, h.kind_len) == 0) printf("%ld", kvspaceXvalueAtInt64(&h, 0));
+        else if (strncmp(h.kind, KVSPACE_KIND_CHAR, h.kind_len) == 0) printf("%.*s", h.raw_len, h.raw);
+        else if (strncmp(h.kind, KVSPACE_KIND_FLOAT64, h.kind_len) == 0) printf("%.2f", kvspaceXvalueAtFloat64(&h, 0));
     }
     printf("\n");
     free(v);
 }
 
 static void set_int(kvspace_t *kv, const char *key, int64_t v) {
-    uint8_t *b; int32_t bl = xvalue_new_int64_1(v, &b);
+    uint8_t *b; int32_t bl = kvspaceXvalueNewInt641(v, &b);
     kvspaceShmSet(kv, key, b, bl); free(b);
 }
 static void set_str(kvspace_t *kv, const char *key, const char *v) {
-    uint8_t *b; int32_t bl = xvalue_new_char(v, &b);
+    uint8_t *b; int32_t bl = kvspaceXvalueNewChar(v, &b);
     kvspaceShmSet(kv, key, b, bl); free(b);
 }
 static void list(kvspace_t *kv, const char *dir, bool show_kind) {
@@ -56,10 +56,10 @@ static void list(kvspace_t *kv, const char *dir, bool show_kind) {
         sprintf(k, "%s%s", dir, ns[i]);
         if (show_kind) {
             int32_t len; uint8_t *v = kvspaceShmGet(kv, k, 1, &len);
-            if (v) { xvalue_head_t h = xvalue_decode_head(v, len);
+            if (v) { xvalue_head_t h = kvspaceXvalueDecodeHead(v, len);
                 printf("%s\t%.*s", ns[i], h.kind_len, h.kind);
-                if (h.raw_len > 0 && strncmp(h.kind, XK_INT64, h.kind_len) == 0)
-                    printf("\t%ld", xvalue_at_int64(&h, 0));
+                if (h.raw_len > 0 && strncmp(h.kind, KVSPACE_KIND_INT64, h.kind_len) == 0)
+                    printf("\t%ld", kvspaceXvalueAtInt64(&h, 0));
                 printf("\n"); free(v);
             }
         } else {
