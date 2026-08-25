@@ -36,7 +36,7 @@ void *kvspaceConnect(const char *dsn) {
     return (void *)kvspaceShmOpen(path, SHM_DEFAULT_SIZE);
 }
 
-void kvspaceFree(void *h) {
+void kvspaceClose(void *h) {
     if (h) kvspaceShmClose((kvspace_t *)h);
 }
 
@@ -65,6 +65,7 @@ int kvspaceGet(void *h, const char *key, uint8_t **out, uint32_t *out_len) {
     *out = c; *out_len = (uint32_t)len;
     return 0;
 }
+
 
 int kvspaceList(void *h, const char *prefix, int expand_ext, int resolve,
                  uint8_t **out, uint32_t *out_len) {
