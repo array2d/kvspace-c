@@ -13,19 +13,17 @@ add_library(kvspace-c SHARED
     src/durable_abi.c
 )
 
-target_include_directories(kvspace-c
-    PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:include>
+# SONAME 版本：libkvspace-c.so.1（dispatch 前端按此 dlopen 后端）
+set_target_properties(kvspace-c PROPERTIES
+    VERSION 1.0.0
+    SOVERSION 1
 )
 
+# 无公共头：内部头在 src/（kvspace_shm.h、xvalue.h），权威 ABI 头在 kvspace 仓库。
 target_link_libraries(kvspace-c
     PUBLIC blockmalloc slotsboxmalloc
 )
 
-add_subdirectory(tutorial)
-
 install(TARGETS kvspace-c
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
-install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

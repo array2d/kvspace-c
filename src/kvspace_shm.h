@@ -8,7 +8,7 @@
 #ifndef KVSPACE_H
 #define KVSPACE_H
 
-#include "kvspace/xvalue.h"
+#include "xvalue.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>

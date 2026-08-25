@@ -4,8 +4,8 @@
 #define _POSIX_C_SOURCE 199309L
 #define _DEFAULT_SOURCE
 
-#include "kvspace/kvspace.h"
-#include "kvspace/xvalue.h"
+#include "kvspace_shm.h"
+#include "xvalue.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

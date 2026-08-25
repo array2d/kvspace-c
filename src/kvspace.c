@@ -3,7 +3,7 @@
  */
 
 #define _GNU_SOURCE
-#include "kvspace/kvspace.h"
+#include "kvspace_shm.h"
 #include "slotsboxmalloc/slotsboxobj.h"
 #include <blockmalloc/blockmalloc.h>
 #include <fcntl.h>
