@@ -21,7 +21,7 @@ set_target_properties(kvspace-c PROPERTIES
 
 # 无公共头：内部头在 src/（kvspace_shm.h、xvalue.h），权威 ABI 头在 kvspace 仓库。
 target_link_libraries(kvspace-c
-    PUBLIC blockmalloc slotsboxmalloc
+    PUBLIC blockmalloc slotsboxmalloc pthread
 )
 
 install(TARGETS kvspace-c
