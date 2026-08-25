@@ -33,7 +33,14 @@ static int parse_shm_path(const char *dsn, char *out, size_t osz) {
 }
 
 #define EXP_CAP 256
-static struct { kvspace_t *kv; char key[512]; int64_t dead_ns; int used; } exp_tab[EXP_CAP];
+static struct {
+    kvspace_t *kv;
+    char key[512];
+    int64_t dead_ns;
+    uint8_t *val;
+    uint32_t vlen;
+    int used;
+} exp_tab[EXP_CAP];
 static pthread_mutex_t exp_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static int64_t exp_now_ns(void) {
@@ -50,12 +57,19 @@ static int exp_key_under(const char *key, const char *prefix) {
     return key[n] == 0 || key[n] == '/' || key[n] == '.';
 }
 
+static void exp_clear_slot(int i) {
+    free(exp_tab[i].val);
+    exp_tab[i].val = NULL;
+    exp_tab[i].vlen = 0;
+    exp_tab[i].used = 0;
+}
+
 static void exp_forget(kvspace_t *kv, const char *key) {
     if (!kv || !key) return;
     pthread_mutex_lock(&exp_mu);
     for (int i = 0; i < EXP_CAP; i++) {
         if (exp_tab[i].used && exp_tab[i].kv == kv && strcmp(exp_tab[i].key, key) == 0)
-            exp_tab[i].used = 0;
+            exp_clear_slot(i);
     }
     pthread_mutex_unlock(&exp_mu);
 }
@@ -65,22 +79,31 @@ static void exp_forget_prefix(kvspace_t *kv, const char *prefix) {
     pthread_mutex_lock(&exp_mu);
     for (int i = 0; i < EXP_CAP; i++) {
         if (exp_tab[i].used && exp_tab[i].kv == kv && exp_key_under(exp_tab[i].key, prefix))
-            exp_tab[i].used = 0;
+            exp_clear_slot(i);
     }
     pthread_mutex_unlock(&exp_mu);
 }
 
-/* 0 live, 1 hidden, 2 reaped */
-static int exp_reap(kvspace_t *kv, const char *key) {
+/* 0 not in table, 1 hidden-live (List gone, Get still has val), 2 reaped */
+static int exp_reap(kvspace_t *kv, const char *key, uint8_t **hold, uint32_t *hlen) {
     int64_t now = exp_now_ns();
     pthread_mutex_lock(&exp_mu);
     int st = 0;
     for (int i = 0; i < EXP_CAP; i++) {
         if (!exp_tab[i].used || exp_tab[i].kv != kv || strcmp(exp_tab[i].key, key) != 0) continue;
-        if (now < exp_tab[i].dead_ns) { st = 1; break; }
-        exp_tab[i].used = 0;
+        if (now < exp_tab[i].dead_ns) {
+            st = 1;
+            if (hold && hlen && exp_tab[i].val) {
+                uint8_t *c = malloc(exp_tab[i].vlen ? exp_tab[i].vlen : 1);
+                if (!c) abort();
+                if (exp_tab[i].vlen) memcpy(c, exp_tab[i].val, exp_tab[i].vlen);
+                *hold = c;
+                *hlen = exp_tab[i].vlen;
+            }
+            break;
+        }
+        exp_clear_slot(i);
         st = 2;
-        kvspaceShmDel(kv, key);
         break;
     }
     pthread_mutex_unlock(&exp_mu);
@@ -117,9 +140,10 @@ int kvspaceSet(void *h, const char *const *keys, const uint8_t *vals,
 }
 
 int kvspaceGet(void *h, const char *key, uint8_t **out, uint32_t *out_len) {
-    if (exp_reap((kvspace_t *)h, key) == 2) {
-        *out = NULL; *out_len = 0; return 0;
-    }
+    uint8_t *held = NULL; uint32_t hl = 0;
+    int st = exp_reap((kvspace_t *)h, key, &held, &hl);
+    if (st == 2) { *out = NULL; *out_len = 0; return 0; }
+    if (st == 1) { *out = held; *out_len = hl; return 0; }
     int32_t len;
     uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 1, &len);
     if (!d || len <= 0) { *out = NULL; *out_len = 0; return 0; }
@@ -293,7 +317,7 @@ int kvspaceGetBatch(void *h, const char *prefix, const char *const *names,
         snprintf(key, sizeof key, "%s%s", prefix, names[i]);
         int32_t len = 0;
         uint8_t *d = NULL;
-        if (exp_reap((kvspace_t *)h, key) != 2)
+        if (exp_reap((kvspace_t *)h, key, NULL, NULL) != 2)
             d = kvspaceShmGet((kvspace_t *)h, key, 1, &len);
         if (d && len > 0) total += (size_t)len;
     }
@@ -305,7 +329,10 @@ int kvspaceGetBatch(void *h, const char *prefix, const char *const *names,
         snprintf(key, sizeof key, "%s%s", prefix, names[i]);
         int32_t len = 0;
         uint8_t *d = NULL;
-        if (exp_reap((kvspace_t *)h, key) != 2)
+        uint8_t *held = NULL; uint32_t hl = 0;
+        int st = exp_reap((kvspace_t *)h, key, &held, &hl);
+        if (st == 1) { d = held; len = (int32_t)hl; }
+        else if (st != 2)
             d = kvspaceShmGet((kvspace_t *)h, key, 1, &len);
         if (!d || len <= 0) len = 0;
         buf[off] = (uint8_t)(len & 0xFF);
@@ -317,6 +344,7 @@ int kvspaceGetBatch(void *h, const char *prefix, const char *const *names,
             memcpy(buf + off, d, (size_t)len);
             off += (size_t)len;
         }
+        free(held);
     }
     *out = buf;
     *out_len = (uint32_t)off;
@@ -333,15 +361,20 @@ int kvspaceWatch(void *h, const char *key, const uint8_t *target, uint32_t targe
     for (;;) {
         int32_t len = 0;
         uint8_t *d = NULL;
-        if (exp_reap((kvspace_t *)h, key) != 2)
+        uint8_t *held = NULL; uint32_t hl = 0;
+        int st = exp_reap((kvspace_t *)h, key, &held, &hl);
+        if (st == 1) { d = held; len = (int32_t)hl; }
+        else if (st != 2)
             d = kvspaceShmGet((kvspace_t *)h, key, 1, &len);
         if (d && (uint32_t)len == target_len && memcmp(d, target, target_len) == 0) {
             uint8_t *c = malloc((size_t)len);
             memcpy(c, d, (size_t)len);
             *out = c;
             *out_len = (uint32_t)len;
+            free(held);
             return 0;
         }
+        free(held);
         clock_gettime(CLOCK_MONOTONIC, &tn);
         uint64_t elapsed = (uint64_t)(tn.tv_sec - t0.tv_sec) * 1000000000ULL +
                            (uint64_t)(tn.tv_nsec - t0.tv_nsec);
@@ -493,7 +526,7 @@ int kvspaceIncr(void *h, const char *key, int64_t *out, char *err, uint32_t err_
     if (!h || !key || !out) { incr_err(err, err_cap, "Incr: bad args"); return 1; }
     *out = 0;
     pthread_mutex_lock(&incr_mu);
-    exp_reap((kvspace_t *)h, key);
+    exp_reap((kvspace_t *)h, key, NULL, NULL);
     int32_t len = 0;
     uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 1, &len);
     int64_t n = 0;
@@ -558,9 +591,21 @@ int kvspaceExpire(void *h, const char *key, uint64_t ttl_ns, char *err, uint32_t
         incr_err(err, err_cap, key && key[0] && key[strlen(key) - 1] == '/' ? "Expire: directory" : "Expire: key is not an absolute path");
         return 1;
     }
-    if (exp_reap((kvspace_t *)h, key) == 2) { incr_err(err, err_cap, "Expire: missing key"); return 1; }
+    uint8_t *held = NULL; uint32_t hl = 0;
+    int st = exp_reap((kvspace_t *)h, key, &held, &hl);
+    if (st == 2) { incr_err(err, err_cap, "Expire: missing key"); return 1; }
     int32_t len = 0;
-    uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 1, &len);
+    uint8_t *d = NULL;
+    if (st == 1) { d = held; len = (int32_t)hl; }
+    else {
+        d = kvspaceShmGet((kvspace_t *)h, key, 1, &len);
+        if (d && len > 0) {
+            uint8_t *c = malloc((size_t)len);
+            if (!c) abort();
+            memcpy(c, d, (size_t)len);
+            d = c;
+        }
+    }
     if (!d || len <= 0) { incr_err(err, err_cap, "Expire: missing key"); return 1; }
     int64_t dead = exp_now_ns() + (int64_t)ttl_ns;
     pthread_mutex_lock(&exp_mu);
@@ -571,11 +616,15 @@ int kvspaceExpire(void *h, const char *key, uint64_t ttl_ns, char *err, uint32_t
         }
         if (slot < 0 && !exp_tab[i].used) slot = i;
     }
-    if (slot < 0) { pthread_mutex_unlock(&exp_mu); abort(); }
+    if (slot < 0) { pthread_mutex_unlock(&exp_mu); free(d); abort(); }
+    if (exp_tab[slot].used) exp_clear_slot(slot);
     exp_tab[slot].kv = (kvspace_t *)h;
     snprintf(exp_tab[slot].key, sizeof exp_tab[slot].key, "%s", key);
     exp_tab[slot].dead_ns = dead;
+    exp_tab[slot].val = d;
+    exp_tab[slot].vlen = (uint32_t)len;
     exp_tab[slot].used = 1;
     pthread_mutex_unlock(&exp_mu);
+    kvspaceShmDel((kvspace_t *)h, key);
     return 0;
 }
