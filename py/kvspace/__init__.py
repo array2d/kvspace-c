@@ -88,6 +88,12 @@ def xv_ext(extpath: str) -> bytes:
     return _xv_encode("extindex", struct.pack("<I", 0) + ("…" + extpath).encode())
 
 
+def xv_map(children: list[str], dims: tuple) -> bytes:
+    """strkeymapindex 散 key ndarray：body=[4B count LE][child\n...]，dims 落 head。"""
+    body = struct.pack("<I", len(children)) + "\n".join(children).encode()
+    return _xv_encode("strkeymapindex", body, dims=dims)
+
+
 # ── KVSpace ─────────────────────────────────────────────────────
 
 class KVSpace:

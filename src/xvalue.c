@@ -274,6 +274,30 @@ int32_t kvspaceXvalueNewIndex(const char **children, int32_t count, uint8_t **ou
     return r;
 }
 
+int32_t kvspaceXvalueNewMap(const char **children, int32_t count,
+                            const int32_t *dims, int32_t ndim, uint8_t **out) {
+    if (ndim <= 0 || ndim > X_MAX_NDIM)
+        return -1;
+    size_t total = 4; /* [4B count LE] */
+    for (int i = 0; i < count; i++) total += (children[i] ? strlen(children[i]) : 0);
+    if (count > 0) total += (size_t)(count - 1);
+    if (total > (size_t)INT32_MAX) return -1;
+    uint8_t *raw = (uint8_t *)malloc(total);
+    if (!raw) return -1;
+    wr_u32(raw, (uint32_t)count);
+    size_t pos = 4;
+    for (int i = 0; i < count; i++) {
+        if (!children[i]) continue;
+        size_t len = strlen(children[i]);
+        memcpy(raw + pos, children[i], len);
+        pos += len;
+        if (i < count - 1) raw[pos++] = '\n';
+    }
+    int32_t r = kvspaceXvalueEncode(KVSPACE_KIND_MAP, raw, (int32_t)pos, dims, ndim, out);
+    free(raw);
+    return r;
+}
+
 int32_t kvspaceXvalueNewPtr(const char *kind, const char *target, int32_t array_len, uint8_t **out) {
     if (!target) return -1;
     return encode_al_ptr(kind, (const uint8_t *)target, (int32_t)strlen(target), array_len, out);

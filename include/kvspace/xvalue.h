@@ -124,6 +124,8 @@ int32_t kvspaceXvalueNewCharAscii(const char *s, uint8_t **out);
 int32_t kvspaceXvalueAtChar(const xvalue_head_t *h, int32_t idx);
 
 int32_t kvspaceXvalueNewIndex(const char **children, int32_t count, uint8_t **out);
+int32_t kvspaceXvalueNewMap(const char **children, int32_t count,
+                            const int32_t *dims, int32_t ndim, uint8_t **out);
 int32_t kvspaceXvalueNewPtr(const char *kind, const char *target, int32_t array_len, uint8_t **out);
 int32_t kvspaceXvalueNewExtindex(const char *extpath, const char **children, int32_t count, uint8_t **out);
 

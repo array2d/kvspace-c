@@ -994,8 +994,79 @@ int kvspaceShmMkindex(kvspace_t *kv, const char *path) {
   return r;
 }
 
+/* ── strkeymapindex 坐标段 [s0,s1,...] 解析与排序（对齐 kvspace-durable coord） ── */
+
+/* 坐标段结构判定：任意非空 [..]，禁止嵌套 [ ]。小数/字符串坐标（[12.24,x]）也算坐标段。 */
+static int coord_is_coord(const char *name) {
+  if (!name || name[0] != '[')
+    return 0;
+  size_t n = strlen(name);
+  if (n < 3 || name[n - 1] != ']')
+    return 0;
+  for (size_t i = 1; i + 1 < n; i++)
+    if (name[i] == '[' || name[i] == ']')
+      return 0;
+  return 1;
+}
+
+/* 解析整数坐标段，成功填充 coords 并返回维数；非整数返回 -1。 */
+static int parse_coord(const char *name, int64_t *coords, int maxn) {
+  if (!name || name[0] != '[')
+    return -1;
+  int n = 0;
+  int64_t cur = 0;
+  bool has = false;
+  for (const char *p = name + 1; *p; p++) {
+    if (*p >= '0' && *p <= '9') {
+      cur = cur * 10 + (*p - '0');
+      has = true;
+    } else if (*p == ',') {
+      if (!has || n >= maxn)
+        return -1;
+      coords[n++] = cur;
+      cur = 0;
+      has = false;
+    } else if (*p == ']') {
+      if (!has || n >= maxn)
+        return -1;
+      coords[n++] = cur;
+      return (p[1] == '\0') ? n : -1;
+    } else {
+      return -1;
+    }
+  }
+  return -1;
+}
+
+static int coord_cmp(const char *a, const char *b) {
+  int ia = coord_is_coord(a), ib = coord_is_coord(b);
+  if (!ia && !ib)
+    return strcmp(a, b);
+  if (!ia)
+    return 1; /* 非坐标段排后 */
+  if (!ib)
+    return -1;
+  int64_t ca[8], cb[8];
+  int na = parse_coord(a, ca, 8);
+  int nb = parse_coord(b, cb, 8);
+  if (na < 0 || nb < 0)
+    return strcmp(a, b); /* 含小数/字符串坐标 → 字典序 */
+  for (int i = 0; i < na && i < nb; i++) {
+    if (ca[i] != cb[i])
+      return ca[i] < cb[i] ? -1 : 1;
+  }
+  if (na != nb)
+    return na < nb ? -1 : 1;
+  return 0;
+}
+
+static int qsort_coord_cmp(const void *a, const void *b) {
+  return coord_cmp(*(const char *const *)a, *(const char *const *)b);
+}
+
 /* 读 dir（目录键）的 objindex/strkeymapindex 成员名（body = [4B count LE]name1\nname2...）。
- * 命中返回 1 并填充 names/count；非 obj/map 或读失败返回 0（调用方回退 ART scan）。 */
+ * 命中返回 1 并填充 names/count；非 obj/map 或读失败返回 0（调用方回退 ART scan）。
+ * strkeymapindex 成员按坐标 row-major 数值升序返回。 */
 static int read_index_names(kvspace_t *kv, const char *dir, char ***on, int32_t *oc) {
   *on = NULL;
   *oc = 0;
@@ -1033,6 +1104,8 @@ static int read_index_names(kvspace_t *kv, const char *dir, char ***on, int32_t 
   }
   *on = names;
   *oc = cnt;
+  if (is_map && cnt > 1)
+    qsort(names, (size_t)cnt, sizeof(char *), qsort_coord_cmp);
   return 1;
 }
 

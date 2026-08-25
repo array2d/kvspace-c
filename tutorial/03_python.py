@@ -4,7 +4,7 @@
 import sys
 sys.path.insert(0, "../py")
 
-from kvspace import KVSpace, xv_int, xv_float, xv_str, xv_index, xv_link, xv_ext, _xv_decode
+from kvspace import KVSpace, xv_int, xv_float, xv_str, xv_index, xv_link, xv_ext, xv_map, _xv_decode
 
 with KVSpace("/tmp/kvspace_py.shm") as kv:
     kv.mkindex("/py/")
@@ -32,5 +32,12 @@ with KVSpace("/tmp/kvspace_py.shm") as kv:
     assert len(kv.list("/py/")) == 2
     kv.deltree("/py/")
     assert kv.list("/py/") == []
+
+    # strkeymapindex：坐标段成员名 [s0,s1]，list 按 row-major 数值升序返回。
+    kv.set("/m.", xv_map(["[1,2]", "[0,1]", "[0,0]"], (2, 3)))
+    assert kv.list("/m.") == ["[0,0]", "[0,1]", "[1,2]"], kv.list("/m.")
+    kind, al, _ = _xv_decode(kv.get("/m."))
+    assert kind == "strkeymapindex" and al == 6, (kind, al)
+    kv.deltree("/m.")
 
     print("PASS python")
