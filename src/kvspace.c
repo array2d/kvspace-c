@@ -1078,7 +1078,7 @@ static int read_index_names(kvspace_t *kv, const char *dir, char ***on, int32_t 
   if (read_tlv(kv, h->box_offset, &raw, &rl) < 0)
     return 0;
   xvalue_head_t hh = kvspaceXvalueDecodeHead(raw, rl);
-  /* 仅 objindex/strkeymapindex（. 成员目录）：marker body 显式存成员名（json writeObj/writeArr）。
+  /* 仅 objindex/strkeymapindex（· 成员目录）：marker body 显式存成员名（json writeObj/writeArr）。
    * index（/ 目录，kv.mkindex）在 shm 后端不自动维护，成员名以 ART scan 为准。 */
   bool is_obj = hh.kind_len == (int32_t)strlen(KVSPACE_KIND_OBJ) && memcmp(hh.kind, KVSPACE_KIND_OBJ, hh.kind_len) == 0;
   bool is_map = hh.kind_len == (int32_t)strlen(KVSPACE_KIND_MAP) && memcmp(hh.kind, KVSPACE_KIND_MAP, hh.kind_len) == 0;
