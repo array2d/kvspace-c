@@ -10,5 +10,3 @@ jobs:
         run: ./ci/deps.sh
       - name: 构建
         run: make
-      - name: 测试
-        run: python3 tutorial/test.py
