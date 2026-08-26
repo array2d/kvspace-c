@@ -183,17 +183,7 @@ int kvspaceNewPtr(const char *kind, const char *target, int32_t array_len,
     return 0;
 }
 
-int kvspaceNewChar(const char *kind, const char *s, uint8_t **out, uint32_t *out_len) {
-    int32_t n;
-    if (strcmp(kind, KVSPACE_KIND_CHAR_UTF8) == 0) n = kvspaceXvalueNewCharUtf8(s, out);
-    else if (strcmp(kind, KVSPACE_KIND_CHAR_ASCII) == 0) n = kvspaceXvalueNewCharAscii(s, out);
-    else n = kvspaceXvalueNewChar(s, out);
-    if (n < 0) return 1;
-    *out_len = (uint32_t)n;
-    return 0;
-}
-
-int kvspaceNewCharByte(const uint8_t *bytes, uint32_t len, uint8_t **out, uint32_t *out_len) {
+int kvspaceNewChar(const uint8_t *bytes, uint32_t len, uint8_t **out, uint32_t *out_len) {
     int32_t d = (int32_t)len;
     int32_t n = kvspaceXvalueEncode(KVSPACE_KIND_CHAR_UTF8, bytes, (int32_t)len, &d, 1, out);
     if (n < 0) return 1;

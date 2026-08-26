@@ -989,6 +989,32 @@ int kvspaceShmDeltree(kvspace_t *kv, const char *prefix) {
   for (int i = 0; i < nc; i++)
     free(ns[i]);
   free(ns);
+
+  /* 成员目录 marker（prefix·，U+00B7）：成员 key = prefix·<name>，直接拼接后递归删除。
+     slash 版 e=prefix/ 覆盖不到 · 成员（json 的 objindex/strkeymapindex 落盘形态）。 */
+  size_t pl = strlen(prefix);
+  char *m = malloc(pl + 3);
+  memcpy(m, prefix, pl);
+  m[pl] = (char)0xC2;
+  m[pl + 1] = (char)0xB7;
+  m[pl + 2] = 0;
+  char **ms;
+  int32_t mc;
+  kvspaceShmList(kv, m, false, 1, &ms, &mc);
+  for (int i = 0; i < mc; i++) {
+    size_t ml = strlen(m), nl = strlen(ms[i]);
+    char *c = malloc(ml + nl + 1);
+    memcpy(c, m, ml);
+    memcpy(c + ml, ms[i], nl + 1);
+    kvspaceShmDeltree(kv, c);
+    free(c);
+  }
+  for (int i = 0; i < mc; i++)
+    free(ms[i]);
+  free(ms);
+  kvspaceShmDel(kv, m);
+  free(m);
+
   kvspaceShmDel(kv, prefix);
   if (strcmp(e, prefix) != 0)
     kvspaceShmDel(kv, e);
