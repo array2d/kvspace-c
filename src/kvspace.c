@@ -572,6 +572,20 @@ static void psplit(const char *k, char **p, char **n) {
   (*p)[pl] = '\0';
   *n = strdup(s + 1);
 }
+/* 非法目录前缀（不是 / 且不以 / 或 · 结尾）→ 返回非 0，对齐 durable validate_dir。 */
+static int bad_dir_prefix(const char *p) {
+  if (!p || !p[0])
+    return 1;
+  if (strcmp(p, "/") == 0)
+    return 0;
+  size_t l = strlen(p);
+  if (p[l - 1] == '/')
+    return 0;
+  if (l >= 2 && (unsigned char)p[l - 2] == 0xC2 && (unsigned char)p[l - 1] == 0xB7)
+    return 0;
+  return 1;
+}
+
 static char *edir(const char *p) {
   size_t l = strlen(p);
   if (l > 0 && p[l - 1] == '/')
@@ -1115,6 +1129,8 @@ int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
     return -1;
   *on = NULL;
   *oc = 0;
+  if (bad_dir_prefix(prefix))
+    return -1;
   const char *pfx = prefix;
   char tbuf[1024];
   if (resolve) {

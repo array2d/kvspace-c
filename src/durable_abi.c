@@ -30,6 +30,16 @@ static int parse_shm_path(const char *dsn, char *out, size_t osz) {
     return 0;
 }
 
+/* 非法目录前缀（不是 / 且不以 / 或 · 结尾）→ 非 0，对齐 durable validate_dir。 */
+static int bad_dir_prefix(const char *p) {
+    if (!p || !p[0]) return 1;
+    if (strcmp(p, "/") == 0) return 0;
+    size_t l = strlen(p);
+    if (p[l - 1] == '/') return 0;
+    if (l >= 2 && (unsigned char)p[l - 2] == 0xC2 && (unsigned char)p[l - 1] == 0xB7) return 0;
+    return 1;
+}
+
 void *kvspaceConnect(const char *dsn) {
     char path[1024];
     if (parse_shm_path(dsn, path, sizeof path) != 0) return NULL;
@@ -71,7 +81,7 @@ int kvspaceList(void *h, const char *prefix, int expand_ext, int resolve,
                  uint8_t **out, uint32_t *out_len) {
     char **names; int32_t count;
     if (kvspaceShmList((kvspace_t *)h, prefix, expand_ext, resolve, &names, &count) != 0) {
-        *out = NULL; *out_len = 0; return -1;
+        *out = NULL; *out_len = 0; return 1;
     }
     size_t total = 0;
     for (int32_t i = 0; i < count; i++) total += strlen(names[i]) + 1;
@@ -218,6 +228,7 @@ int kvspaceGetBatch(void *h, const char *prefix, const char *const *names,
     if (!out || !out_len) return 1;
     *out = NULL;
     *out_len = 0;
+    if (bad_dir_prefix(prefix)) return 1;
     if (!names || nnames == 0) return 0;
     size_t total = (size_t)nnames * 4;
     for (uint32_t i = 0; i < nnames; i++) {
