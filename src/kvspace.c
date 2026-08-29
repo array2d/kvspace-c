@@ -773,8 +773,10 @@ void kvspaceShmClose(kvspace_t *kv) {
 /* ---- link resolve helpers ---- */
 static int read_tlv(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
   uint8_t *s = kv->sbo_data + off;   /* box 内必含完整 TLV，用 xvalue 解码器算长度 */
-  xvalue_head_t h = kvspaceXvalueDecodeHead(s, INT32_MAX);
+  size_t sz = sbo_allocated_size(kv->sbo_meta, off);
+  xvalue_head_t h = kvspaceXvalueDecodeHead(s, sz > INT32_MAX ? INT32_MAX : (int32_t)sz);
   *out = s; /* SHM pointer */
+  if (h.kindexpr_len == 0) { *ol = 0; return 0; } /* None（空 kind）→ len 0 */
   *ol = kvspaceXvalueHeadLen(&h) + h.raw_len;
   return 0;
 }
@@ -1097,6 +1099,8 @@ static int add_child_index(kvspace_t *kv, const char *mem, const char *name) {
     int32_t rl;
     if (read_tlv(kv, h->box_offset, &raw, &rl) == 0) {
       xvalue_head_t hh = kvspaceXvalueDecodeHead(raw, rl);
+      if (hh.ref == 0 && is_kind(&hh, KVSPACE_KIND_EXT_INDEX))
+        return 0; /* extindex：成员由 extpath 展开，不维护本地 childs */
       if (hh.ref == 0 && is_kind(&hh, KVSPACE_KIND_INDEX))
         names = parse_index_body(hh.raw, hh.raw_len, &nnames);
     }
@@ -1171,10 +1175,14 @@ int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
                 int32_t val_len) {
   if (!kv || !key)
     return -1;
-  if (val_len <= 0)
-    return kvspaceShmDel(kv, key); /* None（空 value）→ 删 key，对齐 durable 空写 */
-  if (!val)
+  if (!val && val_len > 0)
     return -1;
+  if (val_len <= 0) {
+    /* None → 写 1 字节空 kind TLV（sbo 不支持 0 字节），读时 read_tlv 判 None 返 len 0。 */
+    static const uint8_t none_tlv[1] = {0};
+    val = none_tlv;
+    val_len = 1;
+  }
   char kbuf[1024];
   resolve_path(kv, key, kbuf, sizeof(kbuf)); // always resolve through link
   if (strstr(kbuf, "//"))
@@ -1248,12 +1256,12 @@ int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
   shm_split_index(kbuf, &parent, &name, &is_member);
   if (is_member) {
     ensure_memindex(kv, parent);
-    /* 自动兜底：坐标段成员 + 容器值 p 不存在 → 建 stringkeymap（dims 由坐标推导）。 */
-    if (coord_is_coord(name)) {
-      char *base = strip_dir_suf_alloc(parent);
-      art_hdr_t *ch = art_search(kv, kv->hdr->art_root, (const uint8_t *)base,
-                                 (int)strlen(base));
-      if (!ch || !ch->has_value) {
+    /* 自动兜底：容器值 p 不存在 → 坐标段建 stringkeymap，命名成员建 object（对齐 durable）。 */
+    char *base = strip_dir_suf_alloc(parent);
+    art_hdr_t *ch = art_search(kv, kv->hdr->art_root, (const uint8_t *)base,
+                               (int)strlen(base));
+    if (!ch || !ch->has_value) {
+      if (coord_is_coord(name)) {
         int32_t dims[8];
         int32_t ndim;
         grow_coord_dims_one(name, dims, &ndim);
@@ -1261,9 +1269,21 @@ int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
         int32_t mvl = kvspaceXvalueEncode(KVSPACE_KIND_MAP, NULL, 0, dims, ndim, &mv);
         shm_set_raw(kv, base, mv, mvl);
         free(mv);
+      } else {
+        uint8_t *ov;
+        int32_t ovl = kvspaceXvalueEncode(KVSPACE_KIND_OBJ, NULL, 0, NULL, 0, &ov);
+        shm_set_raw(kv, base, ov, ovl);
+        free(ov);
       }
-      free(base);
     }
+    /* 注册容器名（base 末段）到父 memindex（对齐 durable parent_name + children.push）。 */
+    char *pp = NULL, *pn = NULL;
+    bool pm = false;
+    shm_split_index(base, &pp, &pn, &pm);
+    if (pm) add_child_index(kv, pp, pn);
+    free(pp);
+    free(pn);
+    free(base);
     add_child_index(kv, parent, name);
     int rc = shm_set_raw(kv, kbuf, val, val_len);
     free(parent);
@@ -1272,6 +1292,36 @@ int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
   }
   free(parent);
   free(name);
+
+  /* 目录写（尾 / 或 · 的 index/extindex）→ 注册父 index（对齐 durable 写目录分支）。 */
+  {
+    size_t l = strlen(kbuf);
+    bool is_dir = (l > 0 && kbuf[l - 1] == '/') ||
+                  (l >= 2 && (unsigned char)kbuf[l - 2] == 0xC2 &&
+                   (unsigned char)kbuf[l - 1] == 0xB7);
+    if (is_dir && hh.ref == 0 &&
+        (is_kind(&hh, KVSPACE_KIND_INDEX) || is_kind(&hh, KVSPACE_KIND_EXT_INDEX))) {
+      char *strip = strip_dir_suf_alloc(kbuf);
+      char *pp = NULL, *pn = NULL;
+      bool pm = false;
+      shm_split_index(strip, &pp, &pn, &pm);
+      if (pn && pn[0]) {
+        char *dn = pn;
+        if (kbuf[l - 1] == '/') {
+          size_t nl = strlen(pn);
+          dn = malloc(nl + 2);
+          memcpy(dn, pn, nl);
+          dn[nl] = '/';
+          dn[nl + 1] = 0;
+        }
+        add_child_index(kv, pp, dn);
+        if (dn != pn) free(dn);
+      }
+      free(pp);
+      free(pn);
+      free(strip);
+    }
+  }
 
   return shm_set_raw(kv, kbuf, val, val_len);
 }
@@ -1478,6 +1528,18 @@ static int read_index_names(kvspace_t *kv, const char *dir, char ***on, int32_t 
   return 1;
 }
 
+/* 提取直接成员名长度：到第一个 / 或 ·（U+00B7，2 字节）为止。 */
+static int child_name_len(const char *rest, int restlen) {
+  for (int i = 0; i < restlen; i++) {
+    if (rest[i] == '/')
+      return i;
+    if (i + 1 < restlen && (unsigned char)rest[i] == 0xC2 &&
+        (unsigned char)rest[i + 1] == 0xB7)
+      return i;
+  }
+  return restlen;
+}
+
 int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
                  char ***on, int32_t *oc) {
   if (!kv || !prefix || !on || !oc)
@@ -1514,8 +1576,7 @@ int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
       continue;
     // extract the name segment immediately after prefix
     const char *rest = k + plen;
-    const char *slash = strchr(rest, '/');
-    int nlen = slash ? (int)(slash - rest) : (int)(kl - plen);
+    int nlen = child_name_len(rest, kl - plen);
     if (nlen == 0)
       continue;
     // dedup
@@ -1552,8 +1613,7 @@ int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
         if (kl <= el)
           continue;
         const char *rest = k + el;
-        const char *slash = strchr(rest, '/');
-        int nlen = slash ? (int)(slash - rest) : (int)(kl - el);
+        int nlen = child_name_len(rest, kl - el);
         if (nlen == 0)
           continue;
         bool dup = false;

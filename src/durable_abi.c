@@ -73,7 +73,7 @@ int kvspaceSet(void *h, const char *const *keys, const uint8_t *vals,
 
 int kvspaceGet(void *h, const char *key, uint8_t **out, uint32_t *out_len) {
     int32_t len;
-    uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 1, &len);
+    uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 0, &len);
     if (!d || len <= 0) { *out = NULL; *out_len = 0; return 0; }
     uint8_t *c = malloc((size_t)len);
     memcpy(c, d, (size_t)len);
