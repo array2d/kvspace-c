@@ -928,6 +928,245 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve, int32_t *ol)
   return raw;
 }
 
+/* ── 值/索引分离（方案2，对齐 kvspace-durable backend.rs） ────────── */
+/* 坐标段工具（定义在下方，先声明）。 */
+static int coord_is_coord(const char *name);
+static int parse_coord(const char *name, int64_t *coords, int maxn);
+
+/* kind 判定（kindexpr 非 NUL 终止）。 */
+static int is_kind(const xvalue_head_t *h, const char *k) {
+  int32_t kl = (int32_t)strlen(k);
+  return h->kind_len == kl && memcmp(h->kind, k, (size_t)kl) == 0;
+}
+
+/* 原始落盘（不处理容器/member 语义，供内部调用，避免递归）。 */
+static int shm_set_raw(kvspace_t *kv, const char *key, const uint8_t *val,
+                       int32_t val_len) {
+  art_hdr_t *old = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
+                              (int)strlen(key));
+  if (old && old->has_value)
+    sbo_free(kv->sbo_meta, old->box_offset);
+  uint64_t off = sbo_alloc(kv->sbo_meta, (size_t)val_len);
+  if (off == (uint64_t)-1)
+    return -1;
+  memcpy(kv->sbo_data + off, val, val_len);
+  kv->hdr->art_root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)key,
+                              (int)strlen(key), 0, off);
+  return 0;
+}
+
+/* 去掉尾部分隔符（/ 或 ·），返回 malloc；根 "/" 保持 "/"。 */
+static char *strip_dir_suf_alloc(const char *p) {
+  size_t l = strlen(p);
+  if (l == 0)
+    return strdup(p);
+  if (l >= 2 && (unsigned char)p[l - 2] == 0xC2 && (unsigned char)p[l - 1] == 0xB7)
+    return strndup(p, l - 2);
+  if (p[l - 1] == '/') {
+    if (l == 1)
+      return strdup("/");
+    return strndup(p, l - 1);
+  }
+  return strdup(p);
+}
+
+/* base + "·"（memindex 键）。 */
+static char *memjoin(const char *base) {
+  size_t l = strlen(base);
+  char *r = malloc(l + 3);
+  memcpy(r, base, l);
+  r[l] = (char)0xC2;
+  r[l + 1] = (char)0xB7;
+  r[l + 2] = 0;
+  return r;
+}
+
+/* 找字符串内最后一个 ·（U+00B7，2 字节），无则返回 NULL。 */
+static const char *strrstr_mid(const char *s) {
+  const char *last = NULL;
+  for (const char *p = s; *p; p++)
+    if ((unsigned char)p[0] == 0xC2 && (unsigned char)p[1] == 0xB7)
+      last = p;
+  return last;
+}
+
+/* 解析 key 的父目录/成员名（对齐 durable split_index，取末段最后一个 ·）。父目录含尾分隔符。 */
+static void shm_split_index(const char *key, char **parent, char **name,
+                            bool *is_member) {
+  *parent = NULL;
+  *name = NULL;
+  *is_member = false;
+  const char *s = strrchr(key, '/');
+  const char *last;
+  size_t plen;
+  if (!s || s == key) {
+    plen = 1; /* 父前缀 "/" */
+    last = s ? s + 1 : key;
+  } else {
+    plen = (size_t)(s - key) + 1; /* 含尾 '/' */
+    last = s + 1;
+  }
+  const char *dot = strrstr_mid(last);
+  if (dot && dot != last && dot[2]) {
+    size_t prelen = (size_t)(dot - last);
+    char *p = malloc(plen + prelen + 2 + 1);
+    if (plen == 1 && (s == key)) {
+      p[0] = '/';
+      memcpy(p + 1, last, prelen + 2);
+      p[plen + prelen + 2] = 0;
+    } else {
+      memcpy(p, key, plen);
+      memcpy(p + plen, last, prelen + 2);
+      p[plen + prelen + 2] = 0;
+    }
+    *parent = p;
+    *name = strdup(dot + 2);
+    *is_member = true;
+  } else {
+    char *p = malloc(plen + 1);
+    if (plen == 1 && (s == key)) {
+      p[0] = '/';
+      p[1] = 0;
+    } else {
+      memcpy(p, key, plen);
+      p[plen] = 0;
+    }
+    *parent = p;
+    *name = strdup(last);
+  }
+}
+
+/* 解析 index body（[4B count LE]name1\nname2...），返回 malloc 成员名数组。 */
+static char **parse_index_body(const uint8_t *raw, int32_t raw_len, int32_t *oc) {
+  *oc = 0;
+  if (!raw || raw_len < 4)
+    return NULL;
+  const char *s = (const char *)raw + 4;
+  int32_t slen = raw_len - 4;
+  if (slen == 0)
+    return NULL;
+  char **names = malloc(sizeof(char *) * (size_t)(slen + 1));
+  if (!names)
+    return NULL;
+  int32_t cnt = 0, start = 0;
+  for (int32_t i = 0; i <= slen; i++) {
+    if (i == slen || s[i] == '\n') {
+      if (i > start)
+        names[cnt++] = strndup(s + start, (size_t)(i - start));
+      start = i + 1;
+    }
+  }
+  *oc = cnt;
+  return names;
+}
+
+/* 坐标段 → stringkeymap dims（对齐 durable grow_coord_dims，单成员）。 */
+static void grow_coord_dims_one(const char *name, int32_t *dims, int32_t *ndim) {
+  int64_t coords[8];
+  int n = parse_coord(name, coords, 8);
+  if (n < 0) {
+    dims[0] = 1;
+    *ndim = 1;
+    return;
+  }
+  *ndim = n;
+  for (int i = 0; i < n; i++)
+    dims[i] = (int32_t)(coords[i] + 1);
+}
+
+/* 确保 memindex 存在（不存在 → 建空 index）。 */
+static void ensure_memindex(kvspace_t *kv, const char *mem) {
+  art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)mem,
+                            (int)strlen(mem));
+  if (h && h->has_value)
+    return;
+  uint8_t *iv;
+  int32_t ivl = kvspaceXvalueNewIndex(NULL, 0, &iv);
+  shm_set_raw(kv, mem, iv, ivl);
+  free(iv);
+}
+
+/* 向 memindex 追加成员名（幂等）。 */
+static int add_child_index(kvspace_t *kv, const char *mem, const char *name) {
+  char **names = NULL;
+  int32_t nnames = 0;
+  art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)mem,
+                            (int)strlen(mem));
+  if (h && h->has_value) {
+    uint8_t *raw;
+    int32_t rl;
+    if (read_tlv(kv, h->box_offset, &raw, &rl) == 0) {
+      xvalue_head_t hh = kvspaceXvalueDecodeHead(raw, rl);
+      if (hh.ref == 0 && is_kind(&hh, KVSPACE_KIND_INDEX))
+        names = parse_index_body(hh.raw, hh.raw_len, &nnames);
+    }
+  }
+  for (int32_t i = 0; i < nnames; i++)
+    if (strcmp(names[i], name) == 0) {
+      for (int32_t j = 0; j < nnames; j++)
+        free(names[j]);
+      free(names);
+      return 0;
+    }
+  char **nn = realloc(names, sizeof(char *) * (size_t)(nnames + 1));
+  if (!nn) {
+    for (int32_t j = 0; j < nnames; j++)
+      free(names[j]);
+    free(names);
+    return -1;
+  }
+  nn[nnames] = strdup(name);
+  uint8_t *iv;
+  int32_t ivl = kvspaceXvalueNewIndex((const char **)nn, nnames + 1, &iv);
+  int rc = shm_set_raw(kv, mem, iv, ivl);
+  free(iv);
+  for (int32_t j = 0; j <= nnames; j++)
+    free(nn[j]);
+  free(nn);
+  return rc;
+}
+
+/* 从 memindex 移除成员名（幂等）。 */
+static int remove_child_index(kvspace_t *kv, const char *mem, const char *name) {
+  art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)mem,
+                            (int)strlen(mem));
+  if (!h || !h->has_value)
+    return 0;
+  uint8_t *raw;
+  int32_t rl;
+  if (read_tlv(kv, h->box_offset, &raw, &rl) < 0)
+    return 0;
+  xvalue_head_t hh = kvspaceXvalueDecodeHead(raw, rl);
+  if (hh.ref != 0 || !is_kind(&hh, KVSPACE_KIND_INDEX))
+    return 0;
+  int32_t nnames;
+  char **names = parse_index_body(hh.raw, hh.raw_len, &nnames);
+  if (!names)
+    return 0;
+  int32_t j = 0;
+  for (int32_t i = 0; i < nnames; i++) {
+    if (strcmp(names[i], name) == 0) {
+      free(names[i]);
+      continue;
+    }
+    names[j++] = names[i];
+  }
+  if (j == nnames) {
+    for (int32_t i = 0; i < j; i++)
+      free(names[i]);
+    free(names);
+    return 0;
+  }
+  uint8_t *iv;
+  int32_t ivl = kvspaceXvalueNewIndex((const char **)names, j, &iv);
+  int rc = shm_set_raw(kv, mem, iv, ivl);
+  free(iv);
+  for (int32_t i = 0; i < j; i++)
+    free(names[i]);
+  free(names);
+  return rc;
+}
+
 int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
                 int32_t val_len) {
   if (!kv || !key)
@@ -938,17 +1177,103 @@ int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
     return -1;
   char kbuf[1024];
   resolve_path(kv, key, kbuf, sizeof(kbuf)); // always resolve through link
-  art_hdr_t *old = art_search(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
-                              (int)strlen(kbuf));
-  if (old && old->has_value)
-    sbo_free(kv->sbo_meta, old->box_offset);
-  uint64_t off = sbo_alloc(kv->sbo_meta, (size_t)val_len);
-  if (off == (uint64_t)-1)
+  if (strstr(kbuf, "//"))
     return -1;
-  memcpy(kv->sbo_data + off, val, val_len);
-  kv->hdr->art_root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
-                              (int)strlen(kbuf), 0, off);
-  return 0;
+
+  xvalue_head_t hh = kvspaceXvalueDecodeHead(val, val_len);
+
+  /* 目录 kind（index/extindex）必须落在目录键（尾 / 或 ·）。 */
+  if (hh.ref == 0 && (is_kind(&hh, KVSPACE_KIND_INDEX) ||
+                      is_kind(&hh, KVSPACE_KIND_EXT_INDEX))) {
+    size_t l = strlen(kbuf);
+    bool is_dir = (l > 0 && kbuf[l - 1] == '/') ||
+                  (l >= 2 && (unsigned char)kbuf[l - 2] == 0xC2 &&
+                   (unsigned char)kbuf[l - 1] == 0xB7);
+    if (!is_dir)
+      return -1;
+  }
+
+  /* 容器值（object/stringkeymap）：值写 p（无后缀，body 空），memindex p· 单独写。 */
+  if (hh.ref == 0 && (is_kind(&hh, KVSPACE_KIND_OBJ) ||
+                      is_kind(&hh, KVSPACE_KIND_MAP))) {
+    char *base = strip_dir_suf_alloc(kbuf);
+    if (!base || !base[0]) {
+      free(base);
+      return -1;
+    }
+    int32_t nnames;
+    char **names = parse_index_body(hh.raw, hh.raw_len, &nnames);
+    char *kind = strndup(hh.kind, hh.kind_len);
+    uint8_t *cv;
+    int32_t cvl = kvspaceXvalueEncodeMode(kind, NULL, 0, hh.dims, hh.ndim, 0,
+                                          hh.ro, hh.vid, &cv);
+    int rc = shm_set_raw(kv, base, cv, cvl);
+    free(cv);
+    free(kind);
+    if (rc < 0) {
+      if (names) {
+        for (int32_t i = 0; i < nnames; i++)
+          free(names[i]);
+        free(names);
+      }
+      free(base);
+      return -1;
+    }
+    char *mem = memjoin(base);
+    uint8_t *iv;
+    int32_t ivl = kvspaceXvalueNewIndex((const char **)names, nnames, &iv);
+    rc = shm_set_raw(kv, mem, iv, ivl);
+    free(iv);
+    free(mem);
+    /* 注册 base 为其父 memindex 成员（嵌套容器）。 */
+    char *pp = NULL, *pn = NULL;
+    bool pm = false;
+    shm_split_index(base, &pp, &pn, &pm);
+    if (pm)
+      add_child_index(kv, pp, pn);
+    free(pp);
+    free(pn);
+    if (names) {
+      for (int32_t i = 0; i < nnames; i++)
+        free(names[i]);
+      free(names);
+    }
+    free(base);
+    return rc;
+  }
+
+  /* 成员写：memindex 成员 p·name → 维护 p· 的 index。 */
+  char *parent = NULL, *name = NULL;
+  bool is_member = false;
+  shm_split_index(kbuf, &parent, &name, &is_member);
+  if (is_member) {
+    ensure_memindex(kv, parent);
+    /* 自动兜底：坐标段成员 + 容器值 p 不存在 → 建 stringkeymap（dims 由坐标推导）。 */
+    if (coord_is_coord(name)) {
+      char *base = strip_dir_suf_alloc(parent);
+      art_hdr_t *ch = art_search(kv, kv->hdr->art_root, (const uint8_t *)base,
+                                 (int)strlen(base));
+      if (!ch || !ch->has_value) {
+        int32_t dims[8];
+        int32_t ndim;
+        grow_coord_dims_one(name, dims, &ndim);
+        uint8_t *mv;
+        int32_t mvl = kvspaceXvalueEncode(KVSPACE_KIND_MAP, NULL, 0, dims, ndim, &mv);
+        shm_set_raw(kv, base, mv, mvl);
+        free(mv);
+      }
+      free(base);
+    }
+    add_child_index(kv, parent, name);
+    int rc = shm_set_raw(kv, kbuf, val, val_len);
+    free(parent);
+    free(name);
+    return rc;
+  }
+  free(parent);
+  free(name);
+
+  return shm_set_raw(kv, kbuf, val, val_len);
 }
 
 int kvspaceShmDel(kvspace_t *kv, const char *key) {
@@ -956,6 +1281,14 @@ int kvspaceShmDel(kvspace_t *kv, const char *key) {
     return -1;
   char kbuf[1024];
   resolve_path(kv, key, kbuf, sizeof(kbuf)); // POSIX rm: resolve all
+  /* memindex 成员删除 → 同步从 p· 的 index 移除。 */
+  char *parent = NULL, *name = NULL;
+  bool is_member = false;
+  shm_split_index(kbuf, &parent, &name, &is_member);
+  if (is_member)
+    remove_child_index(kv, parent, name);
+  free(parent);
+  free(name);
   bool d = false;
   kv->hdr->art_root = art_del(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
                               (int)strlen(kbuf), 0, &d);
@@ -991,7 +1324,7 @@ int kvspaceShmDeltree(kvspace_t *kv, const char *prefix) {
   free(ns);
 
   /* 成员目录 marker（prefix·，U+00B7）：成员 key = prefix·<name>，直接拼接后递归删除。
-     slash 版 e=prefix/ 覆盖不到 · 成员（json 的 objindex/strkeymapindex 落盘形态）。 */
+     slash 版 e=prefix/ 覆盖不到 · 成员（json 的 object/stringkeymap 落盘形态）。 */
   size_t pl = strlen(prefix);
   char *m = malloc(pl + 3);
   memcpy(m, prefix, pl);
@@ -1034,7 +1367,7 @@ int kvspaceShmMkindex(kvspace_t *kv, const char *path) {
   return r;
 }
 
-/* ── strkeymapindex 坐标段 [s0,s1,...] 解析与排序（对齐 kvspace-durable coord） ── */
+/* ── stringkeymap 坐标段 [s0,s1,...] 解析与排序（对齐 kvspace-durable coord） ── */
 
 /* 坐标段结构判定：任意非空 [..]，禁止嵌套 [ ]。小数/字符串坐标（[12.24,x]）也算坐标段。 */
 static int coord_is_coord(const char *name) {
@@ -1104,13 +1437,16 @@ static int qsort_coord_cmp(const void *a, const void *b) {
   return coord_cmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-/* 读 dir（目录键）的 objindex/strkeymapindex 成员名（body = [4B count LE]name1\nname2...）。
- * 命中返回 1 并填充 names/count；非 obj/map 或读失败返回 0（调用方回退 ART scan）。
- * strkeymapindex 成员按坐标 row-major 数值升序返回。 */
+/* 读 memindex（p·）的成员名：index body（[4B count LE]name1\nname2...）是成员名唯一权威。
+ * 仅 p·（尾 ·）目录命中；slash 目录（p/）不自动维护 index，调用方回退 ART scan。
+ * stringkeymap：读容器值 p 的 kind 判定后按坐标 row-major 数值升序（对齐 durable coord.cmp_coord）。 */
 static int read_index_names(kvspace_t *kv, const char *dir, char ***on, int32_t *oc) {
   *on = NULL;
   *oc = 0;
-  art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)dir, (int)strlen(dir));
+  size_t dl = strlen(dir);
+  if (dl < 2 || !((unsigned char)dir[dl - 2] == 0xC2 && (unsigned char)dir[dl - 1] == 0xB7))
+    return 0; /* 仅 memindex（p·） */
+  art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)dir, (int)dl);
   if (!h || !h->has_value)
     return 0;
   uint8_t *raw;
@@ -1118,34 +1454,27 @@ static int read_index_names(kvspace_t *kv, const char *dir, char ***on, int32_t 
   if (read_tlv(kv, h->box_offset, &raw, &rl) < 0)
     return 0;
   xvalue_head_t hh = kvspaceXvalueDecodeHead(raw, rl);
-  /* 仅 objindex/strkeymapindex（· 成员目录）：marker body 显式存成员名（json writeObj/writeArr）。
-   * index（/ 目录，kv.mkindex）在 shm 后端不自动维护，成员名以 ART scan 为准。 */
-  bool is_obj = hh.kind_len == (int32_t)strlen(KVSPACE_KIND_OBJ) && memcmp(hh.kind, KVSPACE_KIND_OBJ, hh.kind_len) == 0;
-  bool is_map = hh.kind_len == (int32_t)strlen(KVSPACE_KIND_MAP) && memcmp(hh.kind, KVSPACE_KIND_MAP, hh.kind_len) == 0;
-  if (!is_obj && !is_map)
+  if (hh.ref != 0 || !is_kind(&hh, KVSPACE_KIND_INDEX))
     return 0;
-  if (hh.raw_len < 4)
+  char **names = parse_index_body(hh.raw, hh.raw_len, oc);
+  if (!names)
     return 1;
-  const char *s = (const char *)hh.raw + 4;
-  int32_t slen = hh.raw_len - 4;
-  if (slen == 0)
-    return 1;
-  char **names = malloc(sizeof(char *) * 4096);
-  int32_t cnt = 0;
-  int start = 0;
-  for (int i = 0; i <= slen; i++) {
-    if (i == slen || s[i] == '\n') {
-      if (i > start) {
-        names[cnt] = strndup(s + start, (size_t)(i - start));
-        cnt++;
-      }
-      start = i + 1;
+  /* stringkeymap：容器值 p（strip · 后无后缀）的 kind 决定 row-major 升序。 */
+  char *base = strip_dir_suf_alloc(dir);
+  bool is_map = false;
+  art_hdr_t *ch = art_search(kv, kv->hdr->art_root, (const uint8_t *)base, (int)strlen(base));
+  if (ch && ch->has_value) {
+    uint8_t *craw;
+    int32_t crl;
+    if (read_tlv(kv, ch->box_offset, &craw, &crl) == 0) {
+      xvalue_head_t chh = kvspaceXvalueDecodeHead(craw, crl);
+      is_map = chh.ref == 0 && is_kind(&chh, KVSPACE_KIND_MAP);
     }
   }
+  free(base);
+  if (is_map && *oc > 1)
+    qsort(names, (size_t)*oc, sizeof(char *), qsort_coord_cmp);
   *on = names;
-  *oc = cnt;
-  if (is_map && cnt > 1)
-    qsort(names, (size_t)cnt, sizeof(char *), qsort_coord_cmp);
   return 1;
 }
 
@@ -1163,7 +1492,7 @@ int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
     resolve_path(kv, prefix, tbuf, sizeof(tbuf));
     pfx = tbuf;
   }
-  /* objindex/strkeymapindex 目录：直接读 marker 成员名（对齐 durable read_dir_index）。 */
+  /* memindex（p·）：读 index body 成员名（唯一权威）；stringkeymap 按坐标 row-major 升序。 */
   if (read_index_names(kv, pfx, on, oc))
     return 0;
   int plen = (int)strlen(pfx);

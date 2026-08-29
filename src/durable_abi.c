@@ -60,8 +60,13 @@ int kvspaceSet(void *h, const char *const *keys, const uint8_t *vals,
     (void)err; (void)err_cap;
     uint32_t off = 0;
     for (uint32_t i = 0; i < n; i++) {
-        kvspaceShmSet((kvspace_t *)h, keys[i], vals + off, (int32_t)lens[i]);
+        int rc = kvspaceShmSet((kvspace_t *)h, keys[i], vals + off, (int32_t)lens[i]);
         off += lens[i];
+        if (rc != 0) {
+            if (err && err_cap)
+                snprintf(err, err_cap, "kvspace: set failed at key %s", keys[i]);
+            return 1;
+        }
     }
     return 0;
 }
