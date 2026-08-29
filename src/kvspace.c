@@ -1171,6 +1171,51 @@ static int remove_child_index(kvspace_t *kv, const char *mem, const char *name) 
   return rc;
 }
 
+/* 写成员时沿父链逐层兜底容器值（leaf base + 中间层 object/stringkeymap）并注册成员（对齐 durable）。
+ * parent 是尾 · 的成员父目录，name 是该成员名；逐层向上建容器值并注册成员到各自 memindex。 */
+static void ensure_member_chain(kvspace_t *kv, char *parent, char *name) {
+  char *dir = strdup(parent);
+  char *child = strdup(name);
+  for (;;) {
+    char *base = strip_dir_suf_alloc(dir);
+    art_hdr_t *ch = art_search(kv, kv->hdr->art_root, (const uint8_t *)base,
+                               (int)strlen(base));
+    if (!ch || !ch->has_value) {
+      if (coord_is_coord(child)) {
+        int32_t dims[8];
+        int32_t ndim;
+        grow_coord_dims_one(child, dims, &ndim);
+        uint8_t *mv;
+        int32_t mvl = kvspaceXvalueEncode(KVSPACE_KIND_MAP, NULL, 0, dims, ndim, &mv);
+        shm_set_raw(kv, base, mv, mvl);
+        free(mv);
+      } else {
+        uint8_t *ov;
+        int32_t ovl = kvspaceXvalueEncode(KVSPACE_KIND_OBJ, NULL, 0, NULL, 0, &ov);
+        shm_set_raw(kv, base, ov, ovl);
+        free(ov);
+      }
+    }
+    ensure_memindex(kv, dir);
+    add_child_index(kv, dir, child);
+    char *pp = NULL, *pn = NULL;
+    bool pm = false;
+    shm_split_index(base, &pp, &pn, &pm);
+    free(base);
+    if (!pm) {
+      free(pp);
+      free(pn);
+      free(dir);
+      free(child);
+      break; /* 父是层级目录（如 /），shm 不维护根 index */
+    }
+    free(dir);
+    dir = pp;
+    free(child);
+    child = pn;
+  }
+}
+
 int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
                 int32_t val_len) {
   if (!kv || !key)
@@ -1255,36 +1300,7 @@ int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
   bool is_member = false;
   shm_split_index(kbuf, &parent, &name, &is_member);
   if (is_member) {
-    ensure_memindex(kv, parent);
-    /* 自动兜底：容器值 p 不存在 → 坐标段建 stringkeymap，命名成员建 object（对齐 durable）。 */
-    char *base = strip_dir_suf_alloc(parent);
-    art_hdr_t *ch = art_search(kv, kv->hdr->art_root, (const uint8_t *)base,
-                               (int)strlen(base));
-    if (!ch || !ch->has_value) {
-      if (coord_is_coord(name)) {
-        int32_t dims[8];
-        int32_t ndim;
-        grow_coord_dims_one(name, dims, &ndim);
-        uint8_t *mv;
-        int32_t mvl = kvspaceXvalueEncode(KVSPACE_KIND_MAP, NULL, 0, dims, ndim, &mv);
-        shm_set_raw(kv, base, mv, mvl);
-        free(mv);
-      } else {
-        uint8_t *ov;
-        int32_t ovl = kvspaceXvalueEncode(KVSPACE_KIND_OBJ, NULL, 0, NULL, 0, &ov);
-        shm_set_raw(kv, base, ov, ovl);
-        free(ov);
-      }
-    }
-    /* 注册容器名（base 末段）到父 memindex（对齐 durable parent_name + children.push）。 */
-    char *pp = NULL, *pn = NULL;
-    bool pm = false;
-    shm_split_index(base, &pp, &pn, &pm);
-    if (pm) add_child_index(kv, pp, pn);
-    free(pp);
-    free(pn);
-    free(base);
-    add_child_index(kv, parent, name);
+    ensure_member_chain(kv, parent, name);
     int rc = shm_set_raw(kv, kbuf, val, val_len);
     free(parent);
     free(name);
