@@ -26,7 +26,7 @@ Two surfaces:
 2. **durable C ABI** — byte-compatible with `kvspace-durable` (`src/durable_abi.c`):
    `kvspaceConnect/Free/BytesFree`, `kvspaceGet/Set/GetBatch/List/Del/DelTree`,
    `kvspaceMkindex/MkindexExt/RmindexExt/Watch/Clear/Disconnect`,
-   `kvspaceTlvEncode/TlvEncodePtr/TlvEncodeMode/DecodeHead`,
+   `kvspaceTlvEncode/TlvEncodeMode/DecodeHead`,
    `kvspaceNewPtr/NewChar/NewCharByte/NewBool/NewInt64/NewFloat64`.
 
    A consumer (e.g. the kvlang layout) links this ABI and switches backends by DSN only, with no code change.

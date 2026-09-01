@@ -2,7 +2,7 @@
  * xvalue.h — XValue 类型系统与 TLV 编解码（对齐 kvspace-durable 的 kindexp TLV）。
  *
  * TLV: [1B kindexprlen][kindexpr 含 0x00 padding][1B ro][4B vid LE][4B raw_len LE][raw]
- *   kindexpr 串首字节 * =软链接(Ptr, raw=目标路径) / @ =扩展句柄 / 无 =内联，其后 [d0,d1]kind 承载 ndim+dims：
+ *   kindexpr 串首字节 * =指针(Ptr, 去 * 即目标完整 kindexpr, raw=目标 key) / @ =扩展句柄 / 无 =内联，其后 [d0,d1]kind 承载 ndim+dims：
  *   裸 kind=标量(ndim=0)、[n]kind=一维、[d0,d1]kind=多维。kindexprlen 为槽总长（含 padding），
  *   reshape 时新 kindexpr 不超过槽长即可原地改写不搬 body；内容以首个 NUL 终止。
  *   char/* kind 恒为一维序列（[n]，含空串/单字符）
@@ -51,7 +51,7 @@ typedef struct {
     int32_t        kindexprlen;  /* wire 槽总长（内容 + NUL + padding） */
     const char    *kind;         /* 派生：base kind（kindexpr 子串），非 NUL 终止 */
     int32_t        kind_len;
-    int32_t        ref;          /* 派生：0=内联 1=软链接 2=扩展句柄 */
+    int32_t        ref;          /* 派生：0=内联 1=指针 2=扩展句柄 */
     int32_t        ro;           /* 1=只读，0=可写 */
     uint32_t       vid;          /* vthread id（默认 0） */
     int32_t        ndim;         /* 派生：0=标量，N=N 维数组 */
@@ -67,9 +67,6 @@ int32_t kvspaceXvalueHeadLen(const xvalue_head_t *h);
 /* 内联编码（ref=0）。dims/ndim 直接落盘：ndim=0 标量，dims 可为 NULL。 */
 int32_t kvspaceXvalueEncode(const char *kind, const uint8_t *raw, int32_t raw_len,
                       const int32_t *dims, int32_t ndim, uint8_t **out);
-/* 软链接编码（ref=1），raw 为目标路径。 */
-int32_t kvspaceXvalueEncodePtr(const char *kind, const uint8_t *raw, int32_t raw_len,
-                          const int32_t *dims, int32_t ndim, uint8_t **out);
 /* 带权限编码（ref + ro + vid）。 */
 int32_t kvspaceXvalueEncodeMode(const char *kind, const uint8_t *raw, int32_t raw_len,
                           const int32_t *dims, int32_t ndim, int32_t ref, int32_t ro, uint32_t vid,
@@ -126,7 +123,7 @@ int32_t kvspaceXvalueAtChar(const xvalue_head_t *h, int32_t idx);
 int32_t kvspaceXvalueNewIndex(const char **children, int32_t count, uint8_t **out);
 int32_t kvspaceXvalueNewMap(const char **children, int32_t count,
                             const int32_t *dims, int32_t ndim, uint8_t **out);
-int32_t kvspaceXvalueNewPtr(const char *kind, const char *target, int32_t array_len, uint8_t **out);
+int32_t kvspaceXvalueNewPtr(const char *target_kindexpr, const char *target, uint8_t **out);
 int32_t kvspaceXvalueNewExtindex(const char *extpath, const char **children, int32_t count, uint8_t **out);
 
 #define kvspaceXvalueNewBool1(v, out)     kvspaceXvalueNewBool(&(bool){v}, 1, out)

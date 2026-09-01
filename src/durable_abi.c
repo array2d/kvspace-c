@@ -148,14 +148,6 @@ int kvspaceTlvEncode(const char *kind, const uint8_t *raw, uint32_t raw_len,
     return 0;
 }
 
-int kvspaceTlvEncodePtr(const char *kind, const uint8_t *raw, uint32_t raw_len,
-                           const int32_t *dims, int32_t ndim, uint8_t **out, uint32_t *out_len) {
-    int32_t n = kvspaceXvalueEncodePtr(kind, raw, (int32_t)raw_len, dims, ndim, out);
-    if (n < 0) return 1;
-    *out_len = (uint32_t)n;
-    return 0;
-}
-
 int kvspaceTlvEncodeMode(const char *kind, const uint8_t *raw, uint32_t raw_len,
                            const int32_t *dims, int32_t ndim, int32_t ref, uint8_t ro, uint32_t vid,
                            uint8_t **out, uint32_t *out_len) {
@@ -180,9 +172,9 @@ int kvspaceDecodeHead(const uint8_t *data, uint32_t data_len, kvspaceHead_t *out
     return 0;
 }
 
-int kvspaceNewPtr(const char *kind, const char *target, int32_t array_len,
+int kvspaceNewPtr(const char *target_kindexpr, const char *target,
                     uint8_t **out, uint32_t *out_len) {
-    int32_t n = kvspaceXvalueNewPtr(kind, target, array_len, out);
+    int32_t n = kvspaceXvalueNewPtr(target_kindexpr, target, out);
     if (n < 0) return 1;
     *out_len = (uint32_t)n;
     return 0;

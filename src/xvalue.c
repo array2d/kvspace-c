@@ -78,15 +78,6 @@ int32_t kvspaceXvalueEncode(const char *kind, const uint8_t *raw, int32_t raw_le
     return encode_head(kind, 0, 0, 0, dims, ndim, raw, raw_len, out);
 }
 
-int32_t kvspaceXvalueEncodePtr(const char *kind, const uint8_t *raw, int32_t raw_len,
-                          const int32_t *dims, int32_t ndim, uint8_t **out) {
-    if (!out || !kind) return -1;
-    if (ndim < 0) ndim = 0;
-    if (ndim > X_MAX_NDIM) return -1;
-    if (raw_len < 0) raw_len = 0;
-    return encode_head(kind, 1, 0, 0, dims, ndim, raw, raw_len, out);
-}
-
 int32_t kvspaceXvalueEncodeMode(const char *kind, const uint8_t *raw, int32_t raw_len,
                           const int32_t *dims, int32_t ndim, int32_t ref, int32_t ro, uint32_t vid,
                           uint8_t **out) {
@@ -109,13 +100,6 @@ static int32_t encode_al(const char *kind, const uint8_t *raw, int32_t raw_len,
                          int32_t array_len, uint8_t **out) {
     int32_t dims[1]; int32_t nd = al_to_dims(kind, array_len, dims);
     return kvspaceXvalueEncode(kind, raw, raw_len, dims, nd, out);
-}
-
-static int32_t encode_al_ptr(const char *kind, const uint8_t *raw, int32_t raw_len,
-                             int32_t array_len, uint8_t **out) {
-    if (array_len <= 0) array_len = 1;
-    int32_t dims[1]; int32_t nd = al_to_dims(kind, array_len, dims);
-    return kvspaceXvalueEncodePtr(kind, raw, raw_len, dims, nd, out);
 }
 
 xvalue_head_t kvspaceXvalueDecodeHead(const uint8_t *data, int32_t data_len) {
@@ -299,9 +283,11 @@ int32_t kvspaceXvalueNewMap(const char **children, int32_t count,
     return r;
 }
 
-int32_t kvspaceXvalueNewPtr(const char *kind, const char *target, int32_t array_len, uint8_t **out) {
-    if (!target) return -1;
-    return encode_al_ptr(kind, (const uint8_t *)target, (int32_t)strlen(target), array_len, out);
+/* 指针（ref=1）：head kindexpr = "*" + target_kindexpr（目标完整 kindexpr，含其自身
+ * 的引用/形状前缀），恒标量不派生 dims；body = 目标 key 路径。 */
+int32_t kvspaceXvalueNewPtr(const char *target_kindexpr, const char *target, uint8_t **out) {
+    if (!target || !target_kindexpr || !out) return -1;
+    return encode_head(target_kindexpr, 1, 0, 0, 0, 0, (const uint8_t *)target, (int32_t)strlen(target), out);
 }
 
 #define EXT_PREFIX "…"
