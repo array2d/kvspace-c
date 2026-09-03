@@ -115,6 +115,16 @@ int kvspaceDelTree(void *h, const char *prefix, char *err, uint32_t err_cap) {
     return kvspaceShmDeltree((kvspace_t *)h, prefix);
 }
 
+int kvspaceCp(void *h, const char *src, const char *dst, char *err, uint32_t err_cap) {
+    (void)err; (void)err_cap;
+    return kvspaceShmCp((kvspace_t *)h, src, dst);
+}
+
+int kvspaceCpTree(void *h, const char *src, const char *dst, char *err, uint32_t err_cap) {
+    (void)err; (void)err_cap;
+    return kvspaceShmCptree((kvspace_t *)h, src, dst);
+}
+
 int kvspaceMkindex(void *h, const char *path, char *err, uint32_t err_cap) {
     (void)err; (void)err_cap;
     return kvspaceShmMkindex((kvspace_t *)h, path);

@@ -1421,6 +1421,93 @@ int kvspaceShmDeltree(kvspace_t *kv, const char *prefix) {
   return 0;
 }
 
+/* 成员目录 marker（p·，U+00B7）。 */
+static char *memdir(const char *p) {
+  size_t l = strlen(p);
+  char *r = malloc(l + 3);
+  memcpy(r, p, l);
+  r[l] = (char)0xC2;
+  r[l + 1] = (char)0xB7;
+  r[l + 2] = 0;
+  return r;
+}
+
+/* 单 key 原样拷贝（Set 可能移动 slab，先拷出）。 */
+int kvspaceShmCp(kvspace_t *kv, const char *src, const char *dst) {
+  if (!kv || !src || !dst)
+    return -1;
+  int32_t rl;
+  uint8_t *raw = kvspaceShmGet(kv, src, 0, &rl);
+  if (!raw || rl <= 0)
+    return -1;
+  uint8_t *tmp = malloc((size_t)rl);
+  memcpy(tmp, raw, (size_t)rl);
+  int rc = kvspaceShmSet(kv, dst, tmp, rl);
+  free(tmp);
+  return rc;
+}
+
+/* 递归拷贝：镜像 kvspaceShmDeltree 的遍历（/ 子节点 + · 成员），逐 key 原样复制。
+   index 由 ART 前缀扫描派生，故写入 dst 各 key 即自动重建目录；extindex marker 一并复制。 */
+static int cptree_rec(kvspace_t *kv, const char *src, const char *dst) {
+  {
+    int32_t rl;
+    uint8_t *raw = kvspaceShmGet(kv, src, 0, &rl);
+    if (raw && rl > 0) {
+      uint8_t *tmp = malloc((size_t)rl);
+      memcpy(tmp, raw, (size_t)rl);
+      kvspaceShmSet(kv, dst, tmp, rl);
+      free(tmp);
+    }
+  }
+  char *es = edir(src), *ed = edir(dst);
+  char **ns;
+  int32_t nc;
+  kvspaceShmList(kv, es, false, 1, &ns, &nc);
+  for (int i = 0; i < nc; i++) {
+    char *cs = pjoin(es, ns[i]), *cd = pjoin(ed, ns[i]);
+    cptree_rec(kv, cs, cd);
+    free(cs);
+    free(cd);
+  }
+  for (int i = 0; i < nc; i++)
+    free(ns[i]);
+  free(ns);
+  free(es);
+  free(ed);
+
+  char *ms = memdir(src), *md = memdir(dst);
+  kvspaceShmCp(kv, ms, md); /* memindex marker 值（extindex marker / map dims）本身。 */
+  char **mms;
+  int32_t mc;
+  kvspaceShmList(kv, ms, false, 1, &mms, &mc);
+  for (int i = 0; i < mc; i++) {
+    size_t msl = strlen(ms), mdl = strlen(md), nl = strlen(mms[i]);
+    char *cs = malloc(msl + nl + 1);
+    memcpy(cs, ms, msl);
+    memcpy(cs + msl, mms[i], nl + 1);
+    char *cd = malloc(mdl + nl + 1);
+    memcpy(cd, md, mdl);
+    memcpy(cd + mdl, mms[i], nl + 1);
+    cptree_rec(kv, cs, cd);
+    free(cs);
+    free(cd);
+  }
+  for (int i = 0; i < mc; i++)
+    free(mms[i]);
+  free(mms);
+  free(ms);
+  free(md);
+  return 0;
+}
+
+int kvspaceShmCptree(kvspace_t *kv, const char *src, const char *dst) {
+  if (!kv || !src || !dst)
+    return -1;
+  kvspaceShmDeltree(kv, dst); /* 覆盖语义：先清 dst 子树。 */
+  return cptree_rec(kv, src, dst);
+}
+
 int kvspaceShmMkindex(kvspace_t *kv, const char *path) {
   if (!kv || !path)
     return -1;
