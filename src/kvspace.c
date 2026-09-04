@@ -946,8 +946,16 @@ static int shm_set_raw(kvspace_t *kv, const char *key, const uint8_t *val,
                        int32_t val_len) {
   art_hdr_t *old = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
                               (int)strlen(key));
-  if (old && old->has_value)
+  if (old && old->has_value) {
+    /* 同尺寸原地覆写：新值 ≤ 旧 box 容量时直接 memcpy，跳过 free+alloc，
+       不改共享 buddy 树。容量读自共享 mmap，零进程内状态。 */
+    uint64_t cap = sbo_allocated_size(kv->sbo_meta, old->box_offset);
+    if ((uint64_t)val_len <= cap) {
+      memcpy(kv->sbo_data + old->box_offset, val, (size_t)val_len);
+      return 0;
+    }
     sbo_free(kv->sbo_meta, old->box_offset);
+  }
   uint64_t off = sbo_alloc(kv->sbo_meta, (size_t)val_len);
   if (off == (uint64_t)-1)
     return -1;
