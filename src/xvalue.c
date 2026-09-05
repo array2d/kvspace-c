@@ -30,6 +30,23 @@ int32_t kvspaceXvalueHeadLen(const xvalue_head_t *h) {
     return 1 + h->kindexprlen + 1 + 4 + 4;
 }
 
+int32_t kvspaceXvalueHeadLenForKindexpr(const char *kindexpr) {
+    int32_t kxl = kindexpr ? (int32_t)strlen(kindexpr) : 0;
+    return 1 + (kxl + 1) + 1 + 4 + 4; /* slot = kxl + 1（含 NUL） */
+}
+
+void kvspaceXvalueWriteHead(uint8_t *dst, const char *kindexpr, int32_t body_len) {
+    int32_t kxl = kindexpr ? (int32_t)strlen(kindexpr) : 0;
+    int32_t slot = kxl + 1;
+    dst[0] = (uint8_t)slot;
+    if (kxl > 0) memcpy(dst + 1, kindexpr, (size_t)kxl);
+    dst[1 + kxl] = 0;
+    int32_t o = 1 + slot;
+    dst[o] = 0;                              /* ro */
+    wr_u32(dst + o + 1, 0);                  /* vid */
+    wr_u32(dst + o + 5, (uint32_t)body_len); /* raw_len */
+}
+
 static int32_t build_kindexpr(char *buf, int32_t cap, const char *kind, int32_t ref,
                               const int32_t *dims, int32_t ndim) {
     int32_t o = 0;

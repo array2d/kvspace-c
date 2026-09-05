@@ -1224,6 +1224,69 @@ static void ensure_member_chain(kvspace_t *kv, char *parent, char *name) {
   }
 }
 
+/* 非容器写的父索引维护：member → ensure_member_chain；dir index/extindex → 注册父 index。
+   kvspaceShmSet 与零拷贝 kvspaceShmWriteNewPlace 共用，杜绝逻辑分叉。 */
+static void shm_ensure_indexes(kvspace_t *kv, const char *kbuf,
+                               const xvalue_head_t *hh) {
+  char *parent = NULL, *name = NULL;
+  bool is_member = false;
+  shm_split_index(kbuf, &parent, &name, &is_member);
+  if (is_member) {
+    ensure_member_chain(kv, parent, name);
+    free(parent);
+    free(name);
+    return;
+  }
+  free(parent);
+  free(name);
+  size_t l = strlen(kbuf);
+  bool is_dir = (l > 0 && kbuf[l - 1] == '/') ||
+                (l >= 2 && (unsigned char)kbuf[l - 2] == 0xC2 &&
+                 (unsigned char)kbuf[l - 1] == 0xB7);
+  if (is_dir && hh->ref == 0 &&
+      (is_kind(hh, KVSPACE_KIND_INDEX) || is_kind(hh, KVSPACE_KIND_EXT_INDEX))) {
+    char *strip = strip_dir_suf_alloc(kbuf);
+    char *pp = NULL, *pn = NULL;
+    bool pm = false;
+    shm_split_index(strip, &pp, &pn, &pm);
+    if (pn && pn[0]) {
+      char *dn = pn;
+      if (kbuf[l - 1] == '/') {
+        size_t nl = strlen(pn);
+        dn = malloc(nl + 2);
+        memcpy(dn, pn, nl);
+        dn[nl] = '/';
+        dn[nl + 1] = 0;
+      }
+      add_child_index(kv, pp, dn);
+      if (dn != pn)
+        free(dn);
+    }
+    free(pp);
+    free(pn);
+    free(strip);
+  }
+}
+
+/* 分配 box、就地写 head（kindexpr, body_len），art_ins 挂树，返回 body 偏移指针。
+   已存在 key 先释放旧 box（新位置写=换 box）。零拷贝写路径唯一分配点。 */
+static int shm_alloc_head(kvspace_t *kv, const char *key, const char *kindexpr,
+                          int32_t headlen, int32_t body_len, uint8_t **body) {
+  int32_t total = headlen + body_len;
+  art_hdr_t *old = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
+                              (int)strlen(key));
+  if (old && old->has_value)
+    sbo_free(kv->sbo_meta, old->box_offset);
+  uint64_t off = sbo_alloc(kv->sbo_meta, (size_t)total);
+  if (off == (uint64_t)-1)
+    return -1;
+  kvspaceXvalueWriteHead(kv->sbo_data + off, kindexpr, body_len);
+  kv->hdr->art_root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)key,
+                              (int)strlen(key), 0, off);
+  *body = kv->sbo_data + off + headlen;
+  return 0;
+}
+
 int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
                 int32_t val_len) {
   if (!kv || !key)
@@ -1303,51 +1366,109 @@ int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
     return rc;
   }
 
-  /* 成员写：memindex 成员 p·name → 维护 p· 的 index。 */
-  char *parent = NULL, *name = NULL;
-  bool is_member = false;
-  shm_split_index(kbuf, &parent, &name, &is_member);
-  if (is_member) {
-    ensure_member_chain(kv, parent, name);
-    int rc = shm_set_raw(kv, kbuf, val, val_len);
-    free(parent);
-    free(name);
+  /* 成员/目录索引维护（与 WriteNewPlace 共用），随后落盘。 */
+  shm_ensure_indexes(kv, kbuf, &hh);
+  return shm_set_raw(kv, kbuf, val, val_len);
+}
+
+int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
+                           int32_t body_len, uint8_t **body) {
+  if (!kv || !key || !body || body_len < 0)
+    return -1;
+  char kbuf[1024];
+  if (resolve)
+    resolve_path(kv, key, kbuf, sizeof(kbuf));
+  else {
+    strncpy(kbuf, key, sizeof(kbuf) - 1);
+    kbuf[sizeof(kbuf) - 1] = '\0';
+  }
+  art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
+                            (int)strlen(kbuf));
+  if (!h || !h->has_value)
+    return -1;
+  uint8_t *raw;
+  int32_t rl;
+  if (read_tlv(kv, h->box_offset, &raw, &rl) < 0 || rl <= 0)
+    return -1; /* None 或读失败 → 强制走 NewPlace */
+  xvalue_head_t hh = kvspaceXvalueDecodeHead(raw, rl);
+  if (hh.raw_len != body_len)
+    return -1; /* 前置条件：同 body_len（同 kind 覆写） */
+  *body = raw + kvspaceXvalueHeadLen(&hh);
+  return 0;
+}
+
+int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, const char *kindexpr,
+                            int32_t body_len, uint8_t **body) {
+  if (!kv || !key || !kindexpr || !body || body_len < 0)
+    return -1;
+  char kbuf[1024];
+  resolve_path(kv, key, kbuf, sizeof(kbuf));
+  if (strstr(kbuf, "//"))
+    return -1;
+
+  int32_t headlen = kvspaceXvalueHeadLenForKindexpr(kindexpr);
+  uint8_t hbuf[512];
+  if (headlen > (int32_t)sizeof(hbuf))
+    return -1;
+  kvspaceXvalueWriteHead(hbuf, kindexpr, 0);
+  xvalue_head_t hh = kvspaceXvalueDecodeHead(hbuf, headlen);
+
+  size_t l = strlen(kbuf);
+  bool is_dir = (l > 0 && kbuf[l - 1] == '/') ||
+                (l >= 2 && (unsigned char)kbuf[l - 2] == 0xC2 &&
+                 (unsigned char)kbuf[l - 1] == 0xB7);
+  if (hh.ref == 0 &&
+      (is_kind(&hh, KVSPACE_KIND_INDEX) || is_kind(&hh, KVSPACE_KIND_EXT_INDEX)) &&
+      !is_dir)
+    return -1;
+
+  /* 容器值（object/stringkeymap，body 恒空）：base 空 box + 空 memindex + 注册父。 */
+  if (hh.ref == 0 &&
+      (is_kind(&hh, KVSPACE_KIND_OBJ) || is_kind(&hh, KVSPACE_KIND_MAP))) {
+    if (body_len != 0)
+      return -1;
+    char *base = strip_dir_suf_alloc(kbuf);
+    if (!base || !base[0]) {
+      free(base);
+      return -1;
+    }
+    char *mem = memjoin(base);
+    uint8_t *iv;
+    int32_t ivl = kvspaceXvalueNewIndex(NULL, 0, &iv);
+    if (ivl > 0) {
+      shm_set_raw(kv, mem, iv, ivl);
+      free(iv);
+    }
+    free(mem);
+    char *pp = NULL, *pn = NULL;
+    bool pm = false;
+    shm_split_index(base, &pp, &pn, &pm);
+    if (pm)
+      add_child_index(kv, pp, pn);
+    free(pp);
+    free(pn);
+    int rc = shm_alloc_head(kv, base, kindexpr, headlen, 0, body);
+    free(base);
     return rc;
   }
-  free(parent);
-  free(name);
 
-  /* 目录写（尾 / 或 · 的 index/extindex）→ 注册父 index（对齐 durable 写目录分支）。 */
-  {
-    size_t l = strlen(kbuf);
-    bool is_dir = (l > 0 && kbuf[l - 1] == '/') ||
-                  (l >= 2 && (unsigned char)kbuf[l - 2] == 0xC2 &&
-                   (unsigned char)kbuf[l - 1] == 0xB7);
-    if (is_dir && hh.ref == 0 &&
-        (is_kind(&hh, KVSPACE_KIND_INDEX) || is_kind(&hh, KVSPACE_KIND_EXT_INDEX))) {
-      char *strip = strip_dir_suf_alloc(kbuf);
-      char *pp = NULL, *pn = NULL;
-      bool pm = false;
-      shm_split_index(strip, &pp, &pn, &pm);
-      if (pn && pn[0]) {
-        char *dn = pn;
-        if (kbuf[l - 1] == '/') {
-          size_t nl = strlen(pn);
-          dn = malloc(nl + 2);
-          memcpy(dn, pn, nl);
-          dn[nl] = '/';
-          dn[nl + 1] = 0;
-        }
-        add_child_index(kv, pp, dn);
-        if (dn != pn) free(dn);
-      }
-      free(pp);
-      free(pn);
-      free(strip);
-    }
+  shm_ensure_indexes(kv, kbuf, &hh);
+  return shm_alloc_head(kv, kbuf, kindexpr, headlen, body_len, body);
+}
+
+int kvspaceShmListLen(kvspace_t *kv, const char *prefix, bool ex, int resolve,
+                      int32_t *out_count) {
+  char **names;
+  int32_t count;
+  if (kvspaceShmList(kv, prefix, ex, resolve, &names, &count) != 0) {
+    *out_count = 0;
+    return -1;
   }
-
-  return shm_set_raw(kv, kbuf, val, val_len);
+  for (int32_t i = 0; i < count; i++)
+    free(names[i]);
+  free(names);
+  *out_count = count;
+  return 0;
 }
 
 int kvspaceShmDel(kvspace_t *kv, const char *key) {

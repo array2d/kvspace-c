@@ -64,6 +64,11 @@ typedef struct {
 /* head 字节数（不含 body） */
 int32_t kvspaceXvalueHeadLen(const xvalue_head_t *h);
 
+/* 由 kindexpr 串直接算 head 字节数（含 slot NUL）。零拷贝写路径用：ro/vid 恒 0。 */
+int32_t kvspaceXvalueHeadLenForKindexpr(const char *kindexpr);
+/* 把 head（kindexpr + body_len，ro=0 vid=0）就地写入 dst 前 headlen 字节；body 随后由调用方填。 */
+void kvspaceXvalueWriteHead(uint8_t *dst, const char *kindexpr, int32_t body_len);
+
 /* 内联编码（ref=0）。dims/ndim 直接落盘：ndim=0 标量，dims 可为 NULL。 */
 int32_t kvspaceXvalueEncode(const char *kind, const uint8_t *raw, int32_t raw_len,
                       const int32_t *dims, int32_t ndim, uint8_t **out);

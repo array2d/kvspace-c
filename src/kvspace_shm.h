@@ -33,6 +33,17 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve, int32_t *out
 // Set: 写入 value（TLV 编码的字节）。总是穿透 link 写入 target。
 int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val, int32_t val_len);
 
+// 零拷贝写原语——返回 SHM 常驻 body 偏移指针供调用方直接写；写即持久，无收尾。
+// WriteInPlace: key 必须已存在、body_len 必须等于原 body_len（同 kind 覆写）；否则返回非 0。
+int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
+                           int32_t body_len, uint8_t **body);
+// WriteNewPlace: 按 (kindexpr, body_len) 分配新 box、写好 head、维护父索引，返回 body 指针。
+int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, const char *kindexpr,
+                            int32_t body_len, uint8_t **body);
+// ListLen: 只返回前缀下子项计数，无缓冲。
+int kvspaceShmListLen(kvspace_t *kv, const char *prefix, bool expand_ext,
+                      int resolve, int32_t *out_count);
+
 /* ================================================================
  * 目录操作
  * ================================================================ */

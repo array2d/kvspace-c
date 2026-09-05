@@ -30,16 +30,6 @@ static int parse_shm_path(const char *dsn, char *out, size_t osz) {
     return 0;
 }
 
-/* 非法目录前缀（不是 / 且不以 / 或 · 结尾）→ 非 0，对齐 durable validate_dir。 */
-static int bad_dir_prefix(const char *p) {
-    if (!p || !p[0]) return 1;
-    if (strcmp(p, "/") == 0) return 0;
-    size_t l = strlen(p);
-    if (p[l - 1] == '/') return 0;
-    if (l >= 2 && (unsigned char)p[l - 2] == 0xC2 && (unsigned char)p[l - 1] == 0xB7) return 0;
-    return 1;
-}
-
 void *kvspaceConnect(const char *dsn) {
     char path[1024];
     if (parse_shm_path(dsn, path, sizeof path) != 0) return NULL;
@@ -50,57 +40,85 @@ void kvspaceClose(void *h) {
     if (h) kvspaceShmClose((kvspace_t *)h);
 }
 
-void kvspaceBytesFree(uint8_t *p, uint32_t len) {
-    (void)len;
-    free(p);
+/* 借用读：*out 指向 SHM 常驻映射（生命周期同该槽），调用方不得 free。 */
+int kvspaceGet(void *h, const char *key, int resolve, uint8_t **out, uint32_t *out_len) {
+    int32_t len = 0;
+    uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, resolve, &len);
+    if (!d || len <= 0) { *out = NULL; *out_len = 0; return 0; }
+    *out = d; *out_len = (uint32_t)len;
+    return 0;
 }
 
-int kvspaceSet(void *h, const char *const *keys, const uint8_t *vals,
-                const uint32_t *lens, uint32_t n, char *err, uint32_t err_cap) {
-    (void)err; (void)err_cap;
-    uint32_t off = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        int rc = kvspaceShmSet((kvspace_t *)h, keys[i], vals + off, (int32_t)lens[i]);
-        off += lens[i];
-        if (rc != 0) {
-            if (err && err_cap)
-                snprintf(err, err_cap, "kvspace: set failed at key %s", keys[i]);
-            return 1;
-        }
+/* 就地写：返回原 box body 偏移指针；前置条件不满足 → 非 0 + err。 */
+int kvspaceWriteInPlace(void *h, const char *key, int resolve, uint32_t body_len,
+                        uint8_t **body, char *err, uint32_t err_cap) {
+    if (kvspaceShmWriteInPlace((kvspace_t *)h, key, resolve, (int32_t)body_len, body) != 0) {
+        if (err && err_cap) snprintf(err, err_cap, "kvspace: write-in-place rejected at %s", key);
+        return 1;
     }
     return 0;
 }
 
-int kvspaceGet(void *h, const char *key, uint8_t **out, uint32_t *out_len) {
-    int32_t len;
-    uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 0, &len);
-    if (!d || len <= 0) { *out = NULL; *out_len = 0; return 0; }
-    uint8_t *c = malloc((size_t)len);
-    memcpy(c, d, (size_t)len);
-    *out = c; *out_len = (uint32_t)len;
+/* 新位置写：按 (kindexpr, body_len) 分配 box、写 head，返回 body 偏移指针。 */
+int kvspaceWriteNewPlace(void *h, const char *key, const char *kindexpr, uint32_t body_len,
+                         uint8_t **body, char *err, uint32_t err_cap) {
+    if (kvspaceShmWriteNewPlace((kvspace_t *)h, key, kindexpr, (int32_t)body_len, body) != 0) {
+        if (err && err_cap) snprintf(err, err_cap, "kvspace: write-new-place failed at %s", key);
+        return 1;
+    }
     return 0;
 }
 
+/* 只返回前缀下子项计数，无缓冲、无需释放。 */
+int kvspaceListLen(void *h, const char *prefix, int expand_ext, int resolve, int32_t *out_count) {
+    return kvspaceShmListLen((kvspace_t *)h, prefix, expand_ext != 0, resolve, out_count);
+}
+
+/* 借用枚举：*out 指向线程局部回收缓冲（\n 连接的直接子项名），生命周期至下次同线程 List，
+   调用方不得 free。空目录 → *out=NULL、*out_len=0。 */
+static __thread uint8_t *list_buf = NULL;
+static __thread size_t list_cap = 0;
 
 int kvspaceList(void *h, const char *prefix, int expand_ext, int resolve,
-                 uint8_t **out, uint32_t *out_len) {
-    char **names; int32_t count;
-    if (kvspaceShmList((kvspace_t *)h, prefix, expand_ext, resolve, &names, &count) != 0) {
-        *out = NULL; *out_len = 0; return 1;
+                uint8_t **out, uint32_t *out_len) {
+    *out = NULL;
+    *out_len = 0;
+    char **names = NULL;
+    int32_t count = 0;
+    if (kvspaceShmList((kvspace_t *)h, prefix, expand_ext != 0, resolve, &names, &count) != 0)
+        return -1;
+    size_t need = 0;
+    for (int32_t i = 0; i < count; i++)
+        need += strlen(names[i]) + 1;
+    if (need == 0) {
+        for (int32_t i = 0; i < count; i++)
+            free(names[i]);
+        free(names);
+        return 0;
     }
-    size_t total = 0;
-    for (int32_t i = 0; i < count; i++) total += strlen(names[i]) + 1;
-    uint8_t *buf = total ? malloc(total) : NULL;
-    size_t off = 0;
+    if (need > list_cap) {
+        uint8_t *nb = realloc(list_buf, need);
+        if (!nb) {
+            for (int32_t i = 0; i < count; i++)
+                free(names[i]);
+            free(names);
+            return -1;
+        }
+        list_buf = nb;
+        list_cap = need;
+    }
+    size_t o = 0;
     for (int32_t i = 0; i < count; i++) {
         size_t l = strlen(names[i]);
-        memcpy(buf + off, names[i], l);
-        off += l;
-        if (i < count - 1) buf[off++] = '\n';
+        if (i)
+            list_buf[o++] = '\n';
+        memcpy(list_buf + o, names[i], l);
+        o += l;
+        free(names[i]);
     }
-    for (int32_t i = 0; i < count; i++) free(names[i]);
     free(names);
-    *out = buf; *out_len = (uint32_t)off;
+    *out = list_buf;
+    *out_len = (uint32_t)o;
     return 0;
 }
 
@@ -220,45 +238,6 @@ int kvspaceNewFloat64(double v, uint8_t **out, uint32_t *out_len) {
     return 0;
 }
 
-int kvspaceGetBatch(void *h, const char *prefix, const char *const *names,
-                      uint32_t nnames, uint8_t **out, uint32_t *out_len) {
-    if (!out || !out_len) return 1;
-    *out = NULL;
-    *out_len = 0;
-    if (bad_dir_prefix(prefix)) return 1;
-    if (!names || nnames == 0) return 0;
-    size_t total = (size_t)nnames * 4;
-    for (uint32_t i = 0; i < nnames; i++) {
-        char key[2048];
-        snprintf(key, sizeof key, "%s%s", prefix, names[i]);
-        int32_t len = 0;
-        uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 1, &len);
-        if (d && len > 0) total += (size_t)len;
-    }
-    uint8_t *buf = malloc(total);
-    if (!buf) return 1;
-    size_t off = 0;
-    for (uint32_t i = 0; i < nnames; i++) {
-        char key[2048];
-        snprintf(key, sizeof key, "%s%s", prefix, names[i]);
-        int32_t len = 0;
-        uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 1, &len);
-        if (!d || len <= 0) len = 0;
-        buf[off] = (uint8_t)(len & 0xFF);
-        buf[off + 1] = (uint8_t)((len >> 8) & 0xFF);
-        buf[off + 2] = (uint8_t)((len >> 16) & 0xFF);
-        buf[off + 3] = (uint8_t)((len >> 24) & 0xFF);
-        off += 4;
-        if (len > 0) {
-            memcpy(buf + off, d, (size_t)len);
-            off += (size_t)len;
-        }
-    }
-    *out = buf;
-    *out_len = (uint32_t)off;
-    return 0;
-}
-
 int kvspaceWatch(void *h, const char *key, const uint8_t *target, uint32_t target_len,
                   uint64_t tick_ns, uint8_t **out, uint32_t *out_len) {
     if (!out || !out_len) return 1;
@@ -270,9 +249,7 @@ int kvspaceWatch(void *h, const char *key, const uint8_t *target, uint32_t targe
         int32_t len = 0;
         uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 1, &len);
         if (d && (uint32_t)len == target_len && memcmp(d, target, target_len) == 0) {
-            uint8_t *c = malloc((size_t)len);
-            memcpy(c, d, (size_t)len);
-            *out = c;
+            *out = d;
             *out_len = (uint32_t)len;
             return 0;
         }
