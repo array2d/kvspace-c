@@ -74,52 +74,42 @@ int kvspaceListLen(void *h, const char *prefix, int expand_ext, int resolve, int
     return kvspaceShmListLen((kvspace_t *)h, prefix, expand_ext != 0, resolve, out_count);
 }
 
-/* 借用枚举：*out 指向线程局部回收缓冲（\n 连接的直接子项名），生命周期至下次同线程 List，
-   调用方不得 free。空目录 → *out=NULL、*out_len=0。 */
+/* 借用索引取项：返回前缀下第 idx 个直接子项名，*out 指向线程局部回收缓冲，生命周期至下次
+   同线程 ListAt，调用方不得 free。idx 越界 → *out=NULL、*out_len=0、返回非 0。配合
+   kvspaceListLen 遍历（listlen 定计数，逐 idx 取名），不再一次性返回整段名单缓冲。 */
 static __thread uint8_t *list_buf = NULL;
 static __thread size_t list_cap = 0;
 
-int kvspaceList(void *h, const char *prefix, int expand_ext, int resolve,
-                uint8_t **out, uint32_t *out_len) {
+int kvspaceListAt(void *h, const char *prefix, int expand_ext, int resolve,
+                  int32_t idx, uint8_t **out, uint32_t *out_len) {
     *out = NULL;
     *out_len = 0;
     char **names = NULL;
     int32_t count = 0;
     if (kvspaceShmList((kvspace_t *)h, prefix, expand_ext != 0, resolve, &names, &count) != 0)
         return -1;
-    size_t need = 0;
-    for (int32_t i = 0; i < count; i++)
-        need += strlen(names[i]) + 1;
-    if (need == 0) {
-        for (int32_t i = 0; i < count; i++)
-            free(names[i]);
-        free(names);
-        return 0;
-    }
-    if (need > list_cap) {
-        uint8_t *nb = realloc(list_buf, need);
-        if (!nb) {
-            for (int32_t i = 0; i < count; i++)
-                free(names[i]);
-            free(names);
-            return -1;
+    int rc = -1;
+    if (idx >= 0 && idx < count) {
+        size_t l = strlen(names[idx]);
+        if (l + 1 > list_cap) {
+            uint8_t *nb = realloc(list_buf, l + 1);
+            if (nb) {
+                list_buf = nb;
+                list_cap = l + 1;
+            }
         }
-        list_buf = nb;
-        list_cap = need;
+        if (list_cap >= l + 1) {
+            memcpy(list_buf, names[idx], l);
+            list_buf[l] = 0;
+            *out = list_buf;
+            *out_len = (uint32_t)l;
+            rc = 0;
+        }
     }
-    size_t o = 0;
-    for (int32_t i = 0; i < count; i++) {
-        size_t l = strlen(names[i]);
-        if (i)
-            list_buf[o++] = '\n';
-        memcpy(list_buf + o, names[i], l);
-        o += l;
+    for (int32_t i = 0; i < count; i++)
         free(names[i]);
-    }
     free(names);
-    *out = list_buf;
-    *out_len = (uint32_t)o;
-    return 0;
+    return rc;
 }
 
 int kvspaceDel(void *h, const char *const *keys, uint32_t nkeys, char *err, uint32_t err_cap) {
