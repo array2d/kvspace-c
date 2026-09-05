@@ -74,15 +74,11 @@ int kvspaceListLen(void *h, const char *prefix, int expand_ext, int resolve, int
     return kvspaceShmListLen((kvspace_t *)h, prefix, expand_ext != 0, resolve, out_count);
 }
 
-/* 借用索引取项：返回前缀下第 idx 个直接子项名，*out 指向线程局部回收缓冲，生命周期至下次
-   同线程 ListAt，调用方不得 free。idx 越界 → *out=NULL、*out_len=0、返回非 0。配合
-   kvspaceListLen 遍历（listlen 定计数，逐 idx 取名），不再一次性返回整段名单缓冲。 */
-static __thread uint8_t *list_buf = NULL;
-static __thread size_t list_cap = 0;
-
+/* 索引取项：把前缀下第 idx 个直接子项名写进调用方自备缓冲 buf（容量 buf_cap），*out_len
+   置该名长度（不含 NUL）。库侧零状态。idx 越界或缓冲不足 → 返回非 0（缓冲不足时 *out_len
+   仍为所需长度，不静默截断）。配合 kvspaceListLen 遍历。 */
 int kvspaceListAt(void *h, const char *prefix, int expand_ext, int resolve,
-                  int32_t idx, uint8_t **out, uint32_t *out_len) {
-    *out = NULL;
+                  int32_t idx, uint8_t *buf, uint32_t buf_cap, uint32_t *out_len) {
     *out_len = 0;
     char **names = NULL;
     int32_t count = 0;
@@ -91,18 +87,9 @@ int kvspaceListAt(void *h, const char *prefix, int expand_ext, int resolve,
     int rc = -1;
     if (idx >= 0 && idx < count) {
         size_t l = strlen(names[idx]);
-        if (l + 1 > list_cap) {
-            uint8_t *nb = realloc(list_buf, l + 1);
-            if (nb) {
-                list_buf = nb;
-                list_cap = l + 1;
-            }
-        }
-        if (list_cap >= l + 1) {
-            memcpy(list_buf, names[idx], l);
-            list_buf[l] = 0;
-            *out = list_buf;
-            *out_len = (uint32_t)l;
+        *out_len = (uint32_t)l;
+        if (buf && l <= buf_cap) {
+            memcpy(buf, names[idx], l);
             rc = 0;
         }
     }
@@ -131,6 +118,11 @@ int kvspaceCp(void *h, const char *src, const char *dst, char *err, uint32_t err
 int kvspaceCpTree(void *h, const char *src, const char *dst, char *err, uint32_t err_cap) {
     (void)err; (void)err_cap;
     return kvspaceShmCptree((kvspace_t *)h, src, dst);
+}
+
+int kvspaceCpList(void *h, const char *src, const char *dst, char *err, uint32_t err_cap) {
+    (void)err; (void)err_cap;
+    return kvspaceShmCplist((kvspace_t *)h, src, dst);
 }
 
 int kvspaceMkindex(void *h, const char *path, char *err, uint32_t err_cap) {

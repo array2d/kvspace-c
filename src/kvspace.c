@@ -1637,6 +1637,37 @@ int kvspaceShmCptree(kvspace_t *kv, const char *src, const char *dst) {
   return cptree_rec(kv, src, dst);
 }
 
+/* 浅拷贝：base 值 + 一层 · 成员（不遍历 / 子节点、不递归成员子树）。用于单 struct/扁平容器。 */
+int kvspaceShmCplist(kvspace_t *kv, const char *src, const char *dst) {
+  if (!kv || !src || !dst)
+    return -1;
+  kvspaceShmDeltree(kv, dst); /* 覆盖语义：先清 dst 子树。 */
+  kvspaceShmCp(kv, src, dst); /* base 值。 */
+  char *ms = memdir(src), *md = memdir(dst);
+  kvspaceShmCp(kv, ms, md); /* memindex marker（成员名单 / map dims）。 */
+  char **mms;
+  int32_t mc;
+  kvspaceShmList(kv, ms, false, 1, &mms, &mc);
+  size_t msl = strlen(ms), mdl = strlen(md);
+  for (int i = 0; i < mc; i++) {
+    size_t nl = strlen(mms[i]);
+    char *cs = malloc(msl + nl + 1);
+    memcpy(cs, ms, msl);
+    memcpy(cs + msl, mms[i], nl + 1);
+    char *cd = malloc(mdl + nl + 1);
+    memcpy(cd, md, mdl);
+    memcpy(cd + mdl, mms[i], nl + 1);
+    kvspaceShmCp(kv, cs, cd); /* 成员值，单 key，不递归。 */
+    free(cs);
+    free(cd);
+    free(mms[i]);
+  }
+  free(mms);
+  free(ms);
+  free(md);
+  return 0;
+}
+
 int kvspaceShmMkindex(kvspace_t *kv, const char *path) {
   if (!kv || !path)
     return -1;
