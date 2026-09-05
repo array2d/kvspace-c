@@ -848,27 +848,39 @@ static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
   }
 }
 
-/* 解析 extindex body 的 extpath（body = [4B count LE]"…extpath\nchild..."）。 */
-static void decode_ext_path(const uint8_t *raw, int32_t rl, char *out, int osz) {
-  out[0] = 0;
-  if (!raw || rl < 4)
-    return;
-  const char *s = (const char *)raw + 4; /* 跳过 [4B count LE] */
-  rl -= 4;
-  int start = 0;
-  if (rl >= 3 && (uint8_t)s[0] == 0xE2 && (uint8_t)s[1] == 0x80 && (uint8_t)s[2] == 0xA6)
-    start = 3; /* 跳过 EXT_PREFIX "…" */
-  int i;
-  for (i = start; i < rl && s[i] != '\n'; i++)
-    ;
-  int el = i - start;
-  if (el >= osz)
-    el = osz - 1;
-  memcpy(out, s + start, (size_t)el);
-  out[el] = 0;
+/* memindex 定宽矩阵几何：n=dims[0]、m=dims[1]；返回矩阵起点（extindex 矩阵在 body 尾部，
+ * off=body_len−N*M；普通 index off=0）。head dims 由 DecodeHead 从 kindexpr 解出。 */
+static const uint8_t *index_matrix(const xvalue_head_t *hh, int32_t *n, int32_t *m) {
+  *n = hh->ndim >= 1 && hh->dims[0] > 0 ? hh->dims[0] : 0;
+  *m = hh->ndim >= 2 && hh->dims[1] > 0 ? hh->dims[1] : 0;
+  int32_t off = hh->raw_len - (*n) * (*m);
+  if (off < 0)
+    off = 0;
+  return hh->raw + off;
 }
 
-/* 读 dir（尾斜杠目录键）的 extindex，返回 extpath；非 extindex 返回 0。 */
+/* 定宽矩阵 → malloc 成员名数组（每行去尾 NUL）。 */
+static char **index_names(const xvalue_head_t *hh, int32_t *oc) {
+  *oc = 0;
+  int32_t n, m;
+  const uint8_t *mat = index_matrix(hh, &n, &m);
+  if (n <= 0)
+    return NULL;
+  char **names = malloc(sizeof(char *) * (size_t)n);
+  if (!names)
+    return NULL;
+  for (int32_t i = 0; i < n; i++) {
+    const char *row = (const char *)mat + (size_t)i * m;
+    int32_t len = 0;
+    while (len < m && row[len] != 0)
+      len++;
+    names[i] = strndup(row, (size_t)len);
+  }
+  *oc = n;
+  return names;
+}
+
+/* 读 dir（尾斜杠目录键）的 extindex，返回 extpath（body 头部 [0..body_len−N*M]）；非 extindex 返回 0。 */
 static int dir_ext_path(kvspace_t *kv, const char *dir, char *out, int osz) {
   out[0] = 0;
   art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)dir, (int)strlen(dir));
@@ -881,7 +893,15 @@ static int dir_ext_path(kvspace_t *kv, const char *dir, char *out, int osz) {
   xvalue_head_t hh = kvspaceXvalueDecodeHead(raw, rl);
   if (hh.kind_len != (int32_t)strlen(KVSPACE_KIND_EXT_INDEX) || memcmp(hh.kind, KVSPACE_KIND_EXT_INDEX, hh.kind_len) != 0)
     return 0;
-  decode_ext_path(hh.raw, hh.raw_len, out, osz);
+  int32_t n, m;
+  index_matrix(&hh, &n, &m);
+  int32_t el = hh.raw_len - n * m;
+  if (el < 0)
+    el = 0;
+  if (el >= osz)
+    el = osz - 1;
+  memcpy(out, hh.raw, (size_t)el);
+  out[el] = 0;
   return out[0] ? 1 : 0;
 }
 
@@ -931,9 +951,7 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve, int32_t *ol)
 }
 
 /* ── 值/索引分离（方案2，对齐 kvspace-durable backend.rs） ────────── */
-/* 坐标段工具（定义在下方，先声明）。 */
-static int coord_is_coord(const char *name);
-static int parse_coord(const char *name, int64_t *coords, int maxn);
+/* 坐标段工具见 xvalue.c：kvspaceCoordIsCoord / kvspaceParseCoord / kvspaceCoordCmp。 */
 
 /* kind 判定（kindexpr 非 NUL 终止）。 */
 static int is_kind(const xvalue_head_t *h, const char *k) {
@@ -1046,34 +1064,10 @@ static void shm_split_index(const char *key, char **parent, char **name,
   }
 }
 
-/* 解析 index body（[4B count LE]name1\nname2...），返回 malloc 成员名数组。 */
-static char **parse_index_body(const uint8_t *raw, int32_t raw_len, int32_t *oc) {
-  *oc = 0;
-  if (!raw || raw_len < 4)
-    return NULL;
-  const char *s = (const char *)raw + 4;
-  int32_t slen = raw_len - 4;
-  if (slen == 0)
-    return NULL;
-  char **names = malloc(sizeof(char *) * (size_t)(slen + 1));
-  if (!names)
-    return NULL;
-  int32_t cnt = 0, start = 0;
-  for (int32_t i = 0; i <= slen; i++) {
-    if (i == slen || s[i] == '\n') {
-      if (i > start)
-        names[cnt++] = strndup(s + start, (size_t)(i - start));
-      start = i + 1;
-    }
-  }
-  *oc = cnt;
-  return names;
-}
-
 /* 坐标段 → stringkeymap dims（对齐 durable grow_coord_dims，单成员）。 */
 static void grow_coord_dims_one(const char *name, int32_t *dims, int32_t *ndim) {
   int64_t coords[8];
-  int n = parse_coord(name, coords, 8);
+  int n = kvspaceParseCoord(name, coords, 8);
   if (n < 0) {
     dims[0] = 1;
     *ndim = 1;
@@ -1110,7 +1104,7 @@ static int add_child_index(kvspace_t *kv, const char *mem, const char *name) {
       if (hh.ref == 0 && is_kind(&hh, KVSPACE_KIND_EXT_INDEX))
         return 0; /* extindex：成员由 extpath 展开，不维护本地 childs */
       if (hh.ref == 0 && is_kind(&hh, KVSPACE_KIND_INDEX))
-        names = parse_index_body(hh.raw, hh.raw_len, &nnames);
+        names = index_names(&hh, &nnames);
     }
   }
   for (int32_t i = 0; i < nnames; i++)
@@ -1152,7 +1146,7 @@ static int remove_child_index(kvspace_t *kv, const char *mem, const char *name) 
   if (hh.ref != 0 || !is_kind(&hh, KVSPACE_KIND_INDEX))
     return 0;
   int32_t nnames;
-  char **names = parse_index_body(hh.raw, hh.raw_len, &nnames);
+  char **names = index_names(&hh, &nnames);
   if (!names)
     return 0;
   int32_t j = 0;
@@ -1189,7 +1183,7 @@ static void ensure_member_chain(kvspace_t *kv, char *parent, char *name) {
     art_hdr_t *ch = art_search(kv, kv->hdr->art_root, (const uint8_t *)base,
                                (int)strlen(base));
     if (!ch || !ch->has_value) {
-      if (coord_is_coord(child)) {
+      if (kvspaceCoordIsCoord(child)) {
         int32_t dims[8];
         int32_t ndim;
         grow_coord_dims_one(child, dims, &ndim);
@@ -1317,7 +1311,8 @@ int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
       return -1;
   }
 
-  /* 容器值（object/stringkeymap）：值写 p（无后缀，body 空），memindex p· 单独写。 */
+  /* 容器值（object/stringkeymap）：值写 p（无后缀、body 空、dims/ro/vid 保留），
+   * memindex p· 写空 index（成员由后续 add_child 维护）；对齐 durable set() 的 Obj/Map 分支。 */
   if (hh.ref == 0 && (is_kind(&hh, KVSPACE_KIND_OBJ) ||
                       is_kind(&hh, KVSPACE_KIND_MAP))) {
     char *base = strip_dir_suf_alloc(kbuf);
@@ -1325,8 +1320,6 @@ int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
       free(base);
       return -1;
     }
-    int32_t nnames;
-    char **names = parse_index_body(hh.raw, hh.raw_len, &nnames);
     char *kind = strndup(hh.kind, hh.kind_len);
     uint8_t *cv;
     int32_t cvl = kvspaceXvalueEncodeMode(kind, NULL, 0, hh.dims, hh.ndim, 0,
@@ -1335,17 +1328,12 @@ int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
     free(cv);
     free(kind);
     if (rc < 0) {
-      if (names) {
-        for (int32_t i = 0; i < nnames; i++)
-          free(names[i]);
-        free(names);
-      }
       free(base);
       return -1;
     }
     char *mem = memjoin(base);
     uint8_t *iv;
-    int32_t ivl = kvspaceXvalueNewIndex((const char **)names, nnames, &iv);
+    int32_t ivl = kvspaceXvalueNewIndex(NULL, 0, &iv);
     rc = shm_set_raw(kv, mem, iv, ivl);
     free(iv);
     free(mem);
@@ -1357,11 +1345,6 @@ int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
       add_child_index(kv, pp, pn);
     free(pp);
     free(pn);
-    if (names) {
-      for (int32_t i = 0; i < nnames; i++)
-        free(names[i]);
-      free(names);
-    }
     free(base);
     return rc;
   }
@@ -1680,79 +1663,9 @@ int kvspaceShmMkindex(kvspace_t *kv, const char *path) {
   return r;
 }
 
-/* ── stringkeymap 坐标段 [s0,s1,...] 解析与排序（对齐 kvspace-durable coord） ── */
-
-/* 坐标段结构判定：任意非空 [..]，禁止嵌套 [ ]。小数/字符串坐标（[12.24,x]）也算坐标段。 */
-static int coord_is_coord(const char *name) {
-  if (!name || name[0] != '[')
-    return 0;
-  size_t n = strlen(name);
-  if (n < 3 || name[n - 1] != ']')
-    return 0;
-  for (size_t i = 1; i + 1 < n; i++)
-    if (name[i] == '[' || name[i] == ']')
-      return 0;
-  return 1;
-}
-
-/* 解析整数坐标段，成功填充 coords 并返回维数；非整数返回 -1。 */
-static int parse_coord(const char *name, int64_t *coords, int maxn) {
-  if (!name || name[0] != '[')
-    return -1;
-  int n = 0;
-  int64_t cur = 0;
-  bool has = false;
-  for (const char *p = name + 1; *p; p++) {
-    if (*p >= '0' && *p <= '9') {
-      cur = cur * 10 + (*p - '0');
-      has = true;
-    } else if (*p == ',') {
-      if (!has || n >= maxn)
-        return -1;
-      coords[n++] = cur;
-      cur = 0;
-      has = false;
-    } else if (*p == ']') {
-      if (!has || n >= maxn)
-        return -1;
-      coords[n++] = cur;
-      return (p[1] == '\0') ? n : -1;
-    } else {
-      return -1;
-    }
-  }
-  return -1;
-}
-
-static int coord_cmp(const char *a, const char *b) {
-  int ia = coord_is_coord(a), ib = coord_is_coord(b);
-  if (!ia && !ib)
-    return strcmp(a, b);
-  if (!ia)
-    return 1; /* 非坐标段排后 */
-  if (!ib)
-    return -1;
-  int64_t ca[8], cb[8];
-  int na = parse_coord(a, ca, 8);
-  int nb = parse_coord(b, cb, 8);
-  if (na < 0 || nb < 0)
-    return strcmp(a, b); /* 含小数/字符串坐标 → 字典序 */
-  for (int i = 0; i < na && i < nb; i++) {
-    if (ca[i] != cb[i])
-      return ca[i] < cb[i] ? -1 : 1;
-  }
-  if (na != nb)
-    return na < nb ? -1 : 1;
-  return 0;
-}
-
-static int qsort_coord_cmp(const void *a, const void *b) {
-  return coord_cmp(*(const char *const *)a, *(const char *const *)b);
-}
-
-/* 读 memindex（p·）的成员名：index body（[4B count LE]name1\nname2...）是成员名唯一权威。
- * 仅 p·（尾 ·）目录命中；slash 目录（p/）不自动维护 index，调用方回退 ART scan。
- * stringkeymap：读容器值 p 的 kind 判定后按坐标 row-major 数值升序（对齐 durable coord.cmp_coord）。 */
+/* 读 memindex（p·）的成员名：index 定宽矩阵 body 是成员名唯一权威，encode 侧已按 cmp_coord
+ * 规范排序（坐标 row-major 数值序、非坐标字典序），读侧原样返回矩阵行序即有序。
+ * 仅 p·（尾 ·）目录命中；slash 目录（p/）不自动维护 index，调用方回退 ART scan。 */
 static int read_index_names(kvspace_t *kv, const char *dir, char ***on, int32_t *oc) {
   *on = NULL;
   *oc = 0;
@@ -1769,25 +1682,7 @@ static int read_index_names(kvspace_t *kv, const char *dir, char ***on, int32_t 
   xvalue_head_t hh = kvspaceXvalueDecodeHead(raw, rl);
   if (hh.ref != 0 || !is_kind(&hh, KVSPACE_KIND_INDEX))
     return 0;
-  char **names = parse_index_body(hh.raw, hh.raw_len, oc);
-  if (!names)
-    return 1;
-  /* stringkeymap：容器值 p（strip · 后无后缀）的 kind 决定 row-major 升序。 */
-  char *base = strip_dir_suf_alloc(dir);
-  bool is_map = false;
-  art_hdr_t *ch = art_search(kv, kv->hdr->art_root, (const uint8_t *)base, (int)strlen(base));
-  if (ch && ch->has_value) {
-    uint8_t *craw;
-    int32_t crl;
-    if (read_tlv(kv, ch->box_offset, &craw, &crl) == 0) {
-      xvalue_head_t chh = kvspaceXvalueDecodeHead(craw, crl);
-      is_map = chh.ref == 0 && is_kind(&chh, KVSPACE_KIND_MAP);
-    }
-  }
-  free(base);
-  if (is_map && *oc > 1)
-    qsort(names, (size_t)*oc, sizeof(char *), qsort_coord_cmp);
-  *on = names;
+  *on = index_names(&hh, oc);
   return 1;
 }
 

@@ -126,10 +126,14 @@ int32_t kvspaceXvalueNewCharAscii(const char *s, uint8_t **out);
 int32_t kvspaceXvalueAtChar(const xvalue_head_t *h, int32_t idx);
 
 int32_t kvspaceXvalueNewIndex(const char **children, int32_t count, uint8_t **out);
-int32_t kvspaceXvalueNewMap(const char **children, int32_t count,
-                            const int32_t *dims, int32_t ndim, uint8_t **out);
 int32_t kvspaceXvalueNewPtr(const char *target_kindexpr, const char *target, uint8_t **out);
 int32_t kvspaceXvalueNewExtindex(const char *extpath, const char **children, int32_t count, uint8_t **out);
+
+/* 坐标段比较（对齐 durable coord::cmp_coord）：坐标段（[i]/[i,j]）数值 row-major 在前、
+ * 非坐标段字典序在后。供 memindex 矩阵规范排序与容器 dims 派生共用。 */
+int kvspaceCoordIsCoord(const char *name);
+int kvspaceParseCoord(const char *name, int64_t *coords, int maxn);
+int kvspaceCoordCmp(const char *a, const char *b);
 
 #define kvspaceXvalueNewBool1(v, out)     kvspaceXvalueNewBool(&(bool){v}, 1, out)
 #define kvspaceXvalueNewInt81(v, out)     kvspaceXvalueNewInt8(&(int8_t){v}, 1, out)

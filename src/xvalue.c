@@ -253,50 +253,110 @@ int32_t kvspaceXvalueAtChar(const xvalue_head_t *h, int32_t idx) {
     return (int32_t)rd_u32(h->raw + idx * 4);
 }
 
-/* ── index / ptr / extindex ──────────────────────────────────────── */
+/* ── 坐标段比较（对齐 durable coord.rs；memindex 矩阵规范排序与容器 dims 派生共用）── */
 
-int32_t kvspaceXvalueNewIndex(const char **children, int32_t count, uint8_t **out) {
-    size_t total = 4; /* [4B count LE] */
-    for (int i = 0; i < count; i++) total += (children[i] ? strlen(children[i]) : 0);
-    if (count > 0) total += (size_t)(count - 1);
-    if (total > (size_t)INT32_MAX) return -1;
-    uint8_t *raw = (uint8_t *)malloc(total);
-    if (!raw) return -1;
-    wr_u32(raw, (uint32_t)count);
-    size_t pos = 4;
-    for (int i = 0; i < count; i++) {
-        if (!children[i]) continue;
-        size_t len = strlen(children[i]);
-        memcpy(raw + pos, children[i], len);
-        pos += len;
-        if (i < count - 1) raw[pos++] = '\n';
-    }
-    int32_t r = encode_al(KVSPACE_KIND_INDEX, raw, (int32_t)pos, 1, out);
-    free(raw);
-    return r;
+int kvspaceCoordIsCoord(const char *name) {
+    if (!name || name[0] != '[')
+        return 0;
+    size_t n = strlen(name);
+    if (n < 3 || name[n - 1] != ']')
+        return 0;
+    for (size_t i = 1; i + 1 < n; i++)
+        if (name[i] == '[' || name[i] == ']')
+            return 0;
+    return 1;
 }
 
-int32_t kvspaceXvalueNewMap(const char **children, int32_t count,
-                            const int32_t *dims, int32_t ndim, uint8_t **out) {
-    if (ndim <= 0 || ndim > X_MAX_NDIM)
+/* 解析整数坐标段，成功填充 coords 并返回维数；非整数返回 -1。 */
+int kvspaceParseCoord(const char *name, int64_t *coords, int maxn) {
+    if (!name || name[0] != '[')
         return -1;
-    size_t total = 4; /* [4B count LE] */
-    for (int i = 0; i < count; i++) total += (children[i] ? strlen(children[i]) : 0);
-    if (count > 0) total += (size_t)(count - 1);
-    if (total > (size_t)INT32_MAX) return -1;
-    uint8_t *raw = (uint8_t *)malloc(total);
-    if (!raw) return -1;
-    wr_u32(raw, (uint32_t)count);
-    size_t pos = 4;
-    for (int i = 0; i < count; i++) {
-        if (!children[i]) continue;
-        size_t len = strlen(children[i]);
-        memcpy(raw + pos, children[i], len);
-        pos += len;
-        if (i < count - 1) raw[pos++] = '\n';
+    int n = 0;
+    int64_t cur = 0;
+    bool has = false;
+    for (const char *p = name + 1; *p; p++) {
+        if (*p >= '0' && *p <= '9') {
+            cur = cur * 10 + (*p - '0');
+            has = true;
+        } else if (*p == ',') {
+            if (!has || n >= maxn)
+                return -1;
+            coords[n++] = cur;
+            cur = 0;
+            has = false;
+        } else if (*p == ']') {
+            if (!has || n >= maxn)
+                return -1;
+            coords[n++] = cur;
+            return (p[1] == '\0') ? n : -1;
+        } else {
+            return -1;
+        }
     }
-    int32_t r = kvspaceXvalueEncode(KVSPACE_KIND_MAP, raw, (int32_t)pos, dims, ndim, out);
-    free(raw);
+    return -1;
+}
+
+int kvspaceCoordCmp(const char *a, const char *b) {
+    int ia = kvspaceCoordIsCoord(a), ib = kvspaceCoordIsCoord(b);
+    if (!ia && !ib)
+        return strcmp(a, b);
+    if (!ia)
+        return 1; /* 非坐标段排后 */
+    if (!ib)
+        return -1;
+    int64_t ca[8], cb[8];
+    int na = kvspaceParseCoord(a, ca, 8);
+    int nb = kvspaceParseCoord(b, cb, 8);
+    if (na < 0 || nb < 0)
+        return strcmp(a, b); /* 含小数/字符串坐标 → 字典序 */
+    for (int i = 0; i < na && i < nb; i++) {
+        if (ca[i] != cb[i])
+            return ca[i] < cb[i] ? -1 : 1;
+    }
+    if (na != nb)
+        return na < nb ? -1 : 1;
+    return 0;
+}
+
+/* ── index / ptr / extindex：定宽排序矩阵 memindex（对齐 durable xvalue_index.rs）──
+ * dims=[N,M]：N=成员数、M=成员 UTF-8 字节最大长（行宽）；body=N×M，每行成员名 + NUL 补齐。
+ * 全表 cmp_coord 排序 → 与 durable blob 逐字节一致，listat/listlen O(1)、成员二分 O(log N)。 */
+
+static int matrix_qsort_cmp(const void *a, const void *b) {
+    return kvspaceCoordCmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* children → (dims=[N,M], body=malloc)，encode 侧规范排序；*bl 出参 body 长度（N×M）。 */
+static uint8_t *build_matrix(const char **children, int32_t count,
+                             int32_t *n_out, int32_t *m_out, int32_t *bl) {
+    const char **c = (const char **)malloc(sizeof(char *) * (size_t)(count > 0 ? count : 1));
+    int32_t n = 0;
+    for (int32_t i = 0; i < count; i++)
+        if (children[i]) c[n++] = children[i];
+    if (n > 1)
+        qsort((void *)c, (size_t)n, sizeof(char *), matrix_qsort_cmp);
+    int32_t m = 0;
+    for (int32_t i = 0; i < n; i++) {
+        int32_t l = (int32_t)strlen(c[i]);
+        if (l > m) m = l;
+    }
+    int32_t total = n * m;
+    uint8_t *body = (uint8_t *)calloc((size_t)(total > 0 ? total : 1), 1);
+    for (int32_t i = 0; i < n; i++)
+        memcpy(body + (size_t)i * m, c[i], strlen(c[i]));
+    free((void *)c);
+    *n_out = n;
+    *m_out = m;
+    *bl = total;
+    return body;
+}
+
+int32_t kvspaceXvalueNewIndex(const char **children, int32_t count, uint8_t **out) {
+    int32_t n, m, bl;
+    uint8_t *body = build_matrix(children, count, &n, &m, &bl);
+    int32_t dims[2] = {n, m};
+    int32_t r = kvspaceXvalueEncode(KVSPACE_KIND_INDEX, body, bl, dims, 2, out);
+    free(body);
     return r;
 }
 
@@ -307,29 +367,20 @@ int32_t kvspaceXvalueNewPtr(const char *target_kindexpr, const char *target, uin
     return encode_head(target_kindexpr, 1, 0, 0, 0, 0, (const uint8_t *)target, (int32_t)strlen(target), out);
 }
 
-#define EXT_PREFIX "…"
-
+/* extindex：body = 头部变长 ext_path + 尾部 N×M 矩阵（childs，cmp_coord 有序）；dims=[N,M]。
+ * ext_path 置头部：帧生命周期内一次写定、childs 才 churn，矩阵起点 off=body_len−N*M 稳定。 */
 int32_t kvspaceXvalueNewExtindex(const char *extpath, const char **children, int32_t count, uint8_t **out) {
     if (!extpath) return -1;
-    size_t plen = strlen(EXT_PREFIX) + strlen(extpath);
-    size_t total = 4 + plen; /* [4B count LE] + extpath 段 */
-    for (int i = 0; i < count; i++) total += (children[i] ? strlen(children[i]) : 0);
-    if (count > 0) total += (size_t)count;
-    if (total > (size_t)INT32_MAX) return -1;
-    uint8_t *raw = (uint8_t *)malloc(total);
-    if (!raw) return -1;
-    wr_u32(raw, (uint32_t)count);
-    size_t pos = 4;
-    memcpy(raw + pos, EXT_PREFIX, strlen(EXT_PREFIX)); pos += strlen(EXT_PREFIX);
-    memcpy(raw + pos, extpath, strlen(extpath)); pos += strlen(extpath);
-    for (int i = 0; i < count; i++) {
-        raw[pos++] = '\n';
-        if (!children[i]) continue;
-        size_t len = strlen(children[i]);
-        memcpy(raw + pos, children[i], len);
-        pos += len;
-    }
-    int32_t r = encode_al(KVSPACE_KIND_EXT_INDEX, raw, (int32_t)pos, 1, out);
-    free(raw);
+    int32_t n, m, mbl;
+    uint8_t *mat = build_matrix(children, count, &n, &m, &mbl);
+    size_t el = strlen(extpath);
+    int32_t bl = (int32_t)el + mbl;
+    uint8_t *body = (uint8_t *)malloc((size_t)(bl > 0 ? bl : 1));
+    memcpy(body, extpath, el);
+    memcpy(body + el, mat, (size_t)mbl);
+    int32_t dims[2] = {n, m};
+    int32_t r = kvspaceXvalueEncode(KVSPACE_KIND_EXT_INDEX, body, bl, dims, 2, out);
+    free(mat);
+    free(body);
     return r;
 }
