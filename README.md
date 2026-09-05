@@ -24,10 +24,11 @@ Two surfaces:
    `kvspaceShmOpen/Close`, `kvspaceShmGet/Set`, `kvspaceShmList`, `kvspaceShmDel/Deltree`, `kvspaceShmMkindex`, `kvspaceShmExtindex/Delextindex`, `kvspaceShmNotify/Watch`.
 
 2. **durable C ABI** — byte-compatible with `kvspace-durable` (`src/durable_abi.c`):
-   `kvspaceConnect/Free/BytesFree`, `kvspaceGet/Set/GetBatch/List/Del/DelTree`,
-   `kvspaceMkindex/MkindexExt/RmindexExt/Watch/Clear/Disconnect`,
+   `kvspaceConnect/Close/Disconnect`, `kvspaceGet` (zero-copy borrow) `/WriteInPlace/WriteNewPlace`,
+   `kvspaceListLen/ListAt/Del/DelTree/Cp/CpTree`,
+   `kvspaceMkindex/MkindexExt/RmindexExt/Watch/Clear`,
    `kvspaceTlvEncode/TlvEncodeMode/DecodeHead`,
-   `kvspaceNewPtr/NewChar/NewCharByte/NewBool/NewInt64/NewFloat64`.
+   `kvspaceNewPtr/NewChar/NewBool/NewInt64/NewFloat64`.
 
    A consumer (e.g. the kvlang layout) links this ABI and switches backends by DSN only, with no code change.
 
