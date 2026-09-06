@@ -318,46 +318,59 @@ int kvspaceCoordCmp(const char *a, const char *b) {
     return 0;
 }
 
-/* ── index / ptr / extindex：定宽排序矩阵 memindex（对齐 durable xvalue_index.rs）──
- * dims=[N,M]：N=成员数、M=成员 UTF-8 字节最大长（行宽）；body=N×M，每行成员名 + NUL 补齐。
- * 全表 cmp_coord 排序 → 与 durable blob 逐字节一致，listat/listlen O(1)、成员二分 O(log N)。 */
+/* ── index / ptr / extindex：定宽排序矩阵 memindex（Go-slice cap/len，对齐 durable xvalue_index.rs）──
+ * dims=[len,cap,M]：len=有效成员数、cap≥len=预留行数、M=成员 UTF-8 字节最大长向上 8 对齐（行宽）；
+ * body=cap×M，前 len 行成员名 + NUL 补齐（cmp_coord 有序），后 cap−len 行全 NUL。容量内增删 body 长度
+ * 恒 cap×M → 就地覆写不重分配；满则 cap 翻倍。与 durable blob 逐字节一致，listat/listlen O(1)。 */
+
+static int32_t align8(int32_t n) { return (n + 7) & ~7; }
 
 static int matrix_qsort_cmp(const void *a, const void *b) {
     return kvspaceCoordCmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-/* children → (dims=[N,M], body=malloc)，encode 侧规范排序；*bl 出参 body 长度（N×M）。 */
-static uint8_t *build_matrix(const char **children, int32_t count,
-                             int32_t *n_out, int32_t *m_out, int32_t *bl) {
+/* children → (dims=[len,cap,M], body=malloc(cap×M))，encode 侧规范排序；cap_hint/m_hint 为下限（只增）。 */
+static uint8_t *build_matrix(const char **children, int32_t count, int32_t cap_hint, int32_t m_hint,
+                             int32_t *len_out, int32_t *cap_out, int32_t *m_out, int32_t *bl) {
     const char **c = (const char **)malloc(sizeof(char *) * (size_t)(count > 0 ? count : 1));
-    int32_t n = 0;
+    int32_t len = 0;
     for (int32_t i = 0; i < count; i++)
-        if (children[i]) c[n++] = children[i];
-    if (n > 1)
-        qsort((void *)c, (size_t)n, sizeof(char *), matrix_qsort_cmp);
-    int32_t m = 0;
-    for (int32_t i = 0; i < n; i++) {
+        if (children[i]) c[len++] = children[i];
+    if (len > 1)
+        qsort((void *)c, (size_t)len, sizeof(char *), matrix_qsort_cmp);
+    int32_t maxl = 0;
+    for (int32_t i = 0; i < len; i++) {
         int32_t l = (int32_t)strlen(c[i]);
-        if (l > m) m = l;
+        if (l > maxl) maxl = l;
     }
-    int32_t total = n * m;
+    int32_t m = align8(maxl);
+    if (m_hint > m) m = m_hint;
+    int32_t cap = len;
+    if (cap_hint > cap) cap = cap_hint;
+    int32_t total = cap * m;
     uint8_t *body = (uint8_t *)calloc((size_t)(total > 0 ? total : 1), 1);
-    for (int32_t i = 0; i < n; i++)
+    for (int32_t i = 0; i < len; i++)
         memcpy(body + (size_t)i * m, c[i], strlen(c[i]));
     free((void *)c);
-    *n_out = n;
+    *len_out = len;
+    *cap_out = cap;
     *m_out = m;
     *bl = total;
     return body;
 }
 
-int32_t kvspaceXvalueNewIndex(const char **children, int32_t count, uint8_t **out) {
-    int32_t n, m, bl;
-    uint8_t *body = build_matrix(children, count, &n, &m, &bl);
-    int32_t dims[2] = {n, m};
-    int32_t r = kvspaceXvalueEncode(KVSPACE_KIND_INDEX, body, bl, dims, 2, out);
+int32_t kvspaceXvalueNewIndexGrow(const char **children, int32_t count, int32_t cap_hint,
+                                  int32_t m_hint, uint8_t **out) {
+    int32_t len, cap, m, bl;
+    uint8_t *body = build_matrix(children, count, cap_hint, m_hint, &len, &cap, &m, &bl);
+    int32_t dims[3] = {len, cap, m};
+    int32_t r = kvspaceXvalueEncode(KVSPACE_KIND_INDEX, body, bl, dims, 3, out);
     free(body);
     return r;
+}
+
+int32_t kvspaceXvalueNewIndex(const char **children, int32_t count, uint8_t **out) {
+    return kvspaceXvalueNewIndexGrow(children, count, 0, 0, out);
 }
 
 /* 指针（ref=1）：head kindexpr = "*" + target_kindexpr（目标完整 kindexpr，含其自身
@@ -367,20 +380,25 @@ int32_t kvspaceXvalueNewPtr(const char *target_kindexpr, const char *target, uin
     return encode_head(target_kindexpr, 1, 0, 0, 0, 0, (const uint8_t *)target, (int32_t)strlen(target), out);
 }
 
-/* extindex：body = 头部变长 ext_path + 尾部 N×M 矩阵（childs，cmp_coord 有序）；dims=[N,M]。
- * ext_path 置头部：帧生命周期内一次写定、childs 才 churn，矩阵起点 off=body_len−N*M 稳定。 */
-int32_t kvspaceXvalueNewExtindex(const char *extpath, const char **children, int32_t count, uint8_t **out) {
+/* extindex：body = 头部变长 ext_path + 尾部 cap×M 矩阵（childs，cmp_coord 有序）；dims=[len,cap,M]。
+ * ext_path 置头部：帧生命周期内一次写定、childs 才 churn，矩阵起点 off=body_len−cap*M 稳定。 */
+int32_t kvspaceXvalueNewExtindexGrow(const char *extpath, const char **children, int32_t count,
+                                     int32_t cap_hint, int32_t m_hint, uint8_t **out) {
     if (!extpath) return -1;
-    int32_t n, m, mbl;
-    uint8_t *mat = build_matrix(children, count, &n, &m, &mbl);
+    int32_t len, cap, m, mbl;
+    uint8_t *mat = build_matrix(children, count, cap_hint, m_hint, &len, &cap, &m, &mbl);
     size_t el = strlen(extpath);
     int32_t bl = (int32_t)el + mbl;
     uint8_t *body = (uint8_t *)malloc((size_t)(bl > 0 ? bl : 1));
     memcpy(body, extpath, el);
     memcpy(body + el, mat, (size_t)mbl);
-    int32_t dims[2] = {n, m};
-    int32_t r = kvspaceXvalueEncode(KVSPACE_KIND_EXT_INDEX, body, bl, dims, 2, out);
+    int32_t dims[3] = {len, cap, m};
+    int32_t r = kvspaceXvalueEncode(KVSPACE_KIND_EXT_INDEX, body, bl, dims, 3, out);
     free(mat);
     free(body);
     return r;
+}
+
+int32_t kvspaceXvalueNewExtindex(const char *extpath, const char **children, int32_t count, uint8_t **out) {
+    return kvspaceXvalueNewExtindexGrow(extpath, children, count, 0, 0, out);
 }

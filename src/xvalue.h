@@ -126,8 +126,14 @@ int32_t kvspaceXvalueNewCharAscii(const char *s, uint8_t **out);
 int32_t kvspaceXvalueAtChar(const xvalue_head_t *h, int32_t idx);
 
 int32_t kvspaceXvalueNewIndex(const char **children, int32_t count, uint8_t **out);
+/* memindex 定宽矩阵（dims=[len,cap,M]，M 向上 8 对齐）：cap_hint/m_hint 为容量与行宽下限（只增），
+ * 供增删时保留预留容量与既有行宽 → body 长度恒 cap×M、就地覆写不重分配。 */
+int32_t kvspaceXvalueNewIndexGrow(const char **children, int32_t count, int32_t cap_hint,
+                                  int32_t m_hint, uint8_t **out);
 int32_t kvspaceXvalueNewPtr(const char *target_kindexpr, const char *target, uint8_t **out);
 int32_t kvspaceXvalueNewExtindex(const char *extpath, const char **children, int32_t count, uint8_t **out);
+int32_t kvspaceXvalueNewExtindexGrow(const char *extpath, const char **children, int32_t count,
+                                     int32_t cap_hint, int32_t m_hint, uint8_t **out);
 
 /* 坐标段比较（对齐 durable coord::cmp_coord）：坐标段（[i]/[i,j]）数值 row-major 在前、
  * 非坐标段字典序在后。供 memindex 矩阵规范排序与容器 dims 派生共用。 */

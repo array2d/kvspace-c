@@ -57,7 +57,8 @@ int kvspaceShmDeltree(kvspace_t *kv, const char *prefix);
 int kvspaceShmCp(kvspace_t *kv, const char *src, const char *dst);     // 单 key 拷贝
 int kvspaceShmCptree(kvspace_t *kv, const char *src, const char *dst); // 递归子树拷贝
 int kvspaceShmCplist(kvspace_t *kv, const char *src, const char *dst); // 浅拷贝：base 值 + 一层 · 成员，不递归
-int kvspaceShmMkindex(kvspace_t *kv, const char *path); // 递归创建目录
+int kvspaceShmMkindex(kvspace_t *kv, const char *path,
+                      uint32_t capacity); // 递归创建目录，capacity 预留叶 index 容量（减少扩容）
 
 /* ================================================================
  * ExtIndex

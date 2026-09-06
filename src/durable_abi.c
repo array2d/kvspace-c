@@ -125,9 +125,9 @@ int kvspaceCpList(void *h, const char *src, const char *dst, char *err, uint32_t
     return kvspaceShmCplist((kvspace_t *)h, src, dst);
 }
 
-int kvspaceMkindex(void *h, const char *path, char *err, uint32_t err_cap) {
+int kvspaceMkindex(void *h, const char *path, uint32_t capacity, char *err, uint32_t err_cap) {
     (void)err; (void)err_cap;
-    return kvspaceShmMkindex((kvspace_t *)h, path);
+    return kvspaceShmMkindex((kvspace_t *)h, path, capacity);
 }
 
 int kvspaceMkindexExt(void *h, const char *path, const char *ext_path, char *err, uint32_t err_cap) {

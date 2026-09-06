@@ -850,12 +850,29 @@ static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
 
 /* memindex 定宽矩阵几何：n=dims[0]、m=dims[1]；返回矩阵起点（extindex 矩阵在 body 尾部，
  * off=body_len−N*M；普通 index off=0）。head dims 由 DecodeHead 从 kindexpr 解出。 */
-static const uint8_t *index_matrix(const xvalue_head_t *hh, int32_t *n, int32_t *m) {
-  *n = hh->ndim >= 1 && hh->dims[0] > 0 ? hh->dims[0] : 0;
-  *m = hh->ndim >= 2 && hh->dims[1] > 0 ? hh->dims[1] : 0;
-  int32_t off = hh->raw_len - (*n) * (*m);
+/* cap 增长：容量足够不变；空取 need；否则从旧容量翻倍覆盖 need（对齐 durable grow_cap）。 */
+static int32_t grow_cap(int32_t old_cap, int32_t need) {
+  if (need <= old_cap)
+    return old_cap;
+  if (old_cap == 0)
+    return need;
+  int32_t c = old_cap;
+  while (c < need)
+    c *= 2;
+  return c;
+}
+
+/* memindex 矩阵（dims=[len,cap,M]）：返回矩阵起点（跳过 extindex 的 ext_path 头部 off=raw_len−cap*M），
+   出参 *len=有效成员数=dims[0]、*m=行宽=dims[2]。 */
+static const uint8_t *index_matrix(const xvalue_head_t *hh, int32_t *len, int32_t *m) {
+  int32_t l = hh->ndim >= 1 && hh->dims[0] > 0 ? hh->dims[0] : 0;
+  int32_t cap = hh->ndim >= 2 && hh->dims[1] > 0 ? hh->dims[1] : 0;
+  int32_t mm = hh->ndim >= 3 && hh->dims[2] > 0 ? hh->dims[2] : 0;
+  int32_t off = hh->raw_len - cap * mm;
   if (off < 0)
     off = 0;
+  *len = l;
+  *m = mm;
   return hh->raw + off;
 }
 
@@ -893,9 +910,9 @@ static int dir_ext_path(kvspace_t *kv, const char *dir, char *out, int osz) {
   xvalue_head_t hh = kvspaceXvalueDecodeHead(raw, rl);
   if (hh.kind_len != (int32_t)strlen(KVSPACE_KIND_EXT_INDEX) || memcmp(hh.kind, KVSPACE_KIND_EXT_INDEX, hh.kind_len) != 0)
     return 0;
-  int32_t n, m;
-  index_matrix(&hh, &n, &m);
-  int32_t el = hh.raw_len - n * m;
+  int32_t len, m;
+  const uint8_t *mat = index_matrix(&hh, &len, &m);
+  int32_t el = (int32_t)(mat - hh.raw);
   if (el < 0)
     el = 0;
   if (el >= osz)
@@ -1094,6 +1111,7 @@ static void ensure_memindex(kvspace_t *kv, const char *mem) {
 static int add_child_index(kvspace_t *kv, const char *mem, const char *name) {
   char **names = NULL;
   int32_t nnames = 0;
+  int32_t old_cap = 0, old_m = 0;
   art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)mem,
                             (int)strlen(mem));
   if (h && h->has_value) {
@@ -1103,8 +1121,11 @@ static int add_child_index(kvspace_t *kv, const char *mem, const char *name) {
       xvalue_head_t hh = kvspaceXvalueDecodeHead(raw, rl);
       if (hh.ref == 0 && is_kind(&hh, KVSPACE_KIND_EXT_INDEX))
         return 0; /* extindex：成员由 extpath 展开，不维护本地 childs */
-      if (hh.ref == 0 && is_kind(&hh, KVSPACE_KIND_INDEX))
+      if (hh.ref == 0 && is_kind(&hh, KVSPACE_KIND_INDEX)) {
         names = index_names(&hh, &nnames);
+        old_cap = hh.ndim >= 2 && hh.dims[1] > 0 ? hh.dims[1] : 0;
+        old_m = hh.ndim >= 3 && hh.dims[2] > 0 ? hh.dims[2] : 0;
+      }
     }
   }
   for (int32_t i = 0; i < nnames; i++)
@@ -1123,7 +1144,8 @@ static int add_child_index(kvspace_t *kv, const char *mem, const char *name) {
   }
   nn[nnames] = strdup(name);
   uint8_t *iv;
-  int32_t ivl = kvspaceXvalueNewIndex((const char **)nn, nnames + 1, &iv);
+  int32_t ivl = kvspaceXvalueNewIndexGrow((const char **)nn, nnames + 1,
+                                          grow_cap(old_cap, nnames + 1), old_m, &iv);
   int rc = shm_set_raw(kv, mem, iv, ivl);
   free(iv);
   for (int32_t j = 0; j <= nnames; j++)
@@ -1145,6 +1167,8 @@ static int remove_child_index(kvspace_t *kv, const char *mem, const char *name) 
   xvalue_head_t hh = kvspaceXvalueDecodeHead(raw, rl);
   if (hh.ref != 0 || !is_kind(&hh, KVSPACE_KIND_INDEX))
     return 0;
+  int32_t old_cap = hh.ndim >= 2 && hh.dims[1] > 0 ? hh.dims[1] : 0;
+  int32_t old_m = hh.ndim >= 3 && hh.dims[2] > 0 ? hh.dims[2] : 0;
   int32_t nnames;
   char **names = index_names(&hh, &nnames);
   if (!names)
@@ -1164,7 +1188,8 @@ static int remove_child_index(kvspace_t *kv, const char *mem, const char *name) 
     return 0;
   }
   uint8_t *iv;
-  int32_t ivl = kvspaceXvalueNewIndex((const char **)names, j, &iv);
+  int32_t ivl =
+      kvspaceXvalueNewIndexGrow((const char **)names, j, old_cap, old_m, &iv);
   int rc = shm_set_raw(kv, mem, iv, ivl);
   free(iv);
   for (int32_t i = 0; i < j; i++)
@@ -1651,12 +1676,12 @@ int kvspaceShmCplist(kvspace_t *kv, const char *src, const char *dst) {
   return 0;
 }
 
-int kvspaceShmMkindex(kvspace_t *kv, const char *path) {
+int kvspaceShmMkindex(kvspace_t *kv, const char *path, uint32_t capacity) {
   if (!kv || !path)
     return -1;
   char *d = edir(path);
   uint8_t *v;
-  int32_t vl = kvspaceXvalueNewIndex(NULL, 0, &v);
+  int32_t vl = kvspaceXvalueNewIndexGrow(NULL, 0, (int32_t)capacity, 0, &v);
   int r = kvspaceShmSet(kv, d, v, vl);
   free(v);
   free(d);
