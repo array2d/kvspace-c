@@ -897,6 +897,23 @@ static char **index_names(const xvalue_head_t *hh, int32_t *oc) {
   return names;
 }
 
+/* 成员是否已在矩阵中：直扫定宽行 memcmp，零分配（成员密集写的幂等快路径）。 */
+static int index_has_member(const xvalue_head_t *hh, const char *name) {
+  int32_t n, m;
+  const uint8_t *mat = index_matrix(hh, &n, &m);
+  if (n <= 0 || m <= 0)
+    return 0;
+  size_t nl = strlen(name);
+  if ((int32_t)nl > m)
+    return 0;
+  for (int32_t i = 0; i < n; i++) {
+    const char *row = (const char *)mat + (size_t)i * m;
+    if (memcmp(row, name, nl) == 0 && ((int32_t)nl == m || row[nl] == 0))
+      return 1;
+  }
+  return 0;
+}
+
 /* 读 dir（尾斜杠目录键）的 extindex，返回 extpath（body 头部 [0..body_len−N*M]）；非 extindex 返回 0。 */
 static int dir_ext_path(kvspace_t *kv, const char *dir, char *out, int osz) {
   out[0] = 0;
@@ -1122,19 +1139,14 @@ static int add_child_index(kvspace_t *kv, const char *mem, const char *name) {
       if (hh.ref == 0 && is_kind(&hh, KVSPACE_KIND_EXT_INDEX))
         return 0; /* extindex：成员由 extpath 展开，不维护本地 childs */
       if (hh.ref == 0 && is_kind(&hh, KVSPACE_KIND_INDEX)) {
+        if (index_has_member(&hh, name))
+          return 1; /* 已存在：零分配快路径，不物化 names、不重建矩阵 */
         names = index_names(&hh, &nnames);
         old_cap = hh.ndim >= 2 && hh.dims[1] > 0 ? hh.dims[1] : 0;
         old_m = hh.ndim >= 3 && hh.dims[2] > 0 ? hh.dims[2] : 0;
       }
     }
   }
-  for (int32_t i = 0; i < nnames; i++)
-    if (strcmp(names[i], name) == 0) {
-      for (int32_t j = 0; j < nnames; j++)
-        free(names[j]);
-      free(names);
-      return 0;
-    }
   char **nn = realloc(names, sizeof(char *) * (size_t)(nnames + 1));
   if (!nn) {
     for (int32_t j = 0; j < nnames; j++)
@@ -1224,7 +1236,13 @@ static void ensure_member_chain(kvspace_t *kv, char *parent, char *name) {
       }
     }
     ensure_memindex(kv, dir);
-    add_child_index(kv, dir, child);
+    if (add_child_index(kv, dir, child) == 1) {
+      /* 叶子成员已存在 → 祖先链早已建立，steady-state 写无需上溯 */
+      free(base);
+      free(dir);
+      free(child);
+      break;
+    }
     char *pp = NULL, *pn = NULL;
     bool pm = false;
     shm_split_index(base, &pp, &pn, &pm);
