@@ -27,31 +27,41 @@ static int32_t header_array_len(int32_t ndim, const int32_t *dims) {
 }
 
 int32_t kvspaceXvalueHeadLen(const xvalue_head_t *h) {
-    return 1 + h->kindexprlen + 1 + 4 + 4;
+    return h->kindexprlen + 11;
 }
 
 int32_t kvspaceXvalueHeadLenForKindexpr(const char *kindexpr) {
     int32_t kxl = kindexpr ? (int32_t)strlen(kindexpr) : 0;
-    return 1 + (kxl + 1) + 1 + 4 + 4; /* slot = kxl + 1（含 NUL） */
+    return (kxl + 1) + 11; /* slot = kxl + 1（含 NUL） */
 }
 
-void kvspaceXvalueWriteHead(uint8_t *dst, const char *kindexpr, int32_t body_len) {
+void kvspaceXvalueWriteHead(uint8_t *dst, uint8_t xkind, const char *kindexpr, int32_t body_len) {
     int32_t kxl = kindexpr ? (int32_t)strlen(kindexpr) : 0;
     int32_t slot = kxl + 1;
-    dst[0] = (uint8_t)slot;
-    if (kxl > 0) memcpy(dst + 1, kindexpr, (size_t)kxl);
-    dst[1 + kxl] = 0;
-    int32_t o = 1 + slot;
+    dst[0] = xkind;
+    dst[1] = (uint8_t)slot;
+    if (kxl > 0) memcpy(dst + 2, kindexpr, (size_t)kxl);
+    dst[2 + kxl] = 0;
+    int32_t o = 2 + slot;
     dst[o] = 0;                              /* ro */
     wr_u32(dst + o + 1, 0);                  /* vid */
-    wr_u32(dst + o + 5, (uint32_t)body_len); /* raw_len */
+    wr_u32(dst + o + 5, (uint32_t)body_len); /* body_len */
 }
 
-static int32_t build_kindexpr(char *buf, int32_t cap, const char *kind, int32_t ref,
+static int is_def_kind(const char *kind) {
+    return strcmp(kind, KVSPACE_KIND_RWFUNC) == 0 || strcmp(kind, KVSPACE_KIND_DEF_RWIR) == 0;
+}
+
+static uint8_t xkind_of(const char *kind, int32_t ref) {
+    if (ref == 1) return KVSPACE_XKIND_PTR;
+    if (ref == 2) return KVSPACE_XKIND_EXTVALUE;
+    if (is_def_kind(kind)) return KVSPACE_XKIND_DEFKINDEXPR;
+    return KVSPACE_XKIND_REALVALUE;
+}
+
+static int32_t build_kindexpr(char *buf, int32_t cap, const char *kind,
                               const int32_t *dims, int32_t ndim) {
     int32_t o = 0;
-    if (ref == 1) buf[o++] = '*';
-    else if (ref == 2) buf[o++] = '@';
     if (ndim > 0) {
         buf[o++] = '[';
         for (int i = 0; i < ndim; i++) {
@@ -69,15 +79,16 @@ static int32_t encode_head(const char *kind, int32_t ref, int32_t ro, uint32_t v
                            const int32_t *dims, int32_t ndim,
                            const uint8_t *raw, int32_t raw_len, uint8_t **out) {
     char kx[256];
-    int32_t kxl = build_kindexpr(kx, (int32_t)sizeof kx, kind, ref, dims, ndim);
+    int32_t kxl = build_kindexpr(kx, (int32_t)sizeof kx, kind, dims, ndim);
     int32_t slot = kxl + 1;
-    int32_t total = 1 + slot + 1 + 4 + 4 + raw_len;
+    int32_t total = 2 + slot + 1 + 4 + 4 + raw_len;
     uint8_t *buf = (uint8_t *)malloc((size_t)total);
     if (!buf) return -1;
-    buf[0] = (uint8_t)slot;
-    memcpy(buf + 1, kx, (size_t)kxl);
-    buf[1 + kxl] = 0; /* NUL（槽内 padding） */
-    int32_t o = 1 + slot;
+    buf[0] = xkind_of(kind, ref);
+    buf[1] = (uint8_t)slot;
+    memcpy(buf + 2, kx, (size_t)kxl);
+    buf[2 + kxl] = 0; /* NUL（槽内 padding） */
+    int32_t o = 2 + slot;
     buf[o] = (uint8_t)(ro ? 1 : 0);
     wr_u32(buf + o + 1, vid);
     wr_u32(buf + o + 5, (uint32_t)raw_len);
@@ -121,16 +132,16 @@ static int32_t encode_al(const char *kind, const uint8_t *raw, int32_t raw_len,
 
 xvalue_head_t kvspaceXvalueDecodeHead(const uint8_t *data, int32_t data_len) {
     xvalue_head_t h = {0};
-    if (!data || data_len < 1) return h;
-    int32_t slot = (int32_t)data[0];
-    int32_t o = 1 + slot;
+    if (!data || data_len < 2) return h;
+    h.xkind = data[0];
+    h.ref = h.xkind == KVSPACE_XKIND_PTR ? 1 : h.xkind == KVSPACE_XKIND_EXTVALUE ? 2 : 0;
+    int32_t slot = (int32_t)data[1];
+    int32_t o = 2 + slot;
     if (data_len < o + 9) return h;
-    const uint8_t *kx = data + 1;
+    const uint8_t *kx = data + 2;
     int32_t kxl = 0;
     while (kxl < slot && kx[kxl] != 0) kxl++;
     int32_t i = 0;
-    if (kxl > 0 && kx[0] == '*') { h.ref = 1; i = 1; }
-    else if (kxl > 0 && kx[0] == '@') { h.ref = 2; i = 1; }
     if (i < kxl && kx[i] == '[') {
         i++;
         while (i < kxl && kx[i] != ']' && h.ndim < X_MAX_NDIM) {
@@ -373,8 +384,8 @@ int32_t kvspaceXvalueNewIndex(const char **children, int32_t count, uint8_t **ou
     return kvspaceXvalueNewIndexGrow(children, count, 0, 0, out);
 }
 
-/* 指针（ref=1）：head kindexpr = "*" + target_kindexpr（目标完整 kindexpr，含其自身
- * 的引用/形状前缀），恒标量不派生 dims；body = 目标 key 路径。 */
+/* 指针（xkind=1/Ptr）：head kindexpr = target_kindexpr（目标完整 kindexpr、无前缀），
+ * 恒标量不派生 dims；body = 目标 key 路径。 */
 int32_t kvspaceXvalueNewPtr(const char *target_kindexpr, const char *target, uint8_t **out) {
     if (!target || !target_kindexpr || !out) return -1;
     return encode_head(target_kindexpr, 1, 0, 0, 0, 0, (const uint8_t *)target, (int32_t)strlen(target), out);

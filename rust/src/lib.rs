@@ -1,10 +1,10 @@
 //! kvspace-c Rust FFI wrapper over libkvspace-c.so.
 //!
 //! ```no_run
-//! use kvspace_c::KVSpace;
+//! use kvspace_c::{KVSpace, xvalue};
 //!
 //! let kv = KVSpace::open("/tmp/test.shm", 32768).unwrap();
-//! kv.mkindex("/t/");
+//! kv.mkindex("/t/", 0);
 //! kv.set("/t/x", &xvalue::int64(42));
 //! let v = kv.get("/t/x").unwrap();
 //! assert_eq!(xvalue::kind(&v), "int64");
@@ -23,7 +23,7 @@ mod ffi {
         pub fn kvspaceShmSet(kv: *mut std::ffi::c_void, key: *const c_char, val: *const u8, val_len: i32) -> i32;
         pub fn kvspaceShmDel(kv: *mut std::ffi::c_void, key: *const c_char) -> i32;
         pub fn kvspaceShmDeltree(kv: *mut std::ffi::c_void, prefix: *const c_char) -> i32;
-        pub fn kvspaceShmMkindex(kv: *mut std::ffi::c_void, path: *const c_char) -> i32;
+        pub fn kvspaceShmMkindex(kv: *mut std::ffi::c_void, path: *const c_char, capacity: u32) -> i32;
         pub fn kvspaceShmList(kv: *mut std::ffi::c_void, prefix: *const c_char, expand_ext: bool, resolve: i32, out_names: *mut *mut *const c_char, out_count: *mut i32) -> i32;
         pub fn kvspaceShmExtindex(kv: *mut std::ffi::c_void, path: *const c_char, extpath: *const c_char) -> i32;
         pub fn kvspaceShmDelextindex(kv: *mut std::ffi::c_void, path: *const c_char) -> i32;
@@ -33,10 +33,19 @@ mod ffi {
 // ── xvalue TLV helpers ──────────────────────────────────────
 
 pub mod xvalue {
-    /// Encode TLV: [1B kindexprlen][kindexpr + 0x00 pad][1B ro][4B vid][4B raw_len][raw]
+    /// Encode TLV: [1B xkind][1B kindexprlen][kindexpr + 0x00 pad][1B ro][4B vid][4B raw_len][raw]
+    /// 入参 kindexpr 允许带 `*`/`@` 前缀（测试便利）：前缀升格为 xkind、槽内不再落前缀。
     fn encode(kindexpr: &str, raw: &[u8]) -> Vec<u8> {
-        let kb = kindexpr.as_bytes();
-        let mut buf = vec![(kb.len() + 1) as u8];
+        let (xkind, kx) = if let Some(r) = kindexpr.strip_prefix('*') {
+            (1u8, r)
+        } else if let Some(r) = kindexpr.strip_prefix('@') {
+            (2u8, r)
+        } else {
+            let base = kx_base(kindexpr);
+            (if base == "rwfunc" || base == "defrwir" { 3 } else { 4 }, kindexpr)
+        };
+        let kb = kx.as_bytes();
+        let mut buf = vec![xkind, (kb.len() + 1) as u8];
         buf.extend_from_slice(kb);
         buf.push(0);                                  // NUL pad
         buf.push(0);                                  // ro
@@ -46,17 +55,26 @@ pub mod xvalue {
         buf
     }
 
+    /// 剥掉 kindexpr 的 dims 段取 base kind。
+    fn kx_base(kx: &str) -> &str {
+        if kx.starts_with('[') {
+            let end = kx.find(']').map(|e| e + 1).unwrap_or(0);
+            &kx[end..]
+        } else {
+            kx
+        }
+    }
+
     /// Decode TLV → (kind, array_len, raw)
     pub fn decode(data: &[u8]) -> (&str, i32, &[u8]) {
-        if data.is_empty() { return ("", 0, &[]); }
-        let slot = data[0] as usize;
-        let kx = std::str::from_utf8(&data[1..1+slot]).unwrap_or("");
+        if data.len() < 2 { return ("", 0, &[]); }
+        let slot = data[1] as usize;
+        let kx = std::str::from_utf8(&data[2..2+slot]).unwrap_or("");
         let kx = kx.split('\0').next().unwrap_or("");
-        let o = 1 + slot;
+        let o = 2 + slot;
         let rl = u32::from_le_bytes(data[o+5..o+9].try_into().unwrap()) as usize;
         let raw = &data[o+9..o+9+rl];
         let mut kind = kx;
-        if kind.starts_with('*') || kind.starts_with('@') { kind = &kind[1..]; }
         let mut dims: Vec<i32> = Vec::new();
         if kind.starts_with('[') {
             let end = kind.find(']').unwrap_or(kind.len());
@@ -121,9 +139,9 @@ impl KVSpace {
         unsafe { ffi::kvspaceShmDeltree(self.ptr, cprefix.as_ptr()); }
     }
 
-    pub fn mkindex(&self, path: &str) {
+    pub fn mkindex(&self, path: &str, capacity: u32) {
         let cpath = CString::new(path).unwrap();
-        unsafe { ffi::kvspaceShmMkindex(self.ptr, cpath.as_ptr()); }
+        unsafe { ffi::kvspaceShmMkindex(self.ptr, cpath.as_ptr(), capacity); }
     }
 
     pub fn list(&self, prefix: &str) -> Vec<String> {

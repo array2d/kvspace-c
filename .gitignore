@@ -4,3 +4,6 @@ cmake-build-*/
 *.a
 __pycache__/
 *.pyc
+
+# Rust 构建产物
+rust/target/

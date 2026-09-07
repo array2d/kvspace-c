@@ -1307,7 +1307,7 @@ static void shm_ensure_indexes(kvspace_t *kv, const char *kbuf,
 
 /* 分配 box、就地写 head（kindexpr, body_len），art_ins 挂树，返回 body 偏移指针。
    已存在 key 先释放旧 box（新位置写=换 box）。零拷贝写路径唯一分配点。 */
-static int shm_alloc_head(kvspace_t *kv, const char *key, const char *kindexpr,
+static int shm_alloc_head(kvspace_t *kv, const char *key, uint8_t xkind, const char *kindexpr,
                           int32_t headlen, int32_t body_len, uint8_t **body) {
   int32_t total = headlen + body_len;
   art_hdr_t *old = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
@@ -1317,7 +1317,7 @@ static int shm_alloc_head(kvspace_t *kv, const char *key, const char *kindexpr,
   uint64_t off = sbo_alloc(kv->sbo_meta, (size_t)total);
   if (off == (uint64_t)-1)
     return -1;
-  kvspaceXvalueWriteHead(kv->sbo_data + off, kindexpr, body_len);
+  kvspaceXvalueWriteHead(kv->sbo_data + off, xkind, kindexpr, body_len);
   kv->hdr->art_root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)key,
                               (int)strlen(key), 0, off);
   *body = kv->sbo_data + off + headlen;
@@ -1423,8 +1423,8 @@ int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
   return 0;
 }
 
-int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, const char *kindexpr,
-                            int32_t body_len, uint8_t **body) {
+int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t xkind,
+                            const char *kindexpr, int32_t body_len, uint8_t **body) {
   if (!kv || !key || !kindexpr || !body || body_len < 0)
     return -1;
   char kbuf[1024];
@@ -1436,7 +1436,7 @@ int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, const char *kindexpr
   uint8_t hbuf[512];
   if (headlen > (int32_t)sizeof(hbuf))
     return -1;
-  kvspaceXvalueWriteHead(hbuf, kindexpr, 0);
+  kvspaceXvalueWriteHead(hbuf, xkind, kindexpr, 0);
   xvalue_head_t hh = kvspaceXvalueDecodeHead(hbuf, headlen);
 
   size_t l = strlen(kbuf);
@@ -1473,13 +1473,13 @@ int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, const char *kindexpr
       add_child_index(kv, pp, pn);
     free(pp);
     free(pn);
-    int rc = shm_alloc_head(kv, base, kindexpr, headlen, 0, body);
+    int rc = shm_alloc_head(kv, base, xkind, kindexpr, headlen, 0, body);
     free(base);
     return rc;
   }
 
   shm_ensure_indexes(kv, kbuf, &hh);
-  return shm_alloc_head(kv, kbuf, kindexpr, headlen, body_len, body);
+  return shm_alloc_head(kv, kbuf, xkind, kindexpr, headlen, body_len, body);
 }
 
 int kvspaceShmListLen(kvspace_t *kv, const char *prefix, bool ex, int resolve,

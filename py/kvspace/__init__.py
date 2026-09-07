@@ -34,24 +34,30 @@ _bind(_lib.kvspaceShmWatch, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, c
 
 # ── XValue TLV helpers ──────────────────────────────────────────
 
+def _xkind_of(kind: str, ref: int) -> int:
+    if ref == 1:
+        return 1
+    if ref == 2:
+        return 2
+    if kind in ("rwfunc", "defrwir"):
+        return 3
+    return 4
+
+
 def _xv_encode(kind: str, raw: bytes, dims: tuple = (), ref: int = 0, ro: int = 0, vid: int = 0) -> bytes:
-    kx = ("*" if ref == 1 else "@" if ref == 2 else "") + ("[" + ",".join(map(str, dims)) + "]" if dims else "") + kind
+    kx = ("[" + ",".join(map(str, dims)) + "]" if dims else "") + kind
     kb = kx.encode()
-    return struct.pack(f"<B{len(kb)}sxBII", len(kb) + 1, kb, ro, vid, len(raw)) + raw
+    return struct.pack(f"<BB{len(kb)}sxBII", _xkind_of(kind, ref), len(kb) + 1, kb, ro, vid, len(raw)) + raw
 
 
 def _xv_decode(data: Optional[bytes]) -> tuple[str, int, bytes]:
     if not data:
         return ("", 0, b"")
-    slot = data[0]
-    kx = data[1:1 + slot].split(b"\x00", 1)[0].decode()
-    o = 1 + slot
+    slot = data[1]
+    kx = data[2:2 + slot].split(b"\x00", 1)[0].decode()
+    o = 2 + slot
     rl = struct.unpack_from("<I", data, o + 5)[0]
     raw = data[o + 9 : o + 9 + rl]
-    if kx.startswith("*"):
-        kx = kx[1:]
-    elif kx.startswith("@"):
-        kx = kx[1:]
     dims = []
     if kx.startswith("["):
         end = kx.index("]")

@@ -16,7 +16,11 @@
 
 /* 对齐 kvspace-durable 的 kvspaceHead_t（repr(C)）。kindexpr 为唯一类型真相。 */
 typedef struct {
+    uint8_t xkind;
     uint8_t kindexpr[256];
+    int32_t kind_off;
+    int32_t ndim;
+    int32_t dims[8];
     uint8_t ro;
     uint32_t vid;
     int32_t body_len;
@@ -59,10 +63,10 @@ int kvspaceWriteInPlace(void *h, const char *key, int resolve, uint32_t body_len
     return 0;
 }
 
-/* 新位置写：按 (kindexpr, body_len) 分配 box、写 head，返回 body 偏移指针。 */
-int kvspaceWriteNewPlace(void *h, const char *key, const char *kindexpr, uint32_t body_len,
-                         uint8_t **body, char *err, uint32_t err_cap) {
-    if (kvspaceShmWriteNewPlace((kvspace_t *)h, key, kindexpr, (int32_t)body_len, body) != 0) {
+/* 新位置写：按 (xkind, kindexpr, body_len) 分配 box、写 head，返回 body 偏移指针。 */
+int kvspaceWriteNewPlace(void *h, const char *key, uint8_t xkind, const char *kindexpr,
+                         uint32_t body_len, uint8_t **body, char *err, uint32_t err_cap) {
+    if (kvspaceShmWriteNewPlace((kvspace_t *)h, key, xkind, kindexpr, (int32_t)body_len, body) != 0) {
         if (err && err_cap) snprintf(err, err_cap, "kvspace: write-new-place failed at %s", key);
         return 1;
     }
@@ -171,10 +175,14 @@ int kvspaceDecodeHead(const uint8_t *data, uint32_t data_len, kvspaceHead_t *out
     if (!out) return 1;
     xvalue_head_t h = kvspaceXvalueDecodeHead(data, (int32_t)data_len);
     memset(out, 0, sizeof(*out));
+    out->xkind = h.xkind;
     int32_t kl = h.kindexpr_len;
     if (kl > 255) kl = 255;
     memcpy(out->kindexpr, h.kindexpr, (size_t)kl);
     out->kindexpr[kl] = 0;
+    out->kind_off = h.kind ? (int32_t)(h.kind - h.kindexpr) : 0;
+    out->ndim = h.ndim;
+    for (int i = 0; i < h.ndim && i < 8; i++) out->dims[i] = h.dims[i];
     out->ro = (uint8_t)h.ro;
     out->vid = h.vid;
     out->body_len = h.raw_len;

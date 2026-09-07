@@ -1,12 +1,11 @@
 /*
  * xvalue.h — XValue 类型系统与 TLV 编解码（对齐 kvspace-durable 的 kindexp TLV）。
  *
- * TLV: [1B kindexprlen][kindexpr 含 0x00 padding][1B ro][4B vid LE][4B raw_len LE][raw]
- *   kindexpr 串首字节 * =指针(Ptr, 去 * 即目标完整 kindexpr, raw=目标 key) / @ =扩展句柄 / 无 =内联，其后 [d0,d1]kind 承载 ndim+dims：
- *   裸 kind=标量(ndim=0)、[n]kind=一维、[d0,d1]kind=多维。kindexprlen 为槽总长（含 padding），
- *   reshape 时新 kindexpr 不超过槽长即可原地改写不搬 body；内容以首个 NUL 终止。
- *   char/* kind 恒为一维序列（[n]，含空串/单字符）
- * None 编码为 NULL/len=0。
+ * TLV: [1B xkind][1B kindexprlen][kindexpr 含 0x00 padding][1B ro][4B vid LE][4B raw_len LE][raw]
+ *   xkind 五分类：0=None 1=Ptr 2=ExtValue 3=DefKindexpr(rwfunc/defrwir) 4=RealValue。
+ *   kindexpr 不带前缀，[d0,d1]kind 承载 ndim+dims：裸 kind=标量(ndim=0)、[n]kind=一维、[d0,d1]kind=多维。
+ *   Ptr: kindexpr=目标完整 kindexpr、raw=目标 key。kindexprlen 为槽总长（含 padding），内容以首个 NUL 终止。
+ *   char/* kind 恒为一维序列（[n]，含空串/单字符）。None 编码为 NULL/len=0。
  */
 
 #ifndef XVALUE_H
@@ -38,20 +37,27 @@
 #define KVSPACE_KIND_RWIR       "rwir"
 #define KVSPACE_KIND_RWFUNC     "rwfunc"
 #define KVSPACE_KIND_DEF_RWIR   "defrwir"
-#define KVSPACE_KIND_DEF_RWFUNC "defrwfunc"
 #define KVSPACE_KIND_SCOPE      "scope"
 #define KVSPACE_KIND_TIME       "time"
 #define KVSPACE_KIND_DURATION   "duration"
 
 #define X_MAX_NDIM 8
 
+/* xvalue 五分类（head 起始 1 字节） */
+#define KVSPACE_XKIND_NONE        0
+#define KVSPACE_XKIND_PTR         1
+#define KVSPACE_XKIND_EXTVALUE    2
+#define KVSPACE_XKIND_DEFKINDEXPR 3
+#define KVSPACE_XKIND_REALVALUE   4
+
 typedef struct {
-    const char    *kindexpr;     /* kindexpr 内容（data 内，含 ref 前缀与 [dims]，非 NUL 终止） */
+    uint8_t        xkind;        /* 五分类：见 KVSPACE_XKIND_* */
+    const char    *kindexpr;     /* kindexpr 内容（data 内，含 [dims]、无前缀，非 NUL 终止） */
     int32_t        kindexpr_len; /* kindexpr 内容长度（去 padding，扫到 NUL） */
     int32_t        kindexprlen;  /* wire 槽总长（内容 + NUL + padding） */
     const char    *kind;         /* 派生：base kind（kindexpr 子串），非 NUL 终止 */
     int32_t        kind_len;
-    int32_t        ref;          /* 派生：0=内联 1=指针 2=扩展句柄 */
+    int32_t        ref;          /* 派生自 xkind：0=内联 1=指针 2=扩展句柄 */
     int32_t        ro;           /* 1=只读，0=可写 */
     uint32_t       vid;          /* vthread id（默认 0） */
     int32_t        ndim;         /* 派生：0=标量，N=N 维数组 */
@@ -66,8 +72,8 @@ int32_t kvspaceXvalueHeadLen(const xvalue_head_t *h);
 
 /* 由 kindexpr 串直接算 head 字节数（含 slot NUL）。零拷贝写路径用：ro/vid 恒 0。 */
 int32_t kvspaceXvalueHeadLenForKindexpr(const char *kindexpr);
-/* 把 head（kindexpr + body_len，ro=0 vid=0）就地写入 dst 前 headlen 字节；body 随后由调用方填。 */
-void kvspaceXvalueWriteHead(uint8_t *dst, const char *kindexpr, int32_t body_len);
+/* 把 head（xkind + kindexpr + body_len，ro=0 vid=0）就地写入 dst 前 headlen 字节；body 随后由调用方填。 */
+void kvspaceXvalueWriteHead(uint8_t *dst, uint8_t xkind, const char *kindexpr, int32_t body_len);
 
 /* 内联编码（ref=0）。dims/ndim 直接落盘：ndim=0 标量，dims 可为 NULL。 */
 int32_t kvspaceXvalueEncode(const char *kind, const uint8_t *raw, int32_t raw_len,
