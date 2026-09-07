@@ -34,39 +34,58 @@ _bind(_lib.kvspaceShmWatch, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, c
 
 # ── XValue TLV helpers ──────────────────────────────────────────
 
-def _xkind_of(kind: str, ref: int) -> int:
-    if ref == 1:
-        return 1
-    if ref == 2:
-        return 2
-    if kind in ("rwfunc", "defrwir"):
-        return 3
-    return 4
+def _storetype(kind: str, ndim: int) -> int:
+    if kind == "":
+        return 0  # NONE
+    if kind == "extindex":
+        return 4  # EXTINDEX
+    if kind in ("index", "rwfunc", "defrwir") or kind.startswith("/") or "·" in kind:
+        return 3  # INDEX
+    if ndim > 0:
+        return 2  # ARRAYND
+    return 1  # ATOM
+
+
+def _store_has_dims(st: int) -> bool:
+    return st in (2, 3, 4)
 
 
 def _xv_encode(kind: str, raw: bytes, dims: tuple = (), ref: int = 0, ro: int = 0, vid: int = 0) -> bytes:
-    kx = ("[" + ",".join(map(str, dims)) + "]" if dims else "") + kind
-    kb = kx.encode()
-    return struct.pack(f"<BB{len(kb)}sxBII", _xkind_of(kind, ref), len(kb) + 1, kb, ro, vid, len(raw)) + raw
+    # 三正交轴 head：[headlen u16][ref u8][storetype u8][ro u8][vid u32][body_len u32][物理字段][langtype]
+    ndim = len(dims)
+    st = _storetype(kind, ndim)
+    langtype = (("[" + ",".join(map(str, dims)) + "]" + kind) if (st == 2 and ndim > 0) else kind)
+    lt = langtype.encode()
+    phys_ndim = 0 if ref == 1 else (ndim if _store_has_dims(st) else 0)  # ptr 物理字段恒空
+    headlen = 13 + ((1 + 4 * phys_ndim) if _store_has_dims(st) else 0) + len(lt)
+    buf = struct.pack("<HBBBII", headlen, ref, st, ro, vid, len(raw))
+    if _store_has_dims(st):
+        buf += struct.pack("<B", phys_ndim)
+        for d in dims[:phys_ndim]:
+            buf += struct.pack("<I", d)
+    return buf + lt + raw
 
 
 def _xv_decode(data: Optional[bytes]) -> tuple[str, int, bytes]:
-    if not data:
+    if not data or len(data) < 13:
         return ("", 0, b"")
-    slot = data[1]
-    kx = data[2:2 + slot].split(b"\x00", 1)[0].decode()
-    o = 2 + slot
-    rl = struct.unpack_from("<I", data, o + 5)[0]
-    raw = data[o + 9 : o + 9 + rl]
+    headlen, ref, st, ro, vid, body_len = struct.unpack_from("<HBBBII", data, 0)
+    o = 13
     dims = []
-    if kx.startswith("["):
-        end = kx.index("]")
-        dims = [int(d) for d in kx[1:end].split(",")]
-        kx = kx[end + 1:]
+    if _store_has_dims(st):
+        ndim = data[o]
+        o += 1
+        for _ in range(ndim):
+            dims.append(struct.unpack_from("<I", data, o)[0])
+            o += 4
+    kind = data[o:headlen].decode()
+    raw = data[headlen : headlen + body_len]
+    if kind.startswith("["):
+        kind = kind[kind.index("]") + 1:]
     al = 1
     for d in dims:
         al *= d
-    return (kx, al, raw)
+    return (kind, al if dims else 1, raw)
 
 
 def xv_int(v: int) -> bytes:

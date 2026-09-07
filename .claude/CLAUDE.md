@@ -44,21 +44,27 @@ uint8_t   *kvspace_watch(kvspace_t *kv, const char *key, int32_t timeout_ms, int
 
 **已知限制**：同名 key 的有/无尾斜杠共存未实现 prefix split（如 `/a` 和 `/a/` 同时存在时 Get("/a") 返回 NULL）。
 
-### XValue TLV 格式
+### XValue Head 线格式（ref × storetype × langtype 三正交轴）
 
 ```
-[1B kind_len][N B kind][4B arraylen LE][4B raw_len LE][M B raw]
+head = [headlen u16 LE][ref u8][storetype u8][ro u8][vid u32 LE][body_len u32 LE]
+       [storetype 物理字段][langtype kindexpr 串（占至 headlen）]
+body = [body_len B raw]
 ```
 
-kind 常量：`""(none)` `"int64"` `"float64"` `"string"` `"index"` `"linkindex"` `"extindex"` 等 17 种。
+- **ref**：存储位置。0=inline（body=值本体）/1=ptr（body=目标 key）/2=@ext（body=扩展定位符）。
+- **storetype**：物理布局，codec 唯一分派。NONE / ATOM / ARRAYND / index / extindex。
+  物理字段：ARRAYND = `ndim u8 + dims[ndim] u32 LE`；index/extindex = 成员名矩阵 `dims=[len,cap,M]`。
+- **langtype**：语义类型真相，完整 kindexpr 串（含 `[dims]`、map `key·value`、struct 原型路径、def 族名），
+  恒为 head 最后一段，无独立长度字段（长度 = headlen − 当前偏移），不含 ptr/ext 前缀。
 
-每个类型天然支持数组（arraylen 标识元素数）。对齐 kvspace-go 的 XValue 接口。
+权威定义 `kvspace/include/kvspace/kvspace.h`，三处 byte-identical（+ `kvspace-durable/src/xvalue.rs`）。
 
-### Index / Link / ExtIndex
+### Index / ExtIndex
 
-- **Index**：目录标记。kind="index", raw=""。List 通过 ART 前缀扫描获取子节点，不依赖 index value 的内容。
-- **LinkIndex**：kind="linkindex", raw=target 路径。当前仅存储，Get/List 未穿透。
-- **ExtIndex**：kind="extindex", raw="…"+extpath。当前仅存储，List 未展开 extpath 子节点。
+- **Index**：storetype=index，成员名矩阵 `[len,cap,M]`（len=成员数、cap 预留、M=行宽 align8）。
+  目录节点（rwfunc/lib）成员走 `/` 子路径；值容器（stringkeymap/struct）成员走 `{key}·` 兄弟槽。
+- **ExtIndex**：storetype=extindex，同 index 但 cap 可增长（运行栈等），body 头部前置 extpath。
 
 ### Watch/Notify
 

@@ -1,11 +1,16 @@
 /*
- * xvalue.h — XValue 类型系统与 TLV 编解码（对齐 kvspace-durable 的 kindexp TLV）。
+ * xvalue.h — XValue 类型系统与三轴 head 编解码（对齐 kvspace/frontend.c 黄金基准 + kvspace-durable）。
  *
- * TLV: [1B xkind][1B kindexprlen][kindexpr 含 0x00 padding][1B ro][4B vid LE][4B raw_len LE][raw]
- *   xkind 五分类：0=None 1=Ptr 2=ExtValue 3=DefKindexpr(rwfunc/defrwir) 4=RealValue。
- *   kindexpr 不带前缀，[d0,d1]kind 承载 ndim+dims：裸 kind=标量(ndim=0)、[n]kind=一维、[d0,d1]kind=多维。
- *   Ptr: kindexpr=目标完整 kindexpr、raw=目标 key。kindexprlen 为槽总长（含 padding），内容以首个 NUL 终止。
- *   char/* kind 恒为一维序列（[n]，含空串/单字符）。None 编码为 NULL/len=0。
+ * head = [headlen u16 LE][ref u8][storetype u8][ro u8][vid u32 LE][body_len u32 LE]
+ *        [storetype 物理字段][langtype kindexpr 串（占至 headlen）]
+ * body = [body_len B raw]
+ *   ref       0=inline（body=值本体）/1=ptr（body=目标 key）/2=@ext（body=扩展定位符）
+ *   storetype NONE/ATOM/ARRAYND/index/extindex；codec 唯一分派。
+ *             物理字段：ARRAYND / index / extindex 为 ndim u8 + dims[ndim] u32 LE
+ *             （index/extindex 的 dims=[len,cap,M]）；NONE / ATOM 无物理字段。
+ *   langtype  完整 kindexpr 串，恒为 head 最后一段（长度 = headlen − 当前偏移，无独立长度字段）。
+ *             ARRAYND 含 [dims]；ATOM/index/extindex 为裸种类名/路径；None 为空串。
+ *   Ptr: langtype=目标完整 kindexpr、body=目标 key、物理字段恒空。char/* 一维序列 → ARRAYND。
  */
 
 #ifndef XVALUE_H
@@ -43,37 +48,45 @@
 
 #define X_MAX_NDIM 8
 
-/* xvalue 五分类（head 起始 1 字节） */
-#define KVSPACE_XKIND_NONE        0
-#define KVSPACE_XKIND_PTR         1
-#define KVSPACE_XKIND_EXTVALUE    2
-#define KVSPACE_XKIND_DEFKINDEXPR 3
-#define KVSPACE_XKIND_REALVALUE   4
+/* ref：存储位置维（head 第 2 字节）。 */
+#define KVSPACE_REF_INLINE 0  /* body = 值本体 raw */
+#define KVSPACE_REF_PTR    1  /* body = 目标 key 路径（软链接） */
+#define KVSPACE_REF_EXT    2  /* body = 扩展世界定位符 */
+
+/* storetype：物理布局维（head 第 3 字节，codec 唯一分派）。 */
+#define KVSPACE_STORETYPE_NONE     0  /* 无物理字段，body 空 */
+#define KVSPACE_STORETYPE_ATOM     1  /* 无物理字段，body 定宽 raw */
+#define KVSPACE_STORETYPE_ARRAYND  2  /* ndim u8 + dims[ndim] u32 LE，body 稠密数组 */
+#define KVSPACE_STORETYPE_INDEX    3  /* 成员名矩阵 dims=[len,cap,M] */
+#define KVSPACE_STORETYPE_EXTINDEX 4  /* 同 index，cap 可增长 */
 
 typedef struct {
-    uint8_t        xkind;        /* 五分类：见 KVSPACE_XKIND_* */
-    const char    *kindexpr;     /* kindexpr 内容（data 内，含 [dims]、无前缀，非 NUL 终止） */
-    int32_t        kindexpr_len; /* kindexpr 内容长度（去 padding，扫到 NUL） */
-    int32_t        kindexprlen;  /* wire 槽总长（内容 + NUL + padding） */
-    const char    *kind;         /* 派生：base kind（kindexpr 子串），非 NUL 终止 */
+    uint16_t       headlen;      /* head 总字节数；body 起于偏移 headlen */
+    int32_t        ref;          /* 存储位置：见 KVSPACE_REF_* */
+    uint8_t        storetype;    /* 物理布局：见 KVSPACE_STORETYPE_* */
+    const char    *langtype;     /* langtype kindexpr 串（data 内，含 [dims]、无前缀，非 NUL 终止） */
+    int32_t        langtype_len; /* langtype 内容长度 */
+    const char    *kind;         /* 派生：base 种类名（越过 [dims]，langtype 子串），非 NUL 终止 */
     int32_t        kind_len;
-    int32_t        ref;          /* 派生自 xkind：0=内联 1=指针 2=扩展句柄 */
     int32_t        ro;           /* 1=只读，0=可写 */
     uint32_t       vid;          /* vthread id（默认 0） */
-    int32_t        ndim;         /* 派生：0=标量，N=N 维数组 */
-    int32_t        dims[X_MAX_NDIM];
+    int32_t        ndim;         /* ARRAYND：维数；index/extindex：3；NONE/ATOM：0 */
+    int32_t        dims[X_MAX_NDIM]; /* ARRAYND：各维长；index/extindex：[len,cap,M] */
     int32_t        array_len;    /* 派生：标量=1，定长=∏dims */
-    int32_t        raw_len;
-    const uint8_t *raw;
+    int32_t        raw_len;      /* body 字节数 */
+    const uint8_t *raw;          /* body 指针（data + headlen） */
 } xvalue_head_t;
 
 /* head 字节数（不含 body） */
 int32_t kvspaceXvalueHeadLen(const xvalue_head_t *h);
 
-/* 由 kindexpr 串直接算 head 字节数（含 slot NUL）。零拷贝写路径用：ro/vid 恒 0。 */
-int32_t kvspaceXvalueHeadLenForKindexpr(const char *kindexpr);
-/* 把 head（xkind + kindexpr + body_len，ro=0 vid=0）就地写入 dst 前 headlen 字节；body 随后由调用方填。 */
-void kvspaceXvalueWriteHead(uint8_t *dst, uint8_t xkind, const char *kindexpr, int32_t body_len);
+/* 由 (storetype, langtype, ndim) 直接算 head 字节数。零拷贝写路径用：ro/vid 恒 0。 */
+int32_t kvspaceXvalueHeadLenForLangtype(uint8_t storetype, const char *langtype, int32_t ndim);
+/* 把 head（ref + storetype + ro + vid + langtype + 物理字段 + body_len）就地写入 dst 前 headlen
+ * 字节；body 随后由调用方填。dims 仅在 store_has_dims(storetype) 时落物理字段。 */
+void kvspaceXvalueWriteHead(uint8_t *dst, uint8_t ref, uint8_t storetype, uint8_t ro, uint32_t vid,
+                            const char *langtype, const int32_t *dims, int32_t ndim,
+                            int32_t body_len);
 
 /* 内联编码（ref=0）。dims/ndim 直接落盘：ndim=0 标量，dims 可为 NULL。 */
 int32_t kvspaceXvalueEncode(const char *kind, const uint8_t *raw, int32_t raw_len,
