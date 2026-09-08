@@ -27,3 +27,12 @@ target_link_libraries(kvspace-c
 install(TARGETS kvspace-c
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
+
+option(KVSPACE_BUILD_TESTS "Build tests (ctest)" OFF)
+if(KVSPACE_BUILD_TESTS)
+    enable_testing()
+    add_executable(test_shm_split tests/test_shm_split.c)
+    target_include_directories(test_shm_split PRIVATE src)
+    target_link_libraries(test_shm_split PRIVATE kvspace-c)
+    add_test(NAME shm_split COMMAND test_shm_split)
+endif()

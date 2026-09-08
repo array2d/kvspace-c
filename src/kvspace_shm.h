@@ -19,7 +19,7 @@ typedef struct kvspace kvspace_t;
  * 生命周期
  * ================================================================ */
 
-// 打开或创建 SHM。data_size 必须为 64 的幂 × 8 的倍数.
+// Files: <path> (ART, grows), <path>.sbo.head, <path>.sbo.data. data_size = 8*64^k, create only.
 kvspace_t *kvspaceShmOpen(const char *path, size_t data_size);
 void kvspaceShmClose(kvspace_t *kv);
 
