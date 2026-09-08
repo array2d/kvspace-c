@@ -876,72 +876,66 @@ static int read_tlv(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
     *ol = kvspaceXvalueHeadLen(&h) + h.raw_len;
     return 0;
 }
+/* link 解析：ptr（ref=1）与 @ext（ref=2）的 XValue 恒为叶子（spec 硬规则——指针/扩展键
+ * 之后不可能再有成员，成员只挂在 target 上），故路径中任何 `/` 分隔的容器前缀都绝不会是
+ * link；唯一可能是 ptr 的只有整键叶子本身。因此只需查整键一次：非 ptr 即完成，ptr 则顺链
+ * 到 target（本身又是一个完整叶子键）再查，最多追 16 跳。叶子不存在→非链，原样返回（调用
+ * 方另做 extindex/dir 兜底）。取代旧的「逐前缀 1~3 次 art_search + 追加 rest」全下降探测。 */
 static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
     strncpy(out, path, osz - 1);
     out[osz - 1] = '\0';
     for (int depth = 0; depth < 16; depth++) {
-        char cur[1024];
-        strncpy(cur, out, sizeof(cur) - 1);
-        cur[sizeof(cur) - 1] = '\0';
-        bool changed = false;
-        // scan / /a /a/b ... for link at each prefix
-        char *s = cur;
-        while (s && *s) {
-            s = strchr(s + 1, '/');
-            int pl = s ? (int)(s - cur) : (int)strlen(cur);
-            if (pl == 0)
-                continue;
-            char pre[1024];
-            memcpy(pre, cur, pl);
-            pre[pl] = '\0';
-            art_hdr_t *h =
-                art_search(kv, kv->hdr->art_root, (const uint8_t *)pre, pl);
-            if (!h || !h->has_value) {
-                pre[pl] = '/';
-                pre[pl + 1] = '\0';
-                h = art_search(kv, kv->hdr->art_root, (const uint8_t *)pre, pl + 1);
-            }
-            if (!h || !h->has_value) {
-                if (s)
-                    continue; // full key: also try dir form
-                char d[1028];
-                snprintf(d, sizeof(d), "%s/", cur);
-                h = art_search(kv, kv->hdr->art_root, (const uint8_t *)d,
-                               (int)strlen(d));
-            }
-            if (!h || !h->has_value)
-                continue;
-            uint8_t *raw;
-            int32_t rl;
-            if (read_tlv(kv, h->box_offset, &raw, &rl) < 0)
-                continue;
-            xvalue_head_t hh = kvspaceXvalueDecodeHead(raw, rl);
-            if (hh.ref != 1) {
-                continue;
-            }
-            int tl = hh.raw_len;
-            if (tl >= osz) {
-                break;
-            }
-            memcpy(out, hh.raw, tl);
-            out[tl] = '\0';
-            const char *rest = path + pl;
-            if (*rest == '/')
-                rest++;
-            if (*rest) {
-                size_t ol = strlen(out);
-                if (ol > 0 && out[ol - 1] != '/') {
-                    out[ol] = '/';
-                    out[ol + 1] = '\0';
-                }
-                strncat(out, rest, osz - (int)strlen(out) - 1);
-            }
-            changed = true;
-            break;
-        }
-        if (!changed)
-            break;
+        art_hdr_t *h =
+            art_search(kv, kv->hdr->art_root, (const uint8_t *)out, (int)strlen(out));
+        if (!h || !h->has_value)
+            return;
+        uint8_t *raw;
+        int32_t rl;
+        if (read_tlv(kv, h->box_offset, &raw, &rl) < 0)
+            return;
+        xvalue_head_t hh = kvspaceXvalueDecodeHead(raw, rl);
+        if (hh.ref != 1)
+            return;
+        int tl = hh.raw_len;
+        if (tl <= 0 || tl >= osz)
+            return;
+        memcpy(out, hh.raw, tl);
+        out[tl] = '\0';
     }
+}
+
+/* resolve_path 的融合版：解析 link 链的同时把终端叶子的值一并取出，令调用方省掉
+ * 「解析后再 art_search + read_tlv」的整套重复下降。每跳只解一次 head（ref 判定与
+ * TLV 长度共用），命中带值节点即返 fetched=1（*raw/*rl 就位）。语义与
+ * resolve_path + art_search + read_tlv 逐字等价：未命中/无值 → 返回该节点、fetched=0，
+ * 交调用方走 extindex/dir 兜底。 */
+static art_hdr_t *resolve_fetch(kvspace_t *kv, const char *path, char *out, int osz,
+                                uint8_t **raw, int32_t *rl, int *fetched) {
+    *fetched = 0;
+    strncpy(out, path, osz - 1);
+    out[osz - 1] = '\0';
+    for (int depth = 0; depth < 16; depth++) {
+        art_hdr_t *h =
+            art_search(kv, kv->hdr->art_root, (const uint8_t *)out, (int)strlen(out));
+        if (!h || !h->has_value)
+            return h;
+        uint8_t *s = kv->sbo_data + h->box_offset;
+        size_t sz = sbo_allocated_size(kv->sbo_meta, h->box_offset);
+        xvalue_head_t hh =
+            kvspaceXvalueDecodeHead(s, sz > INT32_MAX ? INT32_MAX : (int32_t)sz);
+        int32_t tlvlen =
+            hh.langtype_len == 0 ? 0 : kvspaceXvalueHeadLen(&hh) + hh.raw_len;
+        int tl = hh.raw_len;
+        if (hh.ref != 1 || tl <= 0 || tl >= osz) { /* 非 ptr 或无法续链：终端 */
+            *raw = s;
+            *rl = tlvlen;
+            *fetched = 1;
+            return h;
+        }
+        memcpy(out, hh.raw, tl);
+        out[tl] = '\0';
+    }
+    return NULL;
 }
 
 /* memindex 定宽矩阵几何：n=dims[0]、m=dims[1]；返回矩阵起点（extindex 矩阵在
@@ -1050,14 +1044,18 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
     if (kv_sync(kv) != 0)
         return NULL;
     char kbuf[1024];
+    uint8_t *raw;
+    int32_t rl;
+    int fetched = 0;
+    art_hdr_t *h;
     if (resolve)
-        resolve_path(kv, key, kbuf, sizeof(kbuf));
+        h = resolve_fetch(kv, key, kbuf, sizeof(kbuf), &raw, &rl, &fetched);
     else {
         strncpy(kbuf, key, sizeof(kbuf) - 1);
         kbuf[sizeof(kbuf) - 1] = '\0';
+        h = art_search(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
+                       (int)strlen(kbuf));
     }
-    art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
-                              (int)strlen(kbuf));
     if (!h || !h->has_value) {
         /* extindex fallback：父目录是 extindex → 读 extpath + name */
         char *parent = NULL, *name = NULL;
@@ -1083,9 +1081,7 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
         free(name);
         return NULL;
     }
-    uint8_t *raw;
-    int32_t rl;
-    if (read_tlv(kv, h->box_offset, &raw, &rl) < 0)
+    if (!fetched && read_tlv(kv, h->box_offset, &raw, &rl) < 0)
         return NULL;
     *ol = rl;
     return raw;
@@ -1548,19 +1544,21 @@ int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
     if (kv_sync(kv) != 0)
         return -1;
     char kbuf[1024];
+    uint8_t *raw;
+    int32_t rl;
+    int fetched = 0;
+    art_hdr_t *h;
     if (resolve)
-        resolve_path(kv, key, kbuf, sizeof(kbuf));
+        h = resolve_fetch(kv, key, kbuf, sizeof(kbuf), &raw, &rl, &fetched);
     else {
         strncpy(kbuf, key, sizeof(kbuf) - 1);
         kbuf[sizeof(kbuf) - 1] = '\0';
+        h = art_search(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
+                       (int)strlen(kbuf));
     }
-    art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
-                              (int)strlen(kbuf));
     if (!h || !h->has_value)
         return -1;
-    uint8_t *raw;
-    int32_t rl;
-    if (read_tlv(kv, h->box_offset, &raw, &rl) < 0 || rl <= 0)
+    if ((!fetched && read_tlv(kv, h->box_offset, &raw, &rl) < 0) || rl <= 0)
         return -1; /* None 或读失败 → 强制走 NewPlace */
     xvalue_head_t hh = kvspaceXvalueDecodeHead(raw, rl);
     if (hh.raw_len != body_len)
