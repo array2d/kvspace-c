@@ -21,8 +21,15 @@
 #define ART_PREFIX_MAX 10
 #define ART_NODE_MAX_SZ 2112
 #define ART_SLAB_INIT (256UL * 1024 * 1024)
-/* Reserved VA per region: grow in place, base never moves. */
+/* blocks_init picks 30-bit ids only if the initial pool holds > 8191 blocks;
+   a smaller pool would be capped at 16384 blocks forever. */
+#define SBO_HEAD_POOL_INIT (4UL * 1024 * 1024)
+/* Reserved VA per region: grow in place, base never moves.
+   data grows x64 per step; 2^40 fits 8 * 64^6 = 512GB. */
 #define REGION_RESERVE (1ULL << 38)
+#define DATA_RESERVE (1ULL << 40)
+/* Values >= 64KB are level-3+ objects (32KB aligned): punch pages on delete. */
+#define SBO_PUNCH_MIN (64UL * 1024)
 #define WATCH_TABLE_SZ 256
 
 enum { ART_N4 = 0,
@@ -80,6 +87,27 @@ _Static_assert(ART_SLAB_INIT / (ART_NODE_MAX_SZ + 2) > 32767ULL / 4,
                "ART_SLAB_INIT too small: blockmalloc would pick 14-bit ids");
 _Static_assert(REGION_RESERVE / (ART_NODE_MAX_SZ + 4) <= (1ULL << 30),
                "REGION_RESERVE too large for 30-bit block ids");
+_Static_assert(
+    SBO_HEAD_POOL_INIT / (sizeof(sbo_box_t) + 2) > 32767ULL / 4,
+    "SBO_HEAD_POOL_INIT too small: blockmalloc would pick 14-bit ids");
+
+/* Head layout with root_slots == 1 (checked at open):
+   [sbo_meta_t][blocks_meta_t][sbo_lock_t][pool]. Public structs only. */
+#define SBO_HEAD_FIXED                                                         \
+    (sizeof(sbo_meta_t) + sizeof(blocks_meta_t) + sizeof(sbo_lock_t))
+static blocks_meta_t *sbo_pool(sbo_meta_t *m) {
+    return (blocks_meta_t *)(m + 1);
+}
+static sbo_lock_t *sbo_plock(sbo_meta_t *m) {
+    return (sbo_lock_t *)(sbo_pool(m) + 1);
+}
+static uint8_t *sbo_pmem(sbo_meta_t *m) {
+    return (uint8_t *)(sbo_plock(m) + 1);
+}
+static sbo_box_t *sbo_box(sbo_meta_t *m, int32_t id) {
+    return (sbo_box_t *)(sbo_pmem(m) + (size_t)id * m->block_stride +
+                         m->sizeof_block_head);
+}
 
 typedef struct {
     int fd;
@@ -102,7 +130,8 @@ struct kvspace {
     kvspace_hdr_t *hdr;
     blocks_meta_t *art_meta;
     uint8_t *art_data;
-    uint8_t *sbo_meta, *sbo_data;
+    sbo_meta_t *sbo_meta;
+    uint8_t *sbo_data;
     watch_t watches[WATCH_TABLE_SZ];
     pthread_mutex_t wlock;
 };
@@ -121,12 +150,13 @@ static int region_map(shm_region_t *r, size_t size) {
 }
 
 /* create: size the file; open: check it. Then reserve VA and map. */
-static int region_attach(shm_region_t *r, bool create, size_t size) {
+static int region_attach(shm_region_t *r, bool create, size_t size,
+                         size_t reserve) {
     struct stat st;
     if (create ? ftruncate(r->fd, (off_t)size) != 0
                : fstat(r->fd, &st) != 0 || st.st_size < (off_t)size)
         return -1;
-    r->reserve = size > REGION_RESERVE ? size : REGION_RESERVE;
+    r->reserve = size > reserve ? size : reserve;
     void *p = mmap(NULL, r->reserve, PROT_NONE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED)
@@ -161,6 +191,131 @@ static int art_slab_grow(kvspace_t *kv) {
     kv->hdr->art_slab_size = want;
     kv->art_meta->total_size = want;
     return 0;
+}
+
+/* ---- sbo growth (docs/shm-resize.md). Both grow functions run under
+   sbo_plock, which excludes sbo_alloc/free/allocated_size in every process. */
+
+/* Free list empty and no room to append. Unlocked calls are a hint only. */
+static bool sbo_pool_full(sbo_meta_t *m) {
+    blocks_meta_t *p = sbo_pool(m);
+    if (p->free_next_id != -1)
+        return false;
+    uint64_t next_end = (uint64_t)block_offset(p, p->malloc_blocks) +
+                        p->sizeof_block_head + p->block_size;
+    return next_end > p->total_size;
+}
+
+/* Cap at what the block-head width can address: 14-bit or 30-bit ids. */
+static int sbo_head_grow(kvspace_t *kv) {
+    sbo_meta_t *m = kv->sbo_meta;
+    blocks_meta_t *p = sbo_pool(m);
+    uint64_t stride = p->sizeof_block_head + p->block_size;
+    uint64_t cap = (1ULL << (p->sizeof_block_head == 2 ? 14 : 30)) * stride;
+    uint64_t cur = p->total_size, want = cur * 2;
+    if (want > cap)
+        want = cap;
+    if (SBO_HEAD_FIXED + want > kv->r_head.reserve)
+        want = kv->r_head.reserve - SBO_HEAD_FIXED;
+    if (want <= cur ||
+        ftruncate(kv->r_head.fd, (off_t)(SBO_HEAD_FIXED + want)) != 0 ||
+        region_map(&kv->r_head, SBO_HEAD_FIXED + (size_t)want) != 0)
+        return -1;
+    p->total_size = want;
+    m->per_slot_meta = want;
+    m->head_size = SBO_HEAD_FIXED + want;
+    kv->hdr->sbo_head_size = m->head_size;
+    return 0;
+}
+
+/* x64: move the root into a new block, make block 0 the level above with
+   slot 0 pointing at it. Existing offsets stay valid (docs 2.2). */
+static int sbo_data_grow(kvspace_t *kv) {
+    sbo_meta_t *m = kv->sbo_meta;
+    uint64_t cur = m->data_size, want = cur * 64;
+    if (want > kv->r_data.reserve)
+        return -1;
+    if (sbo_pool_full(m) && sbo_head_grow(kv) != 0)
+        return -1;
+    if (ftruncate(kv->r_data.fd, (off_t)want) != 0 ||
+        region_map(&kv->r_data, (size_t)want) != 0)
+        return -1;
+    int64_t nid = blocks_alloc(sbo_pool(m), sbo_pmem(m));
+    if (nid < 0)
+        return -1;
+    sbo_box_t *root = sbo_box(m, 0), *b = sbo_box(m, (int32_t)nid);
+    memcpy(b, root, sizeof *b);
+    b->parent = 0;
+    for (int i = 0; i < SBO_N; i++)
+        if (root->slots[i].state == SBO_BOX)
+            sbo_box(m, root->children[i])->parent = (int32_t)nid;
+    uint8_t lvl = (uint8_t)(root->objlevel + 1);
+    root->objlevel = lvl;
+    root->box_boundary = 1;
+    root->obj_boundary = SBO_N - 1;
+    memset(root->free_bitmap, 0xFF, SBO_BITMAP_B);
+    root->free_bitmap[0] &= 0xFE;
+    for (int i = 0; i < SBO_N; i++) {
+        root->slots[i].state = SBO_FREE;
+        root->children[i] = -1;
+    }
+    root->slots[0].state = SBO_BOX;
+    root->children[0] = (int32_t)nid;
+    root->max_obj_cap = SBO_N - 1;
+    root->child_max_cap = (sbo_usage_t){(uint8_t)(lvl + 1), 1};
+    m->data_size = want;
+    m->slot_bytes = want;
+    kv->hdr->sbo_data_size = want;
+    return 0;
+}
+
+/* Pool exhaustion is exact. Data exhaustion is not (sbo_alloc also fails on
+   trylock contention), so re-root only after two failures at one capacity. */
+static int kv_sbo_grow(kvspace_t *kv, bool failed, uint64_t *seen_data) {
+    sbo_meta_t *m = kv->sbo_meta;
+    sbo_lock(sbo_plock(m));
+    int rc = 0;
+    if (sbo_pool_full(m))
+        rc = sbo_head_grow(kv);
+    else if (failed && m->data_size == *seen_data)
+        rc = sbo_data_grow(kv);
+    else if (failed)
+        *seen_data = m->data_size;
+    sbo_unlock(sbo_plock(m));
+    return rc;
+}
+
+/* A failed sbo_alloc burns one slot per level (box_boundary is not rolled
+   back), so check the pool before allocating. */
+static uint64_t kv_sbo_alloc(kvspace_t *kv, size_t n) {
+    sbo_meta_t *m = kv->sbo_meta;
+    uint64_t seen_data = 0;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        if (attempt && kv_sync(kv) != 0)
+            return (uint64_t)-1;
+        if (sbo_pool_full(m) && kv_sbo_grow(kv, false, &seen_data) != 0)
+            return (uint64_t)-1;
+        uint64_t off = sbo_alloc(m, n);
+        if (off != (uint64_t)-1)
+            return off;
+        if (kv_sbo_grow(kv, true, &seen_data) != 0)
+            return (uint64_t)-1;
+    }
+    return (uint64_t)-1;
+}
+
+/* Punch before free: once freed, another process may reuse the range. */
+static void kv_sbo_free(kvspace_t *kv, uint64_t off) {
+    uint64_t sz = sbo_allocated_size(kv->sbo_meta, off);
+    if (sz >= SBO_PUNCH_MIN) {
+        uint64_t pg = (uint64_t)sysconf(_SC_PAGESIZE);
+        uint64_t a = (off + pg - 1) & ~(pg - 1), b = (off + sz) & ~(pg - 1);
+        if (b > a)
+            (void)fallocate(kv->r_data.fd,
+                            FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                            (off_t)a, (off_t)(b - a));
+    }
+    sbo_free(kv->sbo_meta, off);
 }
 
 /* ---- helpers ---- */
@@ -620,7 +775,7 @@ static int32_t art_del(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
         if (!h->has_value)
             return nid;
         h->has_value = 0;
-        sbo_free(kv->sbo_meta, h->box_offset);
+        kv_sbo_free(kv, h->box_offset);
         h->box_offset = 0;
         *del = true;
     } else {
@@ -788,7 +943,7 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
     size_t art_slab, sbo_head;
     if (created) {
         art_slab = ART_SLAB_INIT;
-        sbo_head = sbo_meta_size(data_size, 256 * 1024);
+        sbo_head = sbo_meta_size(data_size, SBO_HEAD_POOL_INIT);
     } else {
         kvspace_hdr_t tmp;
         if (pread(kv->r_art.fd, &tmp, sizeof tmp, 0) != (ssize_t)sizeof tmp ||
@@ -801,17 +956,18 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
 
     /* O_TRUNC: sbo_init rejects a stale magic */
     int fl = created ? O_RDWR | O_CREAT | O_TRUNC : O_RDWR;
-    if (region_attach(&kv->r_art, created, ART_OFF + art_slab) != 0 ||
+    if (region_attach(&kv->r_art, created, ART_OFF + art_slab,
+                      REGION_RESERVE) != 0 ||
         (kv->r_head.fd = open(head_path, fl, 0644)) < 0 ||
-        region_attach(&kv->r_head, created, sbo_head) != 0 ||
+        region_attach(&kv->r_head, created, sbo_head, REGION_RESERVE) != 0 ||
         (kv->r_data.fd = open(data_path, fl, 0644)) < 0 ||
-        region_attach(&kv->r_data, created, data_size) != 0)
+        region_attach(&kv->r_data, created, data_size, DATA_RESERVE) != 0)
         goto fail;
 
     kv->hdr = (kvspace_hdr_t *)kv->r_art.base;
     kv->art_meta = (blocks_meta_t *)(kv->r_art.base + sizeof(kvspace_hdr_t));
     kv->art_data = kv->r_art.base + ART_OFF;
-    kv->sbo_meta = kv->r_head.base;
+    kv->sbo_meta = (sbo_meta_t *)kv->r_head.base;
     kv->sbo_data = kv->r_data.base;
 
     if (created) {
@@ -826,6 +982,9 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
         /* magic last: half-initialized file fails reopen */
         memcpy(kv->hdr->magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1);
     }
+    /* growth code assumes the single-root pool layout (SBO_HEAD_FIXED) */
+    if (kv->sbo_meta->root_slots != 1)
+        goto fail;
 
     pthread_mutex_init(&kv->wlock, NULL);
     for (int i = 0; i < WATCH_TABLE_SZ; i++) {
@@ -1110,9 +1269,9 @@ static int shm_set_raw(kvspace_t *kv, const char *key, const uint8_t *val,
             memcpy(kv->sbo_data + old->box_offset, val, (size_t)val_len);
             return 0;
         }
-        sbo_free(kv->sbo_meta, old->box_offset);
+        kv_sbo_free(kv, old->box_offset);
     }
-    uint64_t off = sbo_alloc(kv->sbo_meta, (size_t)val_len);
+    uint64_t off = kv_sbo_alloc(kv, (size_t)val_len);
     if (off == (uint64_t)-1)
         return -1;
     memcpy(kv->sbo_data + off, val, val_len);
@@ -1446,8 +1605,8 @@ static int shm_alloc_head(kvspace_t *kv, const char *key, uint8_t ref,
     art_hdr_t *old =
         art_search(kv, kv->hdr->art_root, (const uint8_t *)key, (int)strlen(key));
     if (old && old->has_value)
-        sbo_free(kv->sbo_meta, old->box_offset);
-    uint64_t off = sbo_alloc(kv->sbo_meta, (size_t)total);
+        kv_sbo_free(kv, old->box_offset);
+    uint64_t off = kv_sbo_alloc(kv, (size_t)total);
     if (off == (uint64_t)-1)
         return -1;
     int32_t dims[X_MAX_NDIM];
