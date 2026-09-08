@@ -31,6 +31,8 @@ typedef struct {
     int32_t body_offset;
 } kvspaceHead_t;
 
+int kvspaceDecodeHead(const uint8_t *data, uint32_t data_len, kvspaceHead_t *out);
+
 static int parse_shm_path(const char *dsn, char *out, size_t osz) {
     const char *sep = strstr(dsn, "://");
     if (!sep || strncmp(dsn, "shm", (size_t)(sep - dsn)) != 0)
@@ -64,6 +66,50 @@ int kvspaceGet(void *h, const char *key, int resolve, uint8_t **out,
     *out = d;
     *out_len = (uint32_t)len;
     return 0;
+}
+
+/* 指令边界回收读借用池：SHM 常驻映射，借用恒有效，no-op。 */
+void kvspaceReadReset(void *h) { (void)h; }
+
+/* 定位读：*out 指向 SHM 常驻映射内 [offset, offset+len)（借用，不得 free）。
+ * 越界/空 → *out=NULL、out_len=0。 */
+int kvspaceGetPart(void *h, const char *key, uint32_t offset, uint32_t len,
+                    uint8_t **out, uint32_t *out_len) {
+    int32_t total = 0;
+    uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 1, &total);
+    if (!d || total <= 0 || offset >= (uint32_t)total) {
+        *out = NULL;
+        *out_len = 0;
+        return 0;
+    }
+    uint32_t avail = (uint32_t)total - offset;
+    *out = d + offset;
+    *out_len = len < avail ? len : avail;
+    return 0;
+}
+
+/* 定位写：就地 memcpy buf 到 SHM 映射内 [offset, offset+buf_len)（key 须已存在、不改结构）。 */
+int kvspaceSetPart(void *h, const char *key, uint32_t offset,
+                    const uint8_t *buf, uint32_t buf_len, char *err,
+                    uint32_t err_cap) {
+    int32_t total = 0;
+    uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 1, &total);
+    if (!d || total < 0 || offset + buf_len > (uint32_t)total) {
+        if (err && err_cap)
+            snprintf(err, err_cap, "kvspace: set-part out of range at %s", key);
+        return 1;
+    }
+    memcpy(d + offset, buf, buf_len);
+    return 0;
+}
+
+/* 读 head：解码值前缀的三正交轴 head（不取 body）。空/不存在 → 返回 1。 */
+int kvspaceGetHead(void *h, const char *key, kvspaceHead_t *out) {
+    int32_t total = 0;
+    uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 1, &total);
+    if (!d || total <= 0)
+        return 1;
+    return kvspaceDecodeHead(d, (uint32_t)total, out);
 }
 
 /* 就地写：返回原 box body 偏移指针；前置条件不满足 → 非 0 + err。 */
