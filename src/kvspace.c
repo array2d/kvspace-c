@@ -17,10 +17,12 @@
 #include <time.h>
 #include <unistd.h>
 
-#define KVS_MAGIC "kvspace-c.v1"
+#define KVS_MAGIC "kvspace-c.v2"
 #define ART_PREFIX_MAX 10
 #define ART_NODE_MAX_SZ 2112
-#define ART_SLAB_SZ (256UL * 1024 * 1024)
+#define ART_SLAB_INIT (256UL * 1024 * 1024)
+/* Reserved VA per region: grow in place, base never moves. */
+#define REGION_RESERVE (1ULL << 38)
 #define WATCH_TABLE_SZ 256
 
 enum { ART_N4 = 0,
@@ -62,12 +64,29 @@ static int art_node_sz(int t) {
                           : sizeof(art_n256_t);
 }
 
+/* <path>           [kvspace_hdr_t][blocks_meta_t][ART slab ...]
+ * <path>.sbo.head  [sbo meta ...]
+ * <path>.sbo.data  [sbo data ...] */
 typedef struct {
     char magic[12];
-    uint64_t shm_size, sbo_head_size, sbo_data_offset, sbo_data_size,
-        art_slab_size;
+    uint64_t art_slab_size, sbo_head_size, sbo_data_size;
     int32_t art_root;
 } kvspace_hdr_t;
+
+#define ART_OFF (sizeof(kvspace_hdr_t) + sizeof(blocks_meta_t))
+
+/* blocks_init fixes the block-head width (30-bit ids) from the initial size. */
+_Static_assert(ART_SLAB_INIT / (ART_NODE_MAX_SZ + 2) > 32767ULL / 4,
+               "ART_SLAB_INIT too small: blockmalloc would pick 14-bit ids");
+_Static_assert(REGION_RESERVE / (ART_NODE_MAX_SZ + 4) <= (1ULL << 30),
+               "REGION_RESERVE too large for 30-bit block ids");
+
+typedef struct {
+    int fd;
+    uint8_t *base;
+    size_t mapped;
+    size_t reserve;
+} shm_region_t;
 
 typedef struct {
     char key[256];
@@ -79,9 +98,7 @@ typedef struct {
 } watch_t;
 
 struct kvspace {
-    int fd;
-    size_t shm_sz;
-    uint8_t *shm;
+    shm_region_t r_art, r_head, r_data;
     kvspace_hdr_t *hdr;
     blocks_meta_t *art_meta;
     uint8_t *art_data;
@@ -90,6 +107,62 @@ struct kvspace {
     pthread_mutex_t wlock;
 };
 
+/* ---- shm region ---- */
+static int region_map(shm_region_t *r, size_t size) {
+    if (size > r->reserve)
+        return -1;
+    if (size <= r->mapped)
+        return 0;
+    if (mmap(r->base, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+             r->fd, 0) == MAP_FAILED)
+        return -1;
+    r->mapped = size;
+    return 0;
+}
+
+/* create: size the file; open: check it. Then reserve VA and map. */
+static int region_attach(shm_region_t *r, bool create, size_t size) {
+    struct stat st;
+    if (create ? ftruncate(r->fd, (off_t)size) != 0
+               : fstat(r->fd, &st) != 0 || st.st_size < (off_t)size)
+        return -1;
+    r->reserve = size > REGION_RESERVE ? size : REGION_RESERVE;
+    void *p = mmap(NULL, r->reserve, PROT_NONE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED)
+        return -1;
+    r->base = p;
+    return region_map(r, size);
+}
+
+static void region_close(shm_region_t *r) {
+    if (r->base)
+        munmap(r->base, r->reserve);
+    if (r->fd >= 0)
+        close(r->fd);
+}
+
+/* Pick up growth done by another process (mid-op growth: kvspace#11). */
+static int kv_sync(kvspace_t *kv) {
+    if (region_map(&kv->r_art, ART_OFF + (size_t)kv->hdr->art_slab_size) != 0)
+        return -1;
+    if (region_map(&kv->r_head, (size_t)kv->hdr->sbo_head_size) != 0)
+        return -1;
+    return region_map(&kv->r_data, (size_t)kv->hdr->sbo_data_size);
+}
+
+/* blockmalloc only checks total_size; grow the file before publishing it. */
+static int art_slab_grow(kvspace_t *kv) {
+    size_t want = (size_t)kv->hdr->art_slab_size * 2;
+    if (ART_OFF + want > kv->r_art.reserve ||
+        ftruncate(kv->r_art.fd, (off_t)(ART_OFF + want)) != 0 ||
+        region_map(&kv->r_art, ART_OFF + want) != 0)
+        return -1;
+    kv->hdr->art_slab_size = want;
+    kv->art_meta->total_size = want;
+    return 0;
+}
+
 /* ---- helpers ---- */
 static void *art_blk(kvspace_t *kv, int32_t id) {
     if (id < 0)
@@ -97,6 +170,11 @@ static void *art_blk(kvspace_t *kv, int32_t id) {
     return kv->art_data + blockdata_offset(kv->art_meta, (uint64_t)id);
 }
 static int32_t art_balloc(kvspace_t *kv) {
+    int64_t id = blocks_alloc(kv->art_meta, kv->art_data);
+    if (id >= 0)
+        return (int32_t)id;
+    if (art_slab_grow(kv) != 0)
+        return -1;
     return (int32_t)blocks_alloc(kv->art_meta, kv->art_data);
 }
 static art_hdr_t *art_hdr(kvspace_t *kv, int32_t id) {
@@ -672,86 +750,81 @@ static void art_scan(kvspace_t *kv, int32_t nid, char *buf, int bpos, int bcap,
 }
 
 /* ============ lifecycle ============ */
+/* 8 * 64^k; s wraps to 0. */
+static bool sbo_data_size_ok(size_t n) {
+    for (uint64_t s = 8; s; s *= 64)
+        if (s == n)
+            return true;
+    return false;
+}
+
 kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
-    if (!path || data_size == 0)
+    if (!path)
+        return NULL;
+    char head_path[PATH_MAX], data_path[PATH_MAX];
+    if (snprintf(head_path, sizeof head_path, "%s.sbo.head", path) >=
+            (int)sizeof head_path ||
+        snprintf(data_path, sizeof data_path, "%s.sbo.data", path) >=
+            (int)sizeof data_path)
         return NULL;
 
+    kvspace_t *kv = calloc(1, sizeof(*kv));
+    if (!kv)
+        return NULL;
+    kv->r_art.fd = kv->r_head.fd = kv->r_data.fd = -1;
+
+    /* validate before O_EXCL create: no empty file left behind */
     bool created = false;
-    int fd = open(path, O_RDWR);
-    if (fd < 0) {
-        fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
-        if (fd < 0)
-            return NULL;
+    kv->r_art.fd = open(path, O_RDWR);
+    if (kv->r_art.fd < 0) {
+        if (!sbo_data_size_ok(data_size))
+            goto fail;
+        kv->r_art.fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+        if (kv->r_art.fd < 0)
+            goto fail;
         created = true;
     }
 
-    if (!created) {
-        struct stat st;
-        fstat(fd, &st);
-        if (st.st_size < (off_t)sizeof(kvspace_hdr_t)) {
-            close(fd);
-            return NULL;
-        }
-        kvspace_hdr_t tmp;
-        pread(fd, &tmp, sizeof(tmp), 0);
-        if (memcmp(tmp.magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1) != 0) {
-            close(fd);
-            return NULL;
-        }
-        data_size = (size_t)tmp.sbo_data_size;
+    size_t art_slab, sbo_head;
+    if (created) {
+        art_slab = ART_SLAB_INIT;
+        sbo_head = sbo_meta_size(data_size, 256 * 1024);
     } else {
-        uint64_t slots = data_size / 8;
-        if (slots == 0 || (slots & (slots - 1)) != 0) {
-            close(fd);
-            return NULL;
-        }
+        kvspace_hdr_t tmp;
+        if (pread(kv->r_art.fd, &tmp, sizeof tmp, 0) != (ssize_t)sizeof tmp ||
+            memcmp(tmp.magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1) != 0)
+            goto fail;
+        art_slab = (size_t)tmp.art_slab_size;
+        sbo_head = (size_t)tmp.sbo_head_size;
+        data_size = (size_t)tmp.sbo_data_size;
     }
 
-    size_t sbo_head = sbo_meta_size(data_size, 256 * 1024);
-    size_t shm_total = sizeof(kvspace_hdr_t) + sizeof(blocks_meta_t) +
-                       ART_SLAB_SZ + sbo_head + data_size;
-    if (created && ftruncate(fd, (off_t)shm_total) != 0) {
-        close(fd);
-        return NULL;
-    }
-    uint8_t *shm =
-        mmap(NULL, shm_total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (shm == MAP_FAILED) {
-        close(fd);
-        return NULL;
-    }
+    /* O_TRUNC: sbo_init rejects a stale magic */
+    int fl = created ? O_RDWR | O_CREAT | O_TRUNC : O_RDWR;
+    if (region_attach(&kv->r_art, created, ART_OFF + art_slab) != 0 ||
+        (kv->r_head.fd = open(head_path, fl, 0644)) < 0 ||
+        region_attach(&kv->r_head, created, sbo_head) != 0 ||
+        (kv->r_data.fd = open(data_path, fl, 0644)) < 0 ||
+        region_attach(&kv->r_data, created, data_size) != 0)
+        goto fail;
 
-    kvspace_t *kv = calloc(1, sizeof(*kv));
-    if (!kv) {
-        munmap(shm, shm_total);
-        close(fd);
-        return NULL;
-    }
-    kv->fd = fd;
-    kv->shm_sz = shm_total;
-    kv->shm = shm;
-    kv->hdr = (kvspace_hdr_t *)shm;
-    kv->art_meta = (blocks_meta_t *)(shm + sizeof(kvspace_hdr_t));
-    kv->art_data = shm + sizeof(kvspace_hdr_t) + sizeof(blocks_meta_t);
-    kv->sbo_meta = kv->art_data + ART_SLAB_SZ;
-    kv->sbo_data = kv->sbo_meta + sbo_head;
+    kv->hdr = (kvspace_hdr_t *)kv->r_art.base;
+    kv->art_meta = (blocks_meta_t *)(kv->r_art.base + sizeof(kvspace_hdr_t));
+    kv->art_data = kv->r_art.base + ART_OFF;
+    kv->sbo_meta = kv->r_head.base;
+    kv->sbo_data = kv->r_data.base;
 
     if (created) {
         memset(kv->hdr, 0, sizeof(*kv->hdr));
-        memcpy(kv->hdr->magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1);
-        kv->hdr->shm_size = shm_total;
+        kv->hdr->art_slab_size = art_slab;
         kv->hdr->sbo_head_size = sbo_head;
-        kv->hdr->sbo_data_offset = (uint64_t)(kv->sbo_data - shm);
         kv->hdr->sbo_data_size = data_size;
-        kv->hdr->art_slab_size = ART_SLAB_SZ;
         kv->hdr->art_root = -1;
-        blocks_init(kv->art_meta, ART_SLAB_SZ, ART_NODE_MAX_SZ);
-        sbo_init(kv->sbo_meta, sbo_head, (size_t)kv->hdr->sbo_data_size);
-    } else {
-        if (memcmp(kv->hdr->magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1) != 0) {
-            kvspaceShmClose(kv);
-            return NULL;
-        }
+        if (blocks_init(kv->art_meta, art_slab, ART_NODE_MAX_SZ) != 0 ||
+            sbo_init(kv->sbo_meta, sbo_head, data_size) != 0)
+            goto fail;
+        /* magic last: half-initialized file fails reopen */
+        memcpy(kv->hdr->magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1);
     }
 
     pthread_mutex_init(&kv->wlock, NULL);
@@ -760,6 +833,18 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
         pthread_mutex_init(&kv->watches[i].mtx, NULL);
     }
     return kv;
+
+fail:
+    region_close(&kv->r_art);
+    region_close(&kv->r_head);
+    region_close(&kv->r_data);
+    free(kv);
+    if (created) {
+        unlink(path);
+        unlink(head_path);
+        unlink(data_path);
+    }
+    return NULL;
 }
 void kvspaceShmClose(kvspace_t *kv) {
     if (!kv)
@@ -770,10 +855,9 @@ void kvspaceShmClose(kvspace_t *kv) {
         free(kv->watches[i].val);
     }
     pthread_mutex_destroy(&kv->wlock);
-    if (kv->shm)
-        munmap(kv->shm, kv->shm_sz);
-    if (kv->fd >= 0)
-        close(kv->fd);
+    region_close(&kv->r_art);
+    region_close(&kv->r_head);
+    region_close(&kv->r_data);
     free(kv);
 }
 
@@ -963,6 +1047,8 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
     if (!kv || !key || !ol)
         return NULL;
     *ol = 0;
+    if (kv_sync(kv) != 0)
+        return NULL;
     char kbuf[1024];
     if (resolve)
         resolve_path(kv, key, kbuf, sizeof(kbuf));
@@ -1384,6 +1470,8 @@ int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
         return -1;
     if (!val && val_len > 0)
         return -1;
+    if (kv_sync(kv) != 0)
+        return -1;
     if (val_len <= 0) {
         /* None → 写 1 字节空 kind TLV（sbo 不支持 0 字节），读时 read_tlv 判 None
          * 返 len 0。 */
@@ -1457,6 +1545,8 @@ int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
                            int32_t body_len, uint8_t **body) {
     if (!kv || !key || !body || body_len < 0)
         return -1;
+    if (kv_sync(kv) != 0)
+        return -1;
     char kbuf[1024];
     if (resolve)
         resolve_path(kv, key, kbuf, sizeof(kbuf));
@@ -1484,6 +1574,8 @@ int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
                             const char *langtype, int32_t body_len,
                             uint8_t **body) {
     if (!kv || !key || !langtype || !body || body_len < 0)
+        return -1;
+    if (kv_sync(kv) != 0)
         return -1;
     char kbuf[1024];
     resolve_path(kv, key, kbuf, sizeof(kbuf));
@@ -1564,6 +1656,8 @@ int kvspaceShmListLen(kvspace_t *kv, const char *prefix, bool ex, int resolve,
 int kvspaceShmDel(kvspace_t *kv, const char *key) {
     if (!kv || !key)
         return -1;
+    if (kv_sync(kv) != 0)
+        return -1;
     char kbuf[1024];
     resolve_path(kv, key, kbuf, sizeof(kbuf)); // POSIX rm: resolve all
     /* memindex 成员删除 → 同步从 p· 的 index 移除。 */
@@ -1582,6 +1676,8 @@ int kvspaceShmDel(kvspace_t *kv, const char *key) {
 
 int kvspaceShmDeltree(kvspace_t *kv, const char *prefix) {
     if (!kv || !prefix)
+        return -1;
+    if (kv_sync(kv) != 0)
         return -1;
     // if prefix itself is a link, only delete the link
     art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)prefix,
@@ -1819,7 +1915,7 @@ int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
         return -1;
     *on = NULL;
     *oc = 0;
-    if (bad_dir_prefix(prefix))
+    if (kv_sync(kv) != 0 || bad_dir_prefix(prefix))
         return -1;
     const char *pfx = prefix;
     char tbuf[1024];
