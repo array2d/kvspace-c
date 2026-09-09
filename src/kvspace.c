@@ -1480,6 +1480,32 @@ int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
     if (strstr(kbuf, "//"))
         return -1;
 
+    /* extindex 写保护：父是只读扩展层、本地无同名节点但扩展层有 → 禁止写（对齐
+     * durable backend.rs / fs）。以「父是否 extindex」为唯一首闸——非 extindex（如
+     * 全部 /lib 直写）父读一次即放行，不触碰整键查找，热路径开销与 redis 对齐。 */
+    {
+        char *pp = NULL, *nn = NULL;
+        psplit(kbuf, &pp, &nn);
+        char extpath[1024];
+        if (pp && nn && dir_ext_path(kv, pp, extpath, sizeof extpath)) {
+            art_hdr_t *lh = art_search(kv, kv->hdr->art_root,
+                                       (const uint8_t *)kbuf, (int)strlen(kbuf));
+            if (!lh || !lh->has_value) {
+                char *tgt = pjoin(extpath, nn);
+                art_hdr_t *eh = art_search(kv, kv->hdr->art_root,
+                                           (const uint8_t *)tgt, (int)strlen(tgt));
+                free(tgt);
+                if (eh && eh->has_value) {
+                    free(pp);
+                    free(nn);
+                    return -1;
+                }
+            }
+        }
+        free(pp);
+        free(nn);
+    }
+
     xvalue_head_t hh = kvspaceXvalueDecodeHead(val, val_len);
 
     /* 目录 kind（index/extindex）必须落在目录键（尾 / 或 ·）。 */
