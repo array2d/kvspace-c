@@ -1524,7 +1524,7 @@ static int remove_child_index(kvspace_t *kv, const char *mem,
 }
 
 /* 写成员时沿父链逐层兜底容器值（leaf base + 中间层
- * object/stringkeymap）并注册成员（对齐 durable）。 parent 是尾 ·
+ * stringkeymap）并注册成员（对齐 durable）。 parent 是尾 ·
  * 的成员父目录，name 是该成员名；逐层向上建容器值并注册成员到各自 memindex。 */
 static void ensure_member_chain(kvspace_t *kv, char *parent, char *name) {
     char *dir = strdup(parent);
@@ -1544,9 +1544,10 @@ static void ensure_member_chain(kvspace_t *kv, char *parent, char *name) {
                 shm_set_raw(kv, base, mv, mvl);
                 free(mv);
             } else {
+                int32_t odims[1] = { 0 };
                 uint8_t *ov;
                 int32_t ovl =
-                    kvspaceXvalueEncode(KVSPACE_KIND_OBJ, NULL, 0, NULL, 0, &ov);
+                    kvspaceXvalueEncode(KVSPACE_KIND_MAP, NULL, 0, odims, 1, &ov);
                 shm_set_raw(kv, base, ov, ovl);
                 free(ov);
             }
@@ -1724,11 +1725,11 @@ int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
             return -1;
     }
 
-    /* 容器值（object/stringkeymap）：值写 p（无后缀、body 空、dims/ro/vid
+    /* 容器值（stringkeymap）：值写 p（无后缀、body 空、dims/ro/vid
      * 保留）， memindex p· 写空 index（成员由后续 add_child 维护）；对齐 durable
      * set() 的 Obj/Map 分支。 */
     if (hh.ref == 0 &&
-        (is_kind(&hh, KVSPACE_KIND_OBJ) || is_kind(&hh, KVSPACE_KIND_MAP))) {
+        is_kind(&hh, KVSPACE_KIND_MAP)) {
         char *base = strip_dir_suf_alloc(kbuf);
         if (!base || !base[0]) {
             free(base);
@@ -1830,10 +1831,10 @@ int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
         !is_dir)
         return -1;
 
-    /* 容器值（object/stringkeymap，body 恒空）：base 空 box + 空 memindex +
+    /* 容器值（stringkeymap，body 恒空）：base 空 box + 空 memindex +
      * 注册父。 */
     if (hh.ref == 0 &&
-        (is_kind(&hh, KVSPACE_KIND_OBJ) || is_kind(&hh, KVSPACE_KIND_MAP))) {
+        is_kind(&hh, KVSPACE_KIND_MAP)) {
         if (body_len != 0)
             return -1;
         char *base = strip_dir_suf_alloc(kbuf);
@@ -1935,7 +1936,7 @@ int kvspaceShmDeltree(kvspace_t *kv, const char *prefix) {
 
     /* 成员目录 marker（prefix·，U+00B7）：成员 key =
        prefix·<name>，直接拼接后递归删除。 slash 版 e=prefix/ 覆盖不到 ·
-       成员（json 的 object/stringkeymap 落盘形态）。 */
+       成员（json 的 stringkeymap 落盘形态）。 */
     size_t pl = strlen(prefix);
     char *m = malloc(pl + 3);
     memcpy(m, prefix, pl);
