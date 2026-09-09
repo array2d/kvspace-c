@@ -1097,27 +1097,44 @@ static int is_kind(const xvalue_head_t *h, const char *k) {
     return h->kind_len == kl && memcmp(h->kind, k, (size_t)kl) == 0;
 }
 
+/* Reuse old box if it fits; else alloc first. *drop is the old offset to free
+ * after publish, or -1. Alloc failure leaves the old box untouched. */
+static uint64_t shm_place(kvspace_t *kv, art_hdr_t *old, size_t n,
+                          uint64_t *drop) {
+    *drop = (uint64_t)-1;
+    if (old && old->has_value) {
+        uint64_t cap = sbo_allocated_size(kv->sbo_meta, old->box_offset);
+        if ((uint64_t)n <= cap)
+            return old->box_offset;
+    }
+    uint64_t off = sbo_alloc(kv->sbo_meta, n);
+    if (off == (uint64_t)-1)
+        return off;
+    if (old && old->has_value)
+        *drop = old->box_offset;
+    return off;
+}
+
+static void shm_bind(kvspace_t *kv, const char *key, art_hdr_t *old,
+                     uint64_t off, uint64_t drop) {
+    if (!old || !old->has_value || off != old->box_offset)
+        kv->hdr->art_root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)key,
+                                    (int)strlen(key), 0, off);
+    if (drop != (uint64_t)-1)
+        sbo_free(kv->sbo_meta, drop);
+}
+
 /* 原始落盘（不处理容器/member 语义，供内部调用，避免递归）。 */
 static int shm_set_raw(kvspace_t *kv, const char *key, const uint8_t *val,
                        int32_t val_len) {
     art_hdr_t *old =
         art_search(kv, kv->hdr->art_root, (const uint8_t *)key, (int)strlen(key));
-    if (old && old->has_value) {
-        /* 同尺寸原地覆写：新值 ≤ 旧 box 容量时直接 memcpy，跳过 free+alloc，
-           不改共享 buddy 树。容量读自共享 mmap，零进程内状态。 */
-        uint64_t cap = sbo_allocated_size(kv->sbo_meta, old->box_offset);
-        if ((uint64_t)val_len <= cap) {
-            memcpy(kv->sbo_data + old->box_offset, val, (size_t)val_len);
-            return 0;
-        }
-        sbo_free(kv->sbo_meta, old->box_offset);
-    }
-    uint64_t off = sbo_alloc(kv->sbo_meta, (size_t)val_len);
+    uint64_t drop;
+    uint64_t off = shm_place(kv, old, (size_t)val_len, &drop);
     if (off == (uint64_t)-1)
         return -1;
-    memcpy(kv->sbo_data + off, val, val_len);
-    kv->hdr->art_root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)key,
-                                (int)strlen(key), 0, off);
+    memcpy(kv->sbo_data + off, val, (size_t)val_len);
+    shm_bind(kv, key, old, off, drop);
     return 0;
 }
 
@@ -1435,9 +1452,7 @@ static int32_t parse_langtype_dims(const char *lt, int32_t *dims) {
     return nd;
 }
 
-/* 分配 box、就地写三轴 head（ref/storetype/langtype, body_len），art_ins
-   挂树，返回 body 偏移指针。 已存在 key 先释放旧 box（新位置写=换
-   box）。零拷贝写路径唯一分配点。 */
+/* Place box, write head, bind ART, return body. */
 static int shm_alloc_head(kvspace_t *kv, const char *key, uint8_t ref,
                           uint8_t storetype, uint8_t ro, uint32_t vid,
                           const char *langtype, int32_t headlen,
@@ -1445,17 +1460,15 @@ static int shm_alloc_head(kvspace_t *kv, const char *key, uint8_t ref,
     int32_t total = headlen + body_len;
     art_hdr_t *old =
         art_search(kv, kv->hdr->art_root, (const uint8_t *)key, (int)strlen(key));
-    if (old && old->has_value)
-        sbo_free(kv->sbo_meta, old->box_offset);
-    uint64_t off = sbo_alloc(kv->sbo_meta, (size_t)total);
+    uint64_t drop;
+    uint64_t off = shm_place(kv, old, (size_t)total, &drop);
     if (off == (uint64_t)-1)
         return -1;
     int32_t dims[X_MAX_NDIM];
     int32_t ndim = parse_langtype_dims(langtype, dims);
     kvspaceXvalueWriteHead(kv->sbo_data + off, ref, storetype, ro, vid, langtype,
                            dims, ndim, body_len);
-    kv->hdr->art_root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)key,
-                                (int)strlen(key), 0, off);
+    shm_bind(kv, key, old, off, drop);
     *body = kv->sbo_data + off + headlen;
     return 0;
 }
