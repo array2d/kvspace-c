@@ -36,6 +36,11 @@ if(KVSPACE_BUILD_TESTS)
     target_link_libraries(test_shm_split PRIVATE kvspace-c)
     add_test(NAME shm_split COMMAND test_shm_split)
 
+    add_executable(test_shm_resize tests/test_shm_resize.c)
+    target_include_directories(test_shm_resize PRIVATE src)
+    target_link_libraries(test_shm_resize PRIVATE kvspace-c)
+    add_test(NAME shm_resize COMMAND test_shm_resize)
+
     add_executable(test_art_scan tests/test_art_scan.c)
     target_include_directories(test_art_scan PRIVATE src)
     target_link_libraries(test_art_scan PRIVATE kvspace-c)

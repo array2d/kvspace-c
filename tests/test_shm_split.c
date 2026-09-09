@@ -2,11 +2,11 @@
 
 #define _GNU_SOURCE
 #include "kvspace_shm.h"
+#include "test_util.h"
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -15,28 +15,6 @@
 /* 600B keys take ~60 ART blocks each: 3000 * 125KB > 256MB, one doubling */
 #define GROW_KEYS 3000
 #define GROW_KEY_LEN 600
-
-static int failures = 0;
-#define CHECK(cond, ...)                                                       \
-  do {                                                                         \
-    if (!(cond)) {                                                             \
-      failures++;                                                              \
-      fprintf(stderr, "  FAIL %s:%d: ", __FILE__, __LINE__);                   \
-      fprintf(stderr, __VA_ARGS__);                                            \
-      fprintf(stderr, "\n");                                                   \
-    }                                                                          \
-  } while (0)
-#define REQUIRE(cond, ...)                                                     \
-  do {                                                                         \
-    CHECK(cond, __VA_ARGS__);                                                  \
-    if (!(cond))                                                               \
-      return;                                                                  \
-  } while (0)
-
-static off_t fsize(const char *p) {
-  struct stat st;
-  return stat(p, &st) == 0 ? st.st_size : -1;
-}
 
 /* unique prefix + random tail, no shared prefix between keys */
 static void key_of(char *buf, size_t n, int i) {

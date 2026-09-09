@@ -19,7 +19,8 @@ typedef struct kvspace kvspace_t;
  * 生命周期
  * ================================================================ */
 
-// Files: <path> (ART, grows), <path>.sbo.head, <path>.sbo.data. data_size = 8*64^k, create only.
+// Files: <path>, <path>.sbo.head, <path>.sbo.data; all grow on demand.
+// data_size = 8*64^k, create only, initial (not maximum) data size.
 kvspace_t *kvspaceShmOpen(const char *path, size_t data_size);
 void kvspaceShmClose(kvspace_t *kv);
 
