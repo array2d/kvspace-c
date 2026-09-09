@@ -681,6 +681,42 @@ static char *edir(const char *p) {
     r[l + 1] = '\0';
     return r;
 }
+/* Covering node for pfx: *bpos is reconstructed length at arrival. */
+static int32_t art_cover(kvspace_t *kv, int32_t nid, const uint8_t *pfx,
+                         int plen, char *buf, int bcap, int *bpos) {
+    int d = 0;
+    if (nid < 0 || !pfx || plen < 0 || !buf || !bpos)
+        return -1;
+    while (nid >= 0) {
+        art_hdr_t *h = art_hdr(kv, nid);
+        if (!h)
+            return -1;
+        int pd = d, cover = 0;
+        if (h->prefix_len) {
+            int s = pfx_shared(h->prefix, h->prefix_len, pfx + d, plen - d);
+            if (s < h->prefix_len) {
+                if (d + s < plen)
+                    return -1;
+                cover = 1;
+            } else
+                d += h->prefix_len;
+        }
+        if (cover || d == plen) {
+            if (pd >= bcap)
+                return -1;
+            if (pd)
+                memcpy(buf, pfx, (size_t)pd);
+            *bpos = pd;
+            return nid;
+        }
+        nid = art_child(kv, h, pfx[d]);
+        if (nid < 0)
+            return -1;
+        d++;
+    }
+    return -1;
+}
+
 /* ---- prefix scan: collect all keys under prefix into out[0..*n-1] ---- */
 static void art_scan(kvspace_t *kv, int32_t nid, char *buf, int bpos, int bcap,
                      const char *pfx, int plen, char ***out, int32_t *n) {
@@ -747,6 +783,16 @@ static void art_scan(kvspace_t *kv, int32_t nid, char *buf, int bpos, int bcap,
         break;
     }
     }
+}
+
+static void art_scan_pfx(kvspace_t *kv, const char *pfx, int plen, char *buf,
+                         int bcap, char ***out, int32_t *n) {
+    int bpos = 0;
+    int32_t nid = art_cover(kv, kv->hdr->art_root, (const uint8_t *)pfx, plen,
+                            buf, bcap, &bpos);
+    if (nid < 0)
+        return;
+    art_scan(kv, nid, buf, bpos, bcap, pfx, plen, out, n);
 }
 
 /* ============ lifecycle ============ */
@@ -1958,8 +2004,7 @@ int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
     memset(buf, 0, sizeof(buf));
     if (kv->hdr->art_root < 0)
         return 0;
-    art_scan(kv, kv->hdr->art_root, buf, 0, (int)sizeof(buf), pfx, plen, &out,
-             &n);
+    art_scan_pfx(kv, pfx, plen, buf, (int)sizeof(buf), &out, &n);
     // filter: only direct children (one level below prefix)
     char **filt = malloc(sizeof(char *) * n);
     int32_t fn = 0;
@@ -1999,8 +2044,7 @@ int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
             char ebuf[2048];
             memset(ebuf, 0, sizeof ebuf);
             int el = (int)strlen(extpath);
-            art_scan(kv, kv->hdr->art_root, ebuf, 0, (int)sizeof ebuf, extpath, el,
-                     &eo, &en);
+            art_scan_pfx(kv, extpath, el, ebuf, (int)sizeof ebuf, &eo, &en);
             filt = realloc(filt, sizeof(char *) * (size_t)(fn + en));
             for (int i = 0; i < en; i++) {
                 const char *k = eo[i];
