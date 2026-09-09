@@ -41,7 +41,7 @@
 #define KVSPACE_KIND_EXT_INDEX  "extindex"
 #define KVSPACE_KIND_RWIR       "rwir"
 #define KVSPACE_KIND_RWFUNC     "rwfunc"
-#define KVSPACE_KIND_DEF_RWIR   "defrwir"
+#define KVSPACE_KIND_DEF_RWIR   "def rwir"
 #define KVSPACE_KIND_SCOPE      "scope"
 #define KVSPACE_KIND_TIME       "time"
 #define KVSPACE_KIND_DURATION   "duration"
