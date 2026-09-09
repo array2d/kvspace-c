@@ -24,8 +24,13 @@ target_link_libraries(kvspace-c
     PUBLIC blockmalloc slotsboxmalloc
 )
 
+# 后端库固定装到 dispatch 前端 dlopen 的目录 <prefix>/lib/kvspace。
+# 默认 prefix=/usr（对齐 ci/deps.sh 的 /usr/lib/kvspace），而非 /usr/local。
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    set(CMAKE_INSTALL_PREFIX "/usr" CACHE PATH "" FORCE)
+endif()
 install(TARGETS kvspace-c
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/kvspace
 )
 
 option(KVSPACE_BUILD_TESTS "Build tests (ctest)" OFF)
