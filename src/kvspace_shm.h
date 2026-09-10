@@ -15,6 +15,11 @@
 
 typedef struct kvspace kvspace_t;
 
+typedef struct {
+    uint32_t block_id;
+    uint32_t gen;
+} kvspaceRef_t;
+
 /* ================================================================
  * 生命周期
  * ================================================================ */
@@ -31,6 +36,13 @@ void kvspaceShmClose(kvspace_t *kv);
 // Get: resolve=1 穿透 link，resolve=0 返回 link 本身。
 uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
                        int32_t *out_len);
+
+int kvspaceShmResolveRef(kvspace_t *kv, const char *key, kvspaceRef_t *ref);
+uint8_t *kvspaceShmGetByRef(kvspace_t *kv, kvspaceRef_t *ref,
+                            const char *key_fallback, int32_t *out_len);
+int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
+                           const char *key_fallback, uint32_t offset,
+                           const uint8_t *buf, uint32_t buf_len);
 
 // Set: 写入 value（TLV 编码的字节）。总是穿透 link 写入 target。
 int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
