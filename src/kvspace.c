@@ -1808,7 +1808,8 @@ int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
     if (kv_sync(kv) != 0)
         return -1;
     char kbuf[1024];
-    resolve_path(kv, key, kbuf, sizeof(kbuf));
+    strncpy(kbuf, key, sizeof(kbuf) - 1);
+    kbuf[sizeof(kbuf) - 1] = '\0'; /* 写键本身，不穿透 link——显式解引用由 runtime 掌控 */
     if (strstr(kbuf, "//"))
         return -1;
 
@@ -1889,7 +1890,8 @@ int kvspaceShmDel(kvspace_t *kv, const char *key) {
     if (kv_sync(kv) != 0)
         return -1;
     char kbuf[1024];
-    resolve_path(kv, key, kbuf, sizeof(kbuf)); // POSIX rm: resolve all
+    strncpy(kbuf, key, sizeof(kbuf) - 1);
+    kbuf[sizeof(kbuf) - 1] = '\0'; /* 删键本身，不穿透 link——显式解引用由 runtime 掌控 */
     /* memindex 成员删除 → 同步从 p· 的 index 移除。 */
     char *parent = NULL, *name = NULL;
     bool is_member = false;
