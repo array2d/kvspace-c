@@ -237,12 +237,6 @@ int kvspaceClear(void *h, char *err, uint32_t err_cap) {
     return kvspaceShmDeltree((kvspace_t *)h, "/");
 }
 
-int kvspaceDisconnect(void *h, char *err, uint32_t err_cap) {
-    (void)err;
-    (void)err_cap;
-    return 0;
-}
-
 int kvspaceTlvEncode(const char *kind, const uint8_t *raw, uint32_t raw_len,
                      const int32_t *dims, int32_t ndim, uint8_t **out,
                      uint32_t *out_len) {
