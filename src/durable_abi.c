@@ -68,6 +68,36 @@ int kvspaceGet(void *h, const char *key, int resolve, uint8_t **out,
     return 0;
 }
 
+int kvspaceResolveRef(void *h, const char *key, kvspaceRef_t *ref) {
+    return kvspaceShmResolveRef((kvspace_t *)h, key, ref);
+}
+
+int kvspaceGetByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
+                    uint8_t **out, uint32_t *out_len) {
+    int32_t len = 0;
+    uint8_t *d = kvspaceShmGetByRef((kvspace_t *)h, ref, key_fallback, &len);
+    if (!d || len <= 0) {
+        *out = NULL;
+        *out_len = 0;
+        return 0;
+    }
+    *out = d;
+    *out_len = (uint32_t)len;
+    return 0;
+}
+
+int kvspaceSetPartByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
+                        uint32_t offset, const uint8_t *buf, uint32_t buf_len,
+                        char *err, uint32_t err_cap) {
+    if (kvspaceShmSetPartByRef((kvspace_t *)h, ref, key_fallback, offset, buf,
+                               buf_len) != 0) {
+        if (err && err_cap)
+            snprintf(err, err_cap, "kvspace: set-part-by-ref failed");
+        return 1;
+    }
+    return 0;
+}
+
 /* 指令边界回收读借用池：SHM 常驻映射，借用恒有效，no-op。 */
 void kvspaceReadReset(void *h) { (void)h; }
 

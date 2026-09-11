@@ -35,7 +35,8 @@
 enum { ART_N4 = 0,
        ART_N16 = 1,
        ART_N48 = 2,
-       ART_N256 = 3 };
+       ART_N256 = 3,
+       ART_MOVED = 255 };
 
 typedef struct {
     uint8_t type, prefix[ART_PREFIX_MAX], prefix_len;
@@ -383,33 +384,49 @@ static int32_t art_child(kvspace_t *kv, void *n, uint8_t b) {
 }
 
 /* ---- art_search ---- */
-static art_hdr_t *art_search(kvspace_t *kv, int32_t nid, const uint8_t *key,
-                             int klen) {
+static int32_t art_find(kvspace_t *kv, int32_t nid, const uint8_t *key,
+                        int klen) {
     if (nid < 0 || !key)
-        return NULL;
+        return -1;
     int d = 0;
     while (nid >= 0) {
         art_hdr_t *h = art_hdr(kv, nid);
-        if (!h)
-            return NULL;
+        if (!h || h->type == ART_MOVED)
+            return -1;
         if (h->prefix_len) {
             int s = pfx_shared(h->prefix, h->prefix_len, key + d, klen - d);
             if (s != h->prefix_len) {
                 if (d + s < klen)
-                    return NULL;
+                    return -1;
                 if (s < h->prefix_len)
-                    return NULL;
+                    return -1;
             }
             d += h->prefix_len;
             if (d > klen)
-                return NULL;
+                return -1;
         }
         if (d == klen)
-            return h->has_value ? h : NULL;
+            return h->has_value ? nid : -1;
         nid = art_child(kv, h, key[d]);
         d++;
     }
-    return NULL;
+    return -1;
+}
+static art_hdr_t *art_search(kvspace_t *kv, int32_t nid, const uint8_t *key,
+                             int klen) {
+    int32_t id = art_find(kv, nid, key, klen);
+    return id < 0 ? NULL : art_hdr(kv, id);
+}
+static int32_t art_follow(kvspace_t *kv, int32_t id) {
+    for (int i = 0; i < 8 && id >= 0; i++) {
+        art_hdr_t *h = art_hdr(kv, id);
+        if (!h)
+            return -1;
+        if (h->type != ART_MOVED)
+            return id;
+        id = (int32_t)h->box_offset;
+    }
+    return -1;
 }
 
 /* ---- node create ---- */
@@ -523,6 +540,9 @@ static int32_t art_grow(kvspace_t *kv, void *on) {
                     x->children[j] = tc;
                 }
     }
+    oh->type = ART_MOVED;
+    oh->has_value = 0;
+    oh->box_offset = (uint64_t)(uint32_t)nid;
     return nid;
 }
 
@@ -1290,6 +1310,81 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
         return NULL;
     *ol = rl;
     return raw;
+}
+
+static int32_t ref_live(kvspace_t *kv, kvspaceRef_t *ref) {
+    int32_t id = art_follow(kv, (int32_t)ref->block_id);
+    if (id >= 0)
+        ref->block_id = (uint32_t)id;
+    return id;
+}
+
+int kvspaceShmResolveRef(kvspace_t *kv, const char *key, kvspaceRef_t *ref) {
+    if (!kv || !key || !ref)
+        return -1;
+    if (kv_sync(kv) != 0)
+        return -1;
+    int32_t id =
+        art_find(kv, kv->hdr->art_root, (const uint8_t *)key, (int)strlen(key));
+    if (id < 0)
+        return -1;
+    ref->block_id = (uint32_t)id;
+    ref->gen = 0;
+    return 0;
+}
+
+uint8_t *kvspaceShmGetByRef(kvspace_t *kv, kvspaceRef_t *ref,
+                            const char *key_fallback, int32_t *ol) {
+    if (!kv || !ref || !ol)
+        return NULL;
+    *ol = 0;
+    if (kv_sync(kv) != 0)
+        return NULL;
+    int32_t id = ref_live(kv, ref);
+    art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
+    if (h && h->has_value) {
+        uint8_t *raw;
+        int32_t rl;
+        if (read_tlv(kv, h->box_offset, &raw, &rl) == 0) {
+            *ol = rl;
+            return raw;
+        }
+    }
+    if (!key_fallback)
+        return NULL;
+    uint8_t *raw = kvspaceShmGet(kv, key_fallback, 0, ol);
+    if (raw)
+        kvspaceShmResolveRef(kv, key_fallback, ref);
+    return raw;
+}
+
+int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
+                           const char *key_fallback, uint32_t offset,
+                           const uint8_t *buf, uint32_t buf_len) {
+    if (!kv || !ref || !buf)
+        return -1;
+    if (kv_sync(kv) != 0)
+        return -1;
+    int32_t id = ref_live(kv, ref);
+    art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
+    if (!h || !h->has_value) {
+        if (!key_fallback)
+            return -1;
+        int32_t rl = 0;
+        uint8_t *d = kvspaceShmGet(kv, key_fallback, 0, &rl);
+        if (!d || offset + buf_len > (uint32_t)rl)
+            return -1;
+        memcpy(d + offset, buf, buf_len);
+        kvspaceShmResolveRef(kv, key_fallback, ref);
+        return 0;
+    }
+    uint8_t *raw;
+    int32_t rl;
+    if (read_tlv(kv, h->box_offset, &raw, &rl) < 0 ||
+        offset + buf_len > (uint32_t)rl)
+        return -1;
+    memcpy(raw + offset, buf, buf_len);
+    return 0;
 }
 
 /* ── 值/索引分离（方案2，对齐 kvspace-durable backend.rs） ────────── */
