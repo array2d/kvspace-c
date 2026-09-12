@@ -306,6 +306,8 @@ static uint64_t kv_sbo_alloc(kvspace_t *kv, size_t n) {
 
 /* Punch before free: once freed, another process may reuse the range. */
 static void kv_sbo_free(kvspace_t *kv, uint64_t off) {
+#if defined(__linux__)
+    /* Linux 用 fallocate PUNCH_HOLE 归还磁盘块；macOS 无该 API（仅空间回收优化），跳过。 */
     uint64_t sz = sbo_allocated_size(kv->sbo_meta, off);
     if (sz >= SBO_PUNCH_MIN) {
         uint64_t pg = (uint64_t)sysconf(_SC_PAGESIZE);
@@ -315,6 +317,7 @@ static void kv_sbo_free(kvspace_t *kv, uint64_t off) {
                             FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
                             (off_t)a, (off_t)(b - a));
     }
+#endif
     sbo_free(kv->sbo_meta, off);
 }
 
