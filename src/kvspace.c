@@ -462,14 +462,15 @@ static int32_t art_find_dir(kvspace_t *kv, int32_t nid, const uint8_t *key,
                             int klen, int last_sep, int seplen, int32_t *dirn,
                             int *dird) {
     int d = 0;
-    int32_t dir = -1;
-    int dd = 0;
+    int32_t dir = -1, prev = -1;
+    int dd = 0, prev_d = 0;
     if (nid < 0 || !key)
         return -1;
     while (nid >= 0) {
         art_hdr_t *h = art_hdr(kv, nid);
         if (!h || h->type == ART_MOVED)
             return -1;
+        int entry_d = d;
         if (h->prefix_len) {
             int s = pfx_shared(h->prefix, h->prefix_len, key + d, klen - d);
             if (s != h->prefix_len)
@@ -478,12 +479,16 @@ static int32_t art_find_dir(kvspace_t *kv, int32_t nid, const uint8_t *key,
             if (d > klen)
                 return -1;
         }
-        /* Exact depth of first byte after the separator — not a node
-         * whose prefix already ate unique last-component bytes. */
-        if (dir < 0 && last_sep > 0 && seplen > 0 &&
-            d == last_sep + seplen) {
-            dir = nid;
-            dd = d;
+        if (dir < 0 && last_sep > 0 && seplen > 0) {
+            int want = last_sep + seplen;
+            if (d == want) {
+                dir = nid;
+                dd = d;
+            } else if (entry_d < want && want < d && prev >= 0) {
+                /* Prefix ate past the last component: stay on the parent. */
+                dir = prev;
+                dd = prev_d;
+            }
         }
         if (d == klen) {
             if (dirn)
@@ -492,6 +497,8 @@ static int32_t art_find_dir(kvspace_t *kv, int32_t nid, const uint8_t *key,
                 *dird = dd;
             return h->has_value ? nid : -1;
         }
+        prev = nid;
+        prev_d = d;
         nid = art_child(kv, h, key[d]);
         d++;
     }
