@@ -14,7 +14,8 @@ jobs:
           sudo cmake --install /tmp/blockmalloc/build
       - name: 构建依赖 slotsboxmalloc（同上，从源码装）
         run: |
-          git clone --depth 1 --branch v0.1.5 https://github.com/array2d/slotsboxmalloc.git /tmp/slotsboxmalloc
+          # 跟 main：v0.1.5 尚不含 macOS 的 _POSIX_C_SOURCE 修复（待其发新 tag 后改回固定版本）
+          git clone --depth 1 https://github.com/array2d/slotsboxmalloc.git /tmp/slotsboxmalloc
           cmake -S /tmp/slotsboxmalloc -B /tmp/slotsboxmalloc/build \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
           cmake --build /tmp/slotsboxmalloc/build -j
