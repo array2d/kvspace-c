@@ -470,7 +470,6 @@ static int32_t art_find_dir(kvspace_t *kv, int32_t nid, const uint8_t *key,
         art_hdr_t *h = art_hdr(kv, nid);
         if (!h || h->type == ART_MOVED)
             return -1;
-        int entry_d = d;
         if (h->prefix_len) {
             int s = pfx_shared(h->prefix, h->prefix_len, key + d, klen - d);
             if (s != h->prefix_len)
@@ -479,9 +478,10 @@ static int32_t art_find_dir(kvspace_t *kv, int32_t nid, const uint8_t *key,
             if (d > klen)
                 return -1;
         }
+        /* Exact depth of first byte after the separator — not a node
+         * whose prefix already ate unique last-component bytes. */
         if (dir < 0 && last_sep > 0 && seplen > 0 &&
-            ((entry_d <= last_sep && last_sep < d) ||
-             d == last_sep + seplen)) {
+            d == last_sep + seplen) {
             dir = nid;
             dd = d;
         }
