@@ -137,6 +137,58 @@ int main(void) {
       CHECK(get_i64(d, l) == 3);
       CHECK(get_i64(d, l) != 1);
     }
+    CHECK(set_i64(kv, "/map/[1]", 11) == 0);
+    CHECK(set_i64(kv, "/map/[2]", 22) == 0);
+    CHECK(set_i64(kv, "/map/[3]", 33) == 0);
+    {
+      kvspaceRef_t mr;
+      CHECK(kvspaceShmResolveRef(kv, "/map/[1]", &mr) == 0);
+      CHECK(mr.depth > 0 && mr.parent_id != 0);
+      kvspaceRef_t mp = { mr.parent_id, mr.depth, 0, 0 };
+      d = kvspaceShmGetByRef(kv, &mp, "/map/[2]", &l);
+      CHECK(get_i64(d, l) == 22);
+      CHECK(get_i64(d, l) != 11);
+      d = kvspaceShmGetByRef(kv, &mp, "/map/[3]", &l);
+      CHECK(get_i64(d, l) == 33);
+      CHECK(get_i64(d, l) != 11);
+    }
+    {
+      kvspaceRef_t sr0;
+      CHECK(kvspaceShmResolveRef(kv, "/sib/00", &sr0) == 0);
+      CHECK(sr0.depth > 0);
+      kvspaceRef_t sp = { sr0.parent_id, sr0.depth, 0, 0 };
+      for (int i = 0; i < 64; i++) {
+        char k[16];
+        snprintf(k, sizeof k, "/sib/%02d", i);
+        int32_t l2 = 0;
+        d = kvspaceShmGetByRef(kv, &sp, k, &l2);
+        CHECK(get_i64(d, l2) == i + 100);
+      }
+    }
+    {
+      const int N = 200;
+      for (int i = 0; i < N; i++) {
+        char k[128];
+        snprintf(k, sizeof k, "/vthread/vt0/[0]/h/[%d]",
+                 (int)((unsigned)i * 2654435761u % 100003));
+        CHECK(set_i64(kv, k, i) == 0);
+      }
+      char k0[128];
+      snprintf(k0, sizeof k0, "/vthread/vt0/[0]/h/[%d]", 0);
+      kvspaceRef_t hr;
+      CHECK(kvspaceShmResolveRef(kv, k0, &hr) == 0);
+      CHECK(hr.depth > 0 && hr.parent_id != 0);
+      kvspaceRef_t hp = { hr.parent_id, hr.depth, 0, 0 };
+      for (int i = 0; i < N; i++) {
+        char k[128];
+        snprintf(k, sizeof k, "/vthread/vt0/[0]/h/[%d]",
+                 (int)((unsigned)i * 2654435761u % 100003));
+        int32_t l2 = 0;
+        d = kvspaceShmGetByRef(kv, &hp, k, &l2);
+        CHECK(get_i64(d, l2) == i);
+        CHECK(get_i64(d, l2) != i + 1);
+      }
+    }
   }
 
   const int N = 200000;
