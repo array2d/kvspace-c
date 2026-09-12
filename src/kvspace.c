@@ -434,12 +434,13 @@ static int32_t art_find(kvspace_t *kv, int32_t nid, const uint8_t *key,
     return art_find2(kv, nid, key, klen, NULL, NULL);
 }
 
-/* Ancestor covering last '/'. depth is after this node's prefix, ready for
- * art_child(key[depth]) — siblings in the same dir share that node. */
-static int32_t art_dir_ancestor(kvspace_t *kv, int32_t nid, const uint8_t *key,
-                                int klen, int last_slash, int *out_d) {
+/* One walk: leaf plus the ancestor covering last '/' (after that node's prefix). */
+static int32_t art_find_dir(kvspace_t *kv, int32_t nid, const uint8_t *key,
+                            int klen, int last_slash, int32_t *dirn, int *dird) {
     int d = 0;
-    if (last_slash <= 0 || nid < 0)
+    int32_t dir = -1;
+    int dd = 0;
+    if (nid < 0 || !key)
         return -1;
     while (nid >= 0) {
         art_hdr_t *h = art_hdr(kv, nid);
@@ -454,16 +455,18 @@ static int32_t art_dir_ancestor(kvspace_t *kv, int32_t nid, const uint8_t *key,
             if (d > klen)
                 return -1;
         }
-        if (entry_d <= last_slash && last_slash < d) {
-            *out_d = d;
-            return nid;
+        if (last_slash > 0 &&
+            ((entry_d <= last_slash && last_slash < d) || d == last_slash + 1)) {
+            dir = nid;
+            dd = d;
         }
-        if (d == last_slash + 1) {
-            *out_d = d;
-            return nid;
+        if (d == klen) {
+            if (dirn)
+                *dirn = dir;
+            if (dird)
+                *dird = dd;
+            return h->has_value ? nid : -1;
         }
-        if (d > last_slash || d >= klen)
-            return -1;
         nid = art_child(kv, h, key[d]);
         d++;
     }
@@ -1397,27 +1400,21 @@ int kvspaceShmResolveRef(kvspace_t *kv, const char *key, kvspaceRef_t *ref) {
         return -1;
     if (kv_sync(kv) != 0)
         return -1;
-    int32_t parent = -1;
-    int parent_d = 0;
     int klen = (int)strlen(key);
-    int32_t id = art_find2(kv, kv->hdr->art_root, (const uint8_t *)key, klen,
-                           &parent, &parent_d);
-    if (id < 0)
-        return -1;
-    ref->block_id = (uint32_t)id;
-    ref->gen = 0;
     int slash = klen - 1;
     while (slash > 0 && key[slash] != '/')
         slash--;
     int dir_d = 0;
-    int32_t dn = art_dir_ancestor(kv, kv->hdr->art_root, (const uint8_t *)key,
-                                  klen, slash, &dir_d);
-    if (dn >= 0) {
+    int32_t dn = -1;
+    int32_t id = art_find_dir(kv, kv->hdr->art_root, (const uint8_t *)key, klen,
+                              slash, &dn, &dir_d);
+    if (id < 0)
+        return -1;
+    ref->block_id = (uint32_t)id;
+    ref->gen = 0;
+    if (dn >= 0 && dir_d > 0) {
         ref->parent_id = (uint32_t)dn;
         ref->depth = (uint32_t)dir_d;
-    } else if (parent >= 0 && parent_d > 0) {
-        ref->parent_id = (uint32_t)parent;
-        ref->depth = (uint32_t)parent_d;
     } else {
         ref->parent_id = 0;
         ref->depth = 0;
