@@ -2,7 +2,12 @@
  * 让 kvlang 的 Rust layout 零改动对接 kvspace-c 的 SHM。内部复用 kvspaceShm* 与
  * kvspaceXvalue*。 */
 
-#define _POSIX_C_SOURCE 199309L
+/* macOS 需 _DARWIN_C_SOURCE 才暴露 usleep 等完整 Darwin API；_POSIX_C_SOURCE ≥200112
+ * 才在 macOS 暴露 C99 的 snprintf（Linux 走 glibc 的 _DEFAULT_SOURCE）。 */
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#endif
+#define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
 
 #include "kvspace_shm.h"
