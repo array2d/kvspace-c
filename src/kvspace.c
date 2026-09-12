@@ -462,8 +462,8 @@ static int32_t art_find_dir(kvspace_t *kv, int32_t nid, const uint8_t *key,
                             int klen, int last_sep, int seplen, int32_t *dirn,
                             int *dird) {
     int d = 0;
-    int32_t dir = -1, prev = -1;
-    int dd = 0, prev_d = 0;
+    int32_t dir = -1;
+    int dd = 0;
     if (nid < 0 || !key)
         return -1;
     while (nid >= 0) {
@@ -479,16 +479,11 @@ static int32_t art_find_dir(kvspace_t *kv, int32_t nid, const uint8_t *key,
             if (d > klen)
                 return -1;
         }
-        if (dir < 0 && last_sep > 0 && seplen > 0) {
-            int want = last_sep + seplen;
-            if (d == want) {
-                dir = nid;
-                dd = d;
-            } else if (entry_d < want && want < d && prev >= 0) {
-                /* Prefix ate past the last component: stay on the parent. */
-                dir = prev;
-                dd = prev_d;
-            }
+        if (dir < 0 && last_sep > 0 && seplen > 0 &&
+            ((entry_d <= last_sep && last_sep < d) ||
+             d == last_sep + seplen)) {
+            dir = nid;
+            dd = d;
         }
         if (d == klen) {
             if (dirn)
@@ -497,8 +492,6 @@ static int32_t art_find_dir(kvspace_t *kv, int32_t nid, const uint8_t *key,
                 *dird = dd;
             return h->has_value ? nid : -1;
         }
-        prev = nid;
-        prev_d = d;
         nid = art_child(kv, h, key[d]);
         d++;
     }
