@@ -19,7 +19,6 @@
 
 #define KVS_MAGIC "kvspace-c.v2"
 #define ART_PREFIX_MAX 10
-#define ART_HINT_MAX 256
 #define ART_NODE_MAX_SZ 2112
 #define ART_SLAB_INIT (256UL * 1024 * 1024)
 /* blocks_init picks 30-bit ids only if the initial pool holds > 8191 blocks;
@@ -136,9 +135,6 @@ struct kvspace {
     uint8_t *sbo_data;
     watch_t watches[WATCH_TABLE_SZ];
     pthread_mutex_t wlock;
-    int32_t art_hint;
-    int art_hint_d;
-    uint8_t art_hint_pfx[ART_HINT_MAX];
 };
 
 /* ---- shm region ---- */
@@ -424,39 +420,9 @@ static int32_t art_find2(kvspace_t *kv, int32_t nid, const uint8_t *key, int kle
                          int32_t *par, int *pard) {
     if (nid < 0 || !key)
         return -1;
-    int32_t origin = nid;
-    int d = 0;
     int32_t parent = -1;
     int parent_d = 0;
-    int hinted = 0;
-    if (kv->hdr && nid == kv->hdr->art_root && kv->art_hint >= 0 &&
-        kv->art_hint_d > 0 && kv->art_hint_d < klen &&
-        kv->art_hint_d <= ART_HINT_MAX &&
-        memcmp(key, kv->art_hint_pfx, (size_t)kv->art_hint_d) == 0) {
-        int32_t hid = art_follow(kv, kv->art_hint);
-        art_hdr_t *hh = hid >= 0 ? art_hdr(kv, hid) : NULL;
-        if (hh && hh->type != ART_MOVED) {
-            int32_t cid = art_child(kv, hh, key[kv->art_hint_d]);
-            if (cid >= 0) {
-                parent = hid;
-                parent_d = kv->art_hint_d;
-                nid = cid;
-                d = kv->art_hint_d + 1;
-                hinted = 1;
-            }
-        }
-    }
-    int32_t id = art_walk(kv, nid, key, klen, d, &parent, &parent_d);
-    if (id < 0 && hinted) {
-        parent = -1;
-        parent_d = 0;
-        id = art_walk(kv, origin, key, klen, 0, &parent, &parent_d);
-    }
-    if (id >= 0 && parent >= 0 && parent_d > 0 && parent_d <= ART_HINT_MAX) {
-        kv->art_hint = parent;
-        kv->art_hint_d = parent_d;
-        memcpy(kv->art_hint_pfx, key, (size_t)parent_d);
-    }
+    int32_t id = art_walk(kv, nid, key, klen, 0, &parent, &parent_d);
     if (par)
         *par = parent;
     if (pard)
@@ -1048,7 +1014,6 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
     if (!kv)
         return NULL;
     kv->r_art.fd = kv->r_head.fd = kv->r_data.fd = -1;
-    kv->art_hint = -1;
 
     /* validate before O_EXCL create: no empty file left behind */
     bool created = false;
@@ -1403,12 +1368,14 @@ int kvspaceShmResolveRef(kvspace_t *kv, const char *key, kvspaceRef_t *ref) {
                            &parent, &parent_d);
     if (id < 0)
         return -1;
+    ref->block_id = (uint32_t)id;
+    ref->gen = 0;
     if (parent >= 0 && parent_d > 0) {
-        ref->block_id = (uint32_t)parent;
-        ref->gen = (uint32_t)parent_d;
+        ref->parent_id = (uint32_t)parent;
+        ref->depth = (uint32_t)parent_d;
     } else {
-        ref->block_id = (uint32_t)id;
-        ref->gen = 0;
+        ref->parent_id = 0;
+        ref->depth = 0;
     }
     return 0;
 }

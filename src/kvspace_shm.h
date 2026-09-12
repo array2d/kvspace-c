@@ -18,6 +18,8 @@ typedef struct kvspace kvspace_t;
 typedef struct {
     uint32_t block_id;
     uint32_t gen;
+    uint32_t parent_id;
+    uint32_t depth;
 } kvspaceRef_t;
 
 /* ================================================================

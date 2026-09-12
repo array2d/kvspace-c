@@ -125,12 +125,18 @@ int main(void) {
     CHECK(set_i64(kv, "/frm/i", 2) == 0);
     CHECK(set_i64(kv, "/frm/n", 3) == 0);
     CHECK(kvspaceShmResolveRef(kv, "/frm/a", &sr) == 0);
-    d = kvspaceShmGetByRef(kv, &sr, "/frm/i", &l);
-    CHECK(get_i64(d, l) == 2);
-    d = kvspaceShmGetByRef(kv, &sr, "/frm/n", &l);
-    CHECK(get_i64(d, l) == 3);
+    CHECK(sr.depth > 0 && sr.parent_id != 0);
     d = kvspaceShmGetByRef(kv, &sr, "/frm/a", &l);
     CHECK(get_i64(d, l) == 1);
+    {
+      kvspaceRef_t pr = { sr.parent_id, sr.depth, 0, 0 };
+      d = kvspaceShmGetByRef(kv, &pr, "/frm/i", &l);
+      CHECK(get_i64(d, l) == 2);
+      CHECK(get_i64(d, l) != 1);
+      d = kvspaceShmGetByRef(kv, &pr, "/frm/n", &l);
+      CHECK(get_i64(d, l) == 3);
+      CHECK(get_i64(d, l) != 1);
+    }
   }
 
   const int N = 200000;
@@ -162,12 +168,17 @@ int main(void) {
     kvspaceShmGet(kv, fk[r % NF], 0, &l);
   }
   uint64_t t4 = nsec();
-  kvspaceRef_t sr;
+  kvspaceRef_t sr, pref;
   CHECK(kvspaceShmResolveRef(kv, fk[0], &sr) == 0);
+  CHECK(sr.depth > 0);
+  pref.block_id = sr.parent_id;
+  pref.gen = sr.depth;
+  pref.parent_id = 0;
+  pref.depth = 0;
   uint64_t t5 = nsec();
   for (int r = 0; r < NR; r++) {
     int32_t l = 0;
-    kvspaceShmGetByRef(kv, &sr, fk[r % NF], &l);
+    kvspaceShmGetByRef(kv, &pref, fk[r % NF], &l);
   }
   uint64_t t6 = nsec();
   printf("Get sibling %.1f ns/op  GetByRef sibling %.1f ns/op  ratio %.2f\n",
