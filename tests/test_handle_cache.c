@@ -189,6 +189,77 @@ int main(void) {
         CHECK(get_i64(d, l2) != i + 1);
       }
     }
+    /* kvlang map slots use member '·', not '/'. */
+    {
+      const int N = 200;
+#define MSEP "\xC2\xB7"
+      for (int i = 0; i < N; i++) {
+        char k[128];
+        snprintf(k, sizeof k, "/vthread/vt0/[0]" MSEP "h" MSEP "[%d]",
+                 (int)((unsigned)i * 2654435761u % 100003));
+        CHECK(set_i64(kv, k, i) == 0);
+      }
+      char k0[128];
+      snprintf(k0, sizeof k0, "/vthread/vt0/[0]" MSEP "h" MSEP "[0]");
+      kvspaceRef_t hr;
+      CHECK(kvspaceShmResolveRef(kv, k0, &hr) == 0);
+      CHECK(hr.depth > 0 && hr.parent_id != 0);
+      kvspaceRef_t hp = { hr.parent_id, hr.depth, 0, 0 };
+      int hits = 0;
+      for (int i = 0; i < N; i++) {
+        char k[128];
+        snprintf(k, sizeof k, "/vthread/vt0/[0]" MSEP "h" MSEP "[%d]",
+                 (int)((unsigned)i * 2654435761u % 100003));
+        int32_t l2 = 0;
+        d = kvspaceShmGetByRef(kv, &hp, k, &l2);
+        if (get_i64(d, l2) == i)
+          hits++;
+        CHECK(get_i64(d, l2) == i);
+        CHECK(get_i64(d, l2) != i + 1);
+      }
+      CHECK(hits == N);
+      for (int i = 0; i < 32; i++) {
+        char k[128];
+        snprintf(k, sizeof k, "/vthread/vt0/[0]" MSEP "arr" MSEP "[%d]", i);
+        CHECK(set_i64(kv, k, i + 50) == 0);
+      }
+      snprintf(k0, sizeof k0, "/vthread/vt0/[0]" MSEP "arr" MSEP "[0]");
+      CHECK(kvspaceShmResolveRef(kv, k0, &hr) == 0);
+      hp.block_id = hr.parent_id;
+      hp.gen = hr.depth;
+      for (int i = 0; i < 32; i++) {
+        char k[128];
+        snprintf(k, sizeof k, "/vthread/vt0/[0]" MSEP "arr" MSEP "[%d]", i);
+        int32_t l2 = 0;
+        d = kvspaceShmGetByRef(kv, &hp, k, &l2);
+        CHECK(get_i64(d, l2) == i + 50);
+      }
+      /* kv.get/kv.set map slots are unbracketed: base·42 */
+      for (int i = 0; i < N; i++) {
+        char k[128];
+        snprintf(k, sizeof k, "/vthread/vt0/[0]" MSEP "m" MSEP "%d",
+                 (int)((unsigned)i * 2654435761u % 100003));
+        CHECK(set_i64(kv, k, i + 1000) == 0);
+      }
+      snprintf(k0, sizeof k0, "/vthread/vt0/[0]" MSEP "m" MSEP "0");
+      CHECK(kvspaceShmResolveRef(kv, k0, &hr) == 0);
+      CHECK(hr.depth > 0 && hr.parent_id != 0);
+      hp.block_id = hr.parent_id;
+      hp.gen = hr.depth;
+      hits = 0;
+      for (int i = 0; i < N; i++) {
+        char k[128];
+        snprintf(k, sizeof k, "/vthread/vt0/[0]" MSEP "m" MSEP "%d",
+                 (int)((unsigned)i * 2654435761u % 100003));
+        int32_t l2 = 0;
+        d = kvspaceShmGetByRef(kv, &hp, k, &l2);
+        if (get_i64(d, l2) == i + 1000)
+          hits++;
+        CHECK(get_i64(d, l2) == i + 1000);
+      }
+      CHECK(hits == N);
+#undef MSEP
+    }
   }
 
   const int N = 200000;

@@ -434,9 +434,33 @@ static int32_t art_find(kvspace_t *kv, int32_t nid, const uint8_t *key,
     return art_find2(kv, nid, key, klen, NULL, NULL);
 }
 
-/* One walk: leaf plus the ancestor covering last '/' (after that node's prefix). */
+/* Last path '/' or kvlang member '·' (U+00B7, utf-8 C2 B7). */
+static int last_key_sep(const uint8_t *key, int klen, int *seplen) {
+    int slash = -1, mid = -1;
+    for (int i = 0; i < klen; i++) {
+        if (key[i] == '/')
+            slash = i;
+        if (i + 1 < klen && key[i] == 0xC2 && key[i + 1] == 0xB7)
+            mid = i;
+    }
+    if (mid > slash) {
+        *seplen = 2;
+        return mid;
+    }
+    if (slash > 0) {
+        *seplen = 1;
+        return slash;
+    }
+    *seplen = 0;
+    return -1;
+}
+
+/* One walk: leaf plus the ancestor covering last '/' or '·' (after that
+ * node's prefix). First match: node at the separator, not a deeper unique
+ * prefix that swallowed it. */
 static int32_t art_find_dir(kvspace_t *kv, int32_t nid, const uint8_t *key,
-                            int klen, int last_slash, int32_t *dirn, int *dird) {
+                            int klen, int last_sep, int seplen, int32_t *dirn,
+                            int *dird) {
     int d = 0;
     int32_t dir = -1;
     int dd = 0;
@@ -455,8 +479,9 @@ static int32_t art_find_dir(kvspace_t *kv, int32_t nid, const uint8_t *key,
             if (d > klen)
                 return -1;
         }
-        if (last_slash > 0 &&
-            ((entry_d <= last_slash && last_slash < d) || d == last_slash + 1)) {
+        if (dir < 0 && last_sep > 0 && seplen > 0 &&
+            ((entry_d <= last_sep && last_sep < d) ||
+             d == last_sep + seplen)) {
             dir = nid;
             dd = d;
         }
@@ -1401,13 +1426,12 @@ int kvspaceShmResolveRef(kvspace_t *kv, const char *key, kvspaceRef_t *ref) {
     if (kv_sync(kv) != 0)
         return -1;
     int klen = (int)strlen(key);
-    int slash = klen - 1;
-    while (slash > 0 && key[slash] != '/')
-        slash--;
+    int seplen = 0;
+    int sep = last_key_sep((const uint8_t *)key, klen, &seplen);
     int dir_d = 0;
     int32_t dn = -1;
     int32_t id = art_find_dir(kv, kv->hdr->art_root, (const uint8_t *)key, klen,
-                              slash, &dn, &dir_d);
+                              sep, seplen, &dn, &dir_d);
     if (id < 0)
         return -1;
     ref->block_id = (uint32_t)id;
