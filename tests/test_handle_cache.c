@@ -101,6 +101,38 @@ int main(void) {
   d = kvspaceShmGetByRef(kv, &pr, "/p", &len);
   CHECK(get_i64(d, len) == 200);
 
+  for (int i = 0; i < 64; i++) {
+    char k[16];
+    snprintf(k, sizeof k, "/sib/%02d", i);
+    CHECK(set_i64(kv, k, i + 100) == 0);
+  }
+  for (int i = 0; i < 64; i++) {
+    char k[16];
+    snprintf(k, sizeof k, "/sib/%02d", i);
+    int32_t l = 0;
+    d = kvspaceShmGet(kv, k, 0, &l);
+    CHECK(get_i64(d, l) == i + 100);
+  }
+  CHECK(set_i64(kv, "/other", 1) == 0);
+  {
+    int32_t l = 0;
+    d = kvspaceShmGet(kv, "/sib/00", 0, &l);
+    CHECK(get_i64(d, l) == 100);
+    d = kvspaceShmGet(kv, "/other", 0, &l);
+    CHECK(get_i64(d, l) == 1);
+    kvspaceRef_t sr;
+    CHECK(set_i64(kv, "/frm/a", 1) == 0);
+    CHECK(set_i64(kv, "/frm/i", 2) == 0);
+    CHECK(set_i64(kv, "/frm/n", 3) == 0);
+    CHECK(kvspaceShmResolveRef(kv, "/frm/a", &sr) == 0);
+    d = kvspaceShmGetByRef(kv, &sr, "/frm/i", &l);
+    CHECK(get_i64(d, l) == 2);
+    d = kvspaceShmGetByRef(kv, &sr, "/frm/n", &l);
+    CHECK(get_i64(d, l) == 3);
+    d = kvspaceShmGetByRef(kv, &sr, "/frm/a", &l);
+    CHECK(get_i64(d, l) == 1);
+  }
+
   const int N = 200000;
   CHECK(set_i64(kv, "/hot", 1) == 0);
   kvspaceRef_t hr;
@@ -120,6 +152,27 @@ int main(void) {
   double ns_ref = (double)(t2 - t1) / N;
   printf("Get %.1f ns/op  GetByRef %.1f ns/op  ratio %.2f\n", ns_get, ns_ref,
          ns_ref > 0 ? ns_get / ns_ref : 0);
+
+  const char *fk[] = {"/frm/a", "/frm/i", "/frm/n"};
+  const int NF = 3;
+  const int NR = 50000;
+  uint64_t t3 = nsec();
+  for (int r = 0; r < NR; r++) {
+    int32_t l = 0;
+    kvspaceShmGet(kv, fk[r % NF], 0, &l);
+  }
+  uint64_t t4 = nsec();
+  kvspaceRef_t sr;
+  CHECK(kvspaceShmResolveRef(kv, fk[0], &sr) == 0);
+  uint64_t t5 = nsec();
+  for (int r = 0; r < NR; r++) {
+    int32_t l = 0;
+    kvspaceShmGetByRef(kv, &sr, fk[r % NF], &l);
+  }
+  uint64_t t6 = nsec();
+  printf("Get sibling %.1f ns/op  GetByRef sibling %.1f ns/op  ratio %.2f\n",
+         (double)(t4 - t3) / NR, (double)(t6 - t5) / NR,
+         (t6 - t5) > 0 ? (double)(t4 - t3) / (double)(t6 - t5) : 0);
 
   kvspaceShmClose(kv);
   return failures ? 1 : 0;

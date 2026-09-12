@@ -19,6 +19,7 @@
 
 #define KVS_MAGIC "kvspace-c.v2"
 #define ART_PREFIX_MAX 10
+#define ART_HINT_MAX 256
 #define ART_NODE_MAX_SZ 2112
 #define ART_SLAB_INIT (256UL * 1024 * 1024)
 /* blocks_init picks 30-bit ids only if the initial pool holds > 8191 blocks;
@@ -135,6 +136,9 @@ struct kvspace {
     uint8_t *sbo_data;
     watch_t watches[WATCH_TABLE_SZ];
     pthread_mutex_t wlock;
+    int32_t art_hint;
+    int art_hint_d;
+    uint8_t art_hint_pfx[ART_HINT_MAX];
 };
 
 /* ---- shm region ---- */
@@ -383,12 +387,10 @@ static int32_t art_child(kvspace_t *kv, void *n, uint8_t b) {
     return -1;
 }
 
-/* ---- art_search ---- */
-static int32_t art_find(kvspace_t *kv, int32_t nid, const uint8_t *key,
-                        int klen) {
-    if (nid < 0 || !key)
-        return -1;
-    int d = 0;
+static int32_t art_follow(kvspace_t *kv, int32_t id);
+
+static int32_t art_walk(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
+                        int d, int32_t *par, int *pard) {
     while (nid >= 0) {
         art_hdr_t *h = art_hdr(kv, nid);
         if (!h || h->type == ART_MOVED)
@@ -407,10 +409,63 @@ static int32_t art_find(kvspace_t *kv, int32_t nid, const uint8_t *key,
         }
         if (d == klen)
             return h->has_value ? nid : -1;
+        if (par)
+            *par = nid;
+        if (pard)
+            *pard = d;
         nid = art_child(kv, h, key[d]);
         d++;
     }
     return -1;
+}
+
+/* ---- art_search ---- */
+static int32_t art_find2(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
+                         int32_t *par, int *pard) {
+    if (nid < 0 || !key)
+        return -1;
+    int32_t origin = nid;
+    int d = 0;
+    int32_t parent = -1;
+    int parent_d = 0;
+    int hinted = 0;
+    if (kv->hdr && nid == kv->hdr->art_root && kv->art_hint >= 0 &&
+        kv->art_hint_d > 0 && kv->art_hint_d < klen &&
+        kv->art_hint_d <= ART_HINT_MAX &&
+        memcmp(key, kv->art_hint_pfx, (size_t)kv->art_hint_d) == 0) {
+        int32_t hid = art_follow(kv, kv->art_hint);
+        art_hdr_t *hh = hid >= 0 ? art_hdr(kv, hid) : NULL;
+        if (hh && hh->type != ART_MOVED) {
+            int32_t cid = art_child(kv, hh, key[kv->art_hint_d]);
+            if (cid >= 0) {
+                parent = hid;
+                parent_d = kv->art_hint_d;
+                nid = cid;
+                d = kv->art_hint_d + 1;
+                hinted = 1;
+            }
+        }
+    }
+    int32_t id = art_walk(kv, nid, key, klen, d, &parent, &parent_d);
+    if (id < 0 && hinted) {
+        parent = -1;
+        parent_d = 0;
+        id = art_walk(kv, origin, key, klen, 0, &parent, &parent_d);
+    }
+    if (id >= 0 && parent >= 0 && parent_d > 0 && parent_d <= ART_HINT_MAX) {
+        kv->art_hint = parent;
+        kv->art_hint_d = parent_d;
+        memcpy(kv->art_hint_pfx, key, (size_t)parent_d);
+    }
+    if (par)
+        *par = parent;
+    if (pard)
+        *pard = parent_d;
+    return id;
+}
+static int32_t art_find(kvspace_t *kv, int32_t nid, const uint8_t *key,
+                        int klen) {
+    return art_find2(kv, nid, key, klen, NULL, NULL);
 }
 static art_hdr_t *art_search(kvspace_t *kv, int32_t nid, const uint8_t *key,
                              int klen) {
@@ -993,6 +1048,7 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
     if (!kv)
         return NULL;
     kv->r_art.fd = kv->r_head.fd = kv->r_data.fd = -1;
+    kv->art_hint = -1;
 
     /* validate before O_EXCL create: no empty file left behind */
     bool created = false;
@@ -1312,11 +1368,27 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
     return raw;
 }
 
-static int32_t ref_live(kvspace_t *kv, kvspaceRef_t *ref) {
+/* gen>0: block_id is parent at depth gen; key must share that prefix. */
+static int32_t ref_leaf(kvspace_t *kv, kvspaceRef_t *ref, const char *key) {
     int32_t id = art_follow(kv, (int32_t)ref->block_id);
-    if (id >= 0)
-        ref->block_id = (uint32_t)id;
-    return id;
+    if (id < 0)
+        return -1;
+    ref->block_id = (uint32_t)id;
+    if (ref->gen == 0)
+        return id;
+    if (!key)
+        return -1;
+    int klen = (int)strlen(key);
+    int d = (int)ref->gen;
+    if (d <= 0 || d >= klen)
+        return -1;
+    art_hdr_t *h = art_hdr(kv, id);
+    if (!h || h->type == ART_MOVED)
+        return -1;
+    int32_t cid = art_child(kv, h, (uint8_t)key[d]);
+    if (cid < 0)
+        return -1;
+    return art_walk(kv, cid, (const uint8_t *)key, klen, d + 1, NULL, NULL);
 }
 
 int kvspaceShmResolveRef(kvspace_t *kv, const char *key, kvspaceRef_t *ref) {
@@ -1324,12 +1396,20 @@ int kvspaceShmResolveRef(kvspace_t *kv, const char *key, kvspaceRef_t *ref) {
         return -1;
     if (kv_sync(kv) != 0)
         return -1;
-    int32_t id =
-        art_find(kv, kv->hdr->art_root, (const uint8_t *)key, (int)strlen(key));
+    int32_t parent = -1;
+    int parent_d = 0;
+    int klen = (int)strlen(key);
+    int32_t id = art_find2(kv, kv->hdr->art_root, (const uint8_t *)key, klen,
+                           &parent, &parent_d);
     if (id < 0)
         return -1;
-    ref->block_id = (uint32_t)id;
-    ref->gen = 0;
+    if (parent >= 0 && parent_d > 0) {
+        ref->block_id = (uint32_t)parent;
+        ref->gen = (uint32_t)parent_d;
+    } else {
+        ref->block_id = (uint32_t)id;
+        ref->gen = 0;
+    }
     return 0;
 }
 
@@ -1340,7 +1420,7 @@ uint8_t *kvspaceShmGetByRef(kvspace_t *kv, kvspaceRef_t *ref,
     *ol = 0;
     if (kv_sync(kv) != 0)
         return NULL;
-    int32_t id = ref_live(kv, ref);
+    int32_t id = ref_leaf(kv, ref, key_fallback);
     art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
     if (h && h->has_value) {
         uint8_t *raw;
@@ -1365,7 +1445,7 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
         return -1;
     if (kv_sync(kv) != 0)
         return -1;
-    int32_t id = ref_live(kv, ref);
+    int32_t id = ref_leaf(kv, ref, key_fallback);
     art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
     if (!h || !h->has_value) {
         if (!key_fallback)
