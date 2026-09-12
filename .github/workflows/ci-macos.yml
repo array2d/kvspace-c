@@ -26,4 +26,7 @@ jobs:
             -DKVSPACE_BUILD_TESTS=ON
           cmake --build build -j
       - name: 测试
+        env:
+          # macOS 无 ldconfig，dyld 不会自动搜 /usr/local/lib
+          DYLD_FALLBACK_LIBRARY_PATH: /usr/local/lib
         run: cd build && ctest --output-on-failure
