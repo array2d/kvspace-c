@@ -15,6 +15,7 @@
 
 typedef struct kvspace kvspace_t;
 
+/* 对齐 kvspace/include/kvspace/kvspace.h：叶子 + 目录祖先。 */
 typedef struct {
     uint32_t block_id;
     uint32_t gen;

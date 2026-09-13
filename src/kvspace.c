@@ -1426,6 +1426,7 @@ static int32_t ref_leaf(kvspace_t *kv, kvspaceRef_t *ref, const char *key) {
 int kvspaceShmResolveRef(kvspace_t *kv, const char *key, kvspaceRef_t *ref) {
     if (!kv || !key || !ref)
         return -1;
+    memset(ref, 0, sizeof(*ref));
     if (kv_sync(kv) != 0)
         return -1;
     int klen = (int)strlen(key);
