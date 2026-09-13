@@ -51,7 +51,6 @@ mod ffi {
             path: *const c_char,
             extpath: *const c_char,
         ) -> i32;
-        pub fn kvspaceShmDelextindex(kv: *mut std::ffi::c_void, path: *const c_char) -> i32;
     }
 }
 

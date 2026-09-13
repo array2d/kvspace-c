@@ -250,6 +250,10 @@ static void t_cross_process(const char *dir) {
 }
 
 static int punch_supported(const char *dir) {
+#if !defined(__linux__)
+  (void)dir;
+  return 0; /* macOS 无 fallocate PUNCH_HOLE */
+#else
   char p[600];
   snprintf(p, sizeof p, "%s/punch-probe", dir);
   int fd = open(p, O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -261,6 +265,7 @@ static int punch_supported(const char *dir) {
   close(fd);
   unlink(p);
   return ok;
+#endif
 }
 
 static void t_punch(const char *dir) {

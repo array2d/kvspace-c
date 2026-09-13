@@ -134,14 +134,6 @@ int32_t kvspaceXvalueNewUint64(const uint64_t *vals, int32_t count, uint8_t **ou
 int32_t kvspaceXvalueNewFloat32(const float *vals, int32_t count, uint8_t **out);
 int32_t kvspaceXvalueNewFloat64(const double *vals, int32_t count, uint8_t **out);
 
-/* char/utf32：UTF-8 字符串 → UTF-32 LE 码点（4B×N），array_len=码点数 */
-int32_t kvspaceXvalueNewChar(const char *s, uint8_t **out);
-/* char/utf8：UTF-8 字节（1B×N） */
-int32_t kvspaceXvalueNewCharUtf8(const char *s, uint8_t **out);
-/* char/ascii：ASCII 字节（1B×N） */
-int32_t kvspaceXvalueNewCharAscii(const char *s, uint8_t **out);
-/* 第 idx 个码点（char/utf32） */
-int32_t kvspaceXvalueAtChar(const xvalue_head_t *h, int32_t idx);
 
 int32_t kvspaceXvalueNewIndex(const char **children, int32_t count, uint8_t **out);
 /* memindex 定宽矩阵（dims=[len,cap,M]，M 向上 8 对齐）：cap_hint/m_hint 为容量与行宽下限（只增），
