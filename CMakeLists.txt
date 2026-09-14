@@ -20,9 +20,8 @@ set_target_properties(kvspace-c PROPERTIES
 )
 
 # 无公共头：内部头在 src/（kvspace_shm.h、xvalue.h），权威 ABI 头在 kvspace 仓库。
-target_link_libraries(kvspace-c
-    PUBLIC blockmalloc slotsboxmalloc
-)
+# 两个依赖库走 header-only（src/kvspace.c 里 #define *_IMPLEMENTATION），故不链接 .so；
+# 头的搜索路径由系统 include（/usr/include/blockmalloc、/usr/include/slotsboxmalloc）提供。
 
 # 后端库固定装到 dispatch 前端 dlopen 的目录 <prefix>/lib/kvspace。
 # 默认 prefix=/usr（对齐 ci/deps.sh 的 /usr/lib/kvspace），而非 /usr/local。
