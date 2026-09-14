@@ -3,9 +3,13 @@
  */
 
 #define _GNU_SOURCE
-#include "kvspace_shm.h"
-#include "slotsboxmalloc/slotsboxobj.h"
+/* header-only 模式：两个依赖库的实现体在本 TU 编译，不再链接它们的 .so。
+ * blockmalloc 必须先于 slotsboxmalloc（后者在其实现体里调用前者）。 */
+#define BLOCKMALLOC_IMPLEMENTATION
 #include <blockmalloc/blockmalloc.h>
+#define SLOTSBOXMALLOC_IMPLEMENTATION
+#include "slotsboxmalloc/slotsboxobj.h"
+#include "kvspace_shm.h"
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
