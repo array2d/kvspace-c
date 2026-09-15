@@ -39,7 +39,8 @@
 enum { ART_N4 = 0,
        ART_N16 = 1,
        ART_N48 = 2,
-       ART_N256 = 3 };
+       ART_N256 = 3,
+       ART_MOVED = 255 };
 
 typedef struct {
     uint8_t type, prefix[ART_PREFIX_MAX], prefix_len;
@@ -389,34 +390,135 @@ static int32_t art_child(kvspace_t *kv, void *n, uint8_t b) {
     return -1;
 }
 
-/* ---- art_search ---- */
-static art_hdr_t *art_search(kvspace_t *kv, int32_t nid, const uint8_t *key,
-                             int klen) {
-    if (nid < 0 || !key)
-        return NULL;
-    int d = 0;
+static int32_t art_follow(kvspace_t *kv, int32_t id);
+
+static int32_t art_walk(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
+                        int d, int32_t *par, int *pard) {
     while (nid >= 0) {
         art_hdr_t *h = art_hdr(kv, nid);
-        if (!h)
-            return NULL;
+        if (!h || h->type == ART_MOVED)
+            return -1;
         if (h->prefix_len) {
             int s = pfx_shared(h->prefix, h->prefix_len, key + d, klen - d);
             if (s != h->prefix_len) {
                 if (d + s < klen)
-                    return NULL;
+                    return -1;
                 if (s < h->prefix_len)
-                    return NULL;
+                    return -1;
             }
             d += h->prefix_len;
             if (d > klen)
-                return NULL;
+                return -1;
         }
         if (d == klen)
-            return h->has_value ? h : NULL;
+            return h->has_value ? nid : -1;
+        if (par)
+            *par = nid;
+        if (pard)
+            *pard = d;
         nid = art_child(kv, h, key[d]);
         d++;
     }
-    return NULL;
+    return -1;
+}
+
+/* ---- art_search ---- */
+static int32_t art_find2(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
+                         int32_t *par, int *pard) {
+    if (nid < 0 || !key)
+        return -1;
+    int32_t parent = -1;
+    int parent_d = 0;
+    int32_t id = art_walk(kv, nid, key, klen, 0, &parent, &parent_d);
+    if (par)
+        *par = parent;
+    if (pard)
+        *pard = parent_d;
+    return id;
+}
+static int32_t art_find(kvspace_t *kv, int32_t nid, const uint8_t *key,
+                        int klen) {
+    return art_find2(kv, nid, key, klen, NULL, NULL);
+}
+
+/* Last path '/' or kvlang member '·' (U+00B7, utf-8 C2 B7). */
+static int last_key_sep(const uint8_t *key, int klen, int *seplen) {
+    int slash = -1, mid = -1;
+    for (int i = 0; i < klen; i++) {
+        if (key[i] == '/')
+            slash = i;
+        if (i + 1 < klen && key[i] == 0xC2 && key[i + 1] == 0xB7)
+            mid = i;
+    }
+    if (mid > slash) {
+        *seplen = 2;
+        return mid;
+    }
+    if (slash > 0) {
+        *seplen = 1;
+        return slash;
+    }
+    *seplen = 0;
+    return -1;
+}
+
+/* One walk: leaf plus the ancestor covering last '/' or '·' (after that
+ * node's prefix). First match: node at the separator, not a deeper unique
+ * prefix that swallowed it. */
+static int32_t art_find_dir(kvspace_t *kv, int32_t nid, const uint8_t *key,
+                            int klen, int last_sep, int seplen, int32_t *dirn,
+                            int *dird) {
+    int d = 0;
+    int32_t dir = -1;
+    int dd = 0;
+    if (nid < 0 || !key)
+        return -1;
+    while (nid >= 0) {
+        art_hdr_t *h = art_hdr(kv, nid);
+        if (!h || h->type == ART_MOVED)
+            return -1;
+        int entry_d = d;
+        if (h->prefix_len) {
+            int s = pfx_shared(h->prefix, h->prefix_len, key + d, klen - d);
+            if (s != h->prefix_len)
+                return -1;
+            d += h->prefix_len;
+            if (d > klen)
+                return -1;
+        }
+        if (dir < 0 && last_sep > 0 && seplen > 0 &&
+            ((entry_d <= last_sep && last_sep < d) ||
+             d == last_sep + seplen)) {
+            dir = nid;
+            dd = d;
+        }
+        if (d == klen) {
+            if (dirn)
+                *dirn = dir;
+            if (dird)
+                *dird = dd;
+            return h->has_value ? nid : -1;
+        }
+        nid = art_child(kv, h, key[d]);
+        d++;
+    }
+    return -1;
+}
+static art_hdr_t *art_search(kvspace_t *kv, int32_t nid, const uint8_t *key,
+                             int klen) {
+    int32_t id = art_find(kv, nid, key, klen);
+    return id < 0 ? NULL : art_hdr(kv, id);
+}
+static int32_t art_follow(kvspace_t *kv, int32_t id) {
+    for (int i = 0; i < 8 && id >= 0; i++) {
+        art_hdr_t *h = art_hdr(kv, id);
+        if (!h)
+            return -1;
+        if (h->type != ART_MOVED)
+            return id;
+        id = (int32_t)h->box_offset;
+    }
+    return -1;
 }
 
 /* ---- node create ---- */
@@ -530,6 +632,9 @@ static int32_t art_grow(kvspace_t *kv, void *on) {
                     x->children[j] = tc;
                 }
     }
+    oh->type = ART_MOVED;
+    oh->has_value = 0;
+    oh->box_offset = (uint64_t)(uint32_t)nid;
     return nid;
 }
 
@@ -1297,6 +1402,115 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
         return NULL;
     *ol = rl;
     return raw;
+}
+
+/* gen>0: block_id is parent at depth gen; key must share that prefix. */
+static int32_t ref_leaf(kvspace_t *kv, kvspaceRef_t *ref, const char *key) {
+    int32_t id = art_follow(kv, (int32_t)ref->block_id);
+    if (id < 0)
+        return -1;
+    ref->block_id = (uint32_t)id;
+    if (ref->gen == 0)
+        return id;
+    if (!key)
+        return -1;
+    int klen = (int)strlen(key);
+    int d = (int)ref->gen;
+    if (d < 0 || d >= klen)
+        return -1;
+    art_hdr_t *h = art_hdr(kv, id);
+    if (!h || h->type == ART_MOVED)
+        return -1;
+    int32_t cid = art_child(kv, h, (uint8_t)key[d]);
+    if (cid < 0)
+        return -1;
+    return art_walk(kv, cid, (const uint8_t *)key, klen, d + 1, NULL, NULL);
+}
+
+int kvspaceShmResolveRef(kvspace_t *kv, const char *key, kvspaceRef_t *ref) {
+    if (!kv || !key || !ref)
+        return -1;
+    memset(ref, 0, sizeof(*ref));
+    if (kv_sync(kv) != 0)
+        return -1;
+    int klen = (int)strlen(key);
+    int seplen = 0;
+    int sep = last_key_sep((const uint8_t *)key, klen, &seplen);
+    int dir_d = 0;
+    int32_t dn = -1;
+    int32_t id = art_find_dir(kv, kv->hdr->art_root, (const uint8_t *)key, klen,
+                              sep, seplen, &dn, &dir_d);
+    if (id < 0)
+        return -1;
+    ref->block_id = (uint32_t)id;
+    ref->gen = 0;
+    if (dn >= 0 && dir_d > 0) {
+        ref->parent_id = (uint32_t)dn;
+        ref->depth = (uint32_t)dir_d;
+    } else {
+        ref->parent_id = 0;
+        ref->depth = 0;
+    }
+    return 0;
+}
+
+uint8_t *kvspaceShmGetByRef(kvspace_t *kv, kvspaceRef_t *ref,
+                            const char *key_fallback, int32_t *ol) {
+    if (!kv || !ref || !ol)
+        return NULL;
+    *ol = 0;
+    if (kv_sync(kv) != 0)
+        return NULL;
+    int32_t id = ref_leaf(kv, ref, key_fallback);
+    art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
+    if (h && h->has_value) {
+        uint8_t *raw;
+        int32_t rl;
+        if (read_tlv(kv, h->box_offset, &raw, &rl) == 0) {
+            *ol = rl;
+            return raw;
+        }
+    }
+    /* gen>0: parent walk miss — do not full-Get; caller falls back. */
+    if (ref->gen != 0)
+        return NULL;
+    if (!key_fallback)
+        return NULL;
+    uint8_t *raw = kvspaceShmGet(kv, key_fallback, 0, ol);
+    if (raw)
+        kvspaceShmResolveRef(kv, key_fallback, ref);
+    return raw;
+}
+
+int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
+                           const char *key_fallback, uint32_t offset,
+                           const uint8_t *buf, uint32_t buf_len) {
+    if (!kv || !ref || !buf)
+        return -1;
+    if (kv_sync(kv) != 0)
+        return -1;
+    int32_t id = ref_leaf(kv, ref, key_fallback);
+    art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
+    if (!h || !h->has_value) {
+        if (ref->gen != 0)
+            return -1;
+        if (!key_fallback)
+            return -1;
+        int32_t rl = 0;
+        uint8_t *d = kvspaceShmGet(kv, key_fallback, 0, &rl);
+        if (!d || offset + buf_len > (uint32_t)rl)
+            return -1;
+        memcpy(d + offset, buf, buf_len);
+        kvspaceShmResolveRef(kv, key_fallback, ref);
+        return 0;
+    }
+    uint8_t *raw;
+    int32_t rl;
+    if (read_tlv(kv, h->box_offset, &raw, &rl) < 0 ||
+        offset + buf_len > (uint32_t)rl)
+        return -1;
+    memcpy(raw + offset, buf, buf_len);
+    return 0;
 }
 
 /* ── 值/索引分离（方案2，对齐 kvspace-durable backend.rs） ────────── */
