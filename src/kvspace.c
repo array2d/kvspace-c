@@ -1227,11 +1227,10 @@ void kvspaceShmClose(kvspace_t *kv) {
 
 /* ---- link resolve helpers ---- */
 static int read_tlv(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
-    uint8_t *s =
-        kv->sbo_data + off; /* box 内必含完整 TLV，用 xvalue 解码器算长度 */
+    uint8_t *s = kv->sbo_data + off;
     size_t sz = sbo_allocated_size(kv->sbo_meta, off);
     kvspaceXh wire;
-    if (kvspaceXhDecode(s, sz, &wire) == 0) {
+    if (kvspaceXhView(s, sz, &wire) == 0) {
         if (wire.total > INT32_MAX)
             return -1;
         *out = s;
@@ -1258,7 +1257,7 @@ static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
         if (read_tlv(kv, h->box_offset, &raw, &rl) < 0)
             return;
         kvspaceXh wire;
-        if (rl > 0 && kvspaceXhDecode(raw, (uint64_t)rl, &wire) == 0) {
+        if (rl > 0 && kvspaceXhView(raw, (uint64_t)rl, &wire) == 0) {
             if (wire.kind != (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG) ||
                 wire.content_len >= (uint64_t)osz)
                 return;
@@ -1288,7 +1287,7 @@ static art_hdr_t *resolve_fetch(kvspace_t *kv, const char *path, char *out, int 
         uint8_t *s = kv->sbo_data + h->box_offset;
         size_t sz = sbo_allocated_size(kv->sbo_meta, h->box_offset);
         kvspaceXh wire;
-        if (kvspaceXhDecode(s, sz, &wire) == 0) {
+        if (kvspaceXhView(s, sz, &wire) == 0) {
             if (wire.total > INT32_MAX)
                 return NULL;
             if (wire.kind != (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG) ||
