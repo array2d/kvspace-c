@@ -91,6 +91,20 @@ int main(void) {
     CHECK(stored && kvspaceXhDecode(stored, got, &head) == 0 &&
           head.kind == (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG));
 
+    CHECK(kvspaceXhNewScalar("int64", raw, 8, &value, &n) == 0);
+    CHECK(kvspaceShmSetValue(kv, "/vthread/1/[1]/[1,-1]", value,
+                             (int32_t)n, 1, 23) == 0);
+    CHECK(kvspaceShmMetaGetAt(kv, "/vthread/1/[1]/[1,-1]", &ro, &vid) == 0 &&
+          ro == 1 && vid == 23);
+    CHECK(kvspaceShmSet(kv, "/vthread/1/[1]/[1,-1]", value, (int32_t)n) == 0);
+    CHECK(kvspaceShmMetaGetAt(kv, "/vthread/1/[1]/[1,-1]", &ro, &vid) == 0 &&
+          ro == 0 && vid == 0);
+    CHECK(kvspaceShmSet(kv, "/vthread/1/[1]/[1,-1]/child", value,
+                        (int32_t)n) == 0);
+    CHECK(kvspaceShmDel(kv, "/vthread/1/[1]/[1,-1]") == 0);
+    CHECK(kvspaceShmSet(kv, "/vthread/1/[1]/[1,-1]", value, (int32_t)n) != 0);
+    free(value);
+
     uint8_t *body = NULL;
     CHECK(kvspaceShmWriteInPlace(kv, "/x", 0, 8, &body) == 0);
     body[0] = 43;

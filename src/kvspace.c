@@ -1491,10 +1491,8 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
 }
 
 /* 原始落盘（不处理容器/member 语义，供内部调用，避免递归）。 */
-static int shm_set_raw(kvspace_t *kv, const char *key, const uint8_t *val,
-                       int32_t val_len) {
-    art_hdr_t *old =
-        art_search(kv, kv->hdr->art_root, (const uint8_t *)key, (int)strlen(key));
+static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
+                         int32_t val_len, art_hdr_t *old) {
     if (old && old->has_value) {
         /* 同尺寸原地覆写：新值 ≤ 旧 box 容量时直接 memcpy，跳过 free+alloc，
            不改共享 buddy 树。容量读自共享 mmap，零进程内状态。 */
@@ -1512,6 +1510,13 @@ static int shm_set_raw(kvspace_t *kv, const char *key, const uint8_t *val,
     kv->hdr->art_root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)key,
                                 (int)strlen(key), 0, off);
     return 0;
+}
+
+static int shm_set_raw(kvspace_t *kv, const char *key, const uint8_t *val,
+                       int32_t val_len) {
+    art_hdr_t *old = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
+                                (int)strlen(key));
+    return shm_set_local(kv, key, val, val_len, old);
 }
 
 static int sync_metadata(kvspace_t *kv, const char *key, uint8_t ro, uint32_t vid) {
@@ -1594,33 +1599,29 @@ static int shm_set_validated(kvspace_t *kv, const char *key,
         return -1;
     strcpy(kbuf, key);
 
-    /* extindex 写保护：父是只读扩展层、本地无同名节点但扩展层有 → 禁止写（对齐
-     * durable backend.rs / fs）。以「父是否 extindex」为唯一首闸——非 extindex（如
-     * 全部 /lib 直写）父读一次即放行，不触碰整键查找，热路径开销与 redis 对齐。 */
-    {
+    art_hdr_t *local = art_search(kv, kv->hdr->art_root,
+                                   (const uint8_t *)kbuf, (int)strlen(kbuf));
+    /* Existing local values already shadow the extension. */
+    if (!local || !local->has_value) {
         char *pp = NULL, *nn = NULL;
         psplit(kbuf, &pp, &nn);
         char extpath[1024];
         if (pp && nn && dir_ext_path(kv, pp, extpath, sizeof extpath)) {
-            art_hdr_t *lh = art_search(kv, kv->hdr->art_root,
-                                       (const uint8_t *)kbuf, (int)strlen(kbuf));
-            if (!lh || !lh->has_value) {
-                char *tgt = pjoin(extpath, nn);
-                art_hdr_t *eh = art_search(kv, kv->hdr->art_root,
-                                           (const uint8_t *)tgt, (int)strlen(tgt));
-                free(tgt);
-                if (eh && eh->has_value && !frame_operand_ptr(kbuf, wire)) {
-                    free(pp);
-                    free(nn);
-                    return -1;
-                }
+            char *tgt = pjoin(extpath, nn);
+            art_hdr_t *eh = art_search(kv, kv->hdr->art_root,
+                                       (const uint8_t *)tgt, (int)strlen(tgt));
+            free(tgt);
+            if (eh && eh->has_value && !frame_operand_ptr(kbuf, wire)) {
+                free(pp);
+                free(nn);
+                return -1;
             }
         }
         free(pp);
         free(nn);
     }
 
-    if (shm_set_raw(kv, kbuf, val, val_len) != 0)
+    if (shm_set_local(kv, kbuf, val, val_len, local) != 0)
         return -1;
     return sync_metadata(kv, kbuf, ro, vid);
 }
