@@ -44,7 +44,7 @@ kindexpr XValue uses the headlenpow wire format:
 - Directory members come from physical key prefixes. `@ext` stores its locator in class 3.
 - `ro` and `vid` live at `/.kvspace-meta/<hex-encoded key>`.
 
-The codec accepts `None`, scalars, sized byte and character arrays, tensors, maps, and code values.
+The codec accepts `None`, scalars, sized uint8 and character arrays, tensors, maps, and code values.
 
 ## Tutorial
 
