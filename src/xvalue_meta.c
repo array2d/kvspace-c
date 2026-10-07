@@ -50,7 +50,7 @@ int kvspaceMetaDecode(const uint8_t *data, uint64_t len, uint8_t *ro, uint32_t *
     kvspaceXh h;
     if (kvspaceXhDecode(data, len, &h) != 0 || h.total != len ||
         h.kind != KVSPACE_XH_SLACK || h.a != 5 || h.b != 5 ||
-        h.langtype_len != 7 || memcmp(h.langtype, "[5]byte", 7) != 0 ||
+        h.langtype_len != 8 || memcmp(h.langtype, "[5]uint8", 8) != 0 ||
         h.body[0] > 1)
         return -1;
     *ro = h.body[0];

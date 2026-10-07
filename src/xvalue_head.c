@@ -76,7 +76,7 @@ static const struct {
     uint8_t width;
 } k_slack[] = {
     {"char/utf8", 0},
-    {"byte", 1},
+    {"uint8", 1},
     {"char/utf32", 4},
     {"char/ascii", 1},
 };

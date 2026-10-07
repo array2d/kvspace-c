@@ -99,7 +99,7 @@ static void test_slack(void) {
 
     CHECK(kvspaceXhNewSlack(KVSPACE_XH_BYTE, hi, 2, 2, &buf, &n) == 0, "byte");
     CHECK(kvspaceXhDecode(buf, n, &h) == 0, "byte dec");
-    CHECK(memcmp(h.langtype, "[2]byte", h.langtype_len) == 0, "byte lt");
+    CHECK(memcmp(h.langtype, "[2]uint8", h.langtype_len) == 0, "byte lt");
     buf[2] = 9;
     CHECK(kvspaceXhDecode(buf, n, &h) != 0, "len > cap");
     free(buf);
