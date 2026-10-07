@@ -1025,19 +1025,82 @@ static int keyscan_add_n(keyscan_t *scan, const char *key, size_t len) {
     return 0;
 }
 
-static int art_scan(kvspace_t *kv, int32_t nid, char *buf, int bpos, int bcap,
-                    const char *pfx, int plen, keyscan_t *scan) {
+/* Direct children end at '/' or U+00B7. */
+static int child_name_len(const char *rest, int restlen) {
+    for (int i = 0; i < restlen; i++) {
+        if (rest[i] == '/')
+            return i;
+        if (i + 1 < restlen && (unsigned char)rest[i] == 0xC2 &&
+            (unsigned char)rest[i + 1] == 0xB7)
+            return i;
+    }
+    return restlen;
+}
+
+/* Deleted values leave ART nodes behind. */
+static int art_has_live_value(kvspace_t *kv, int32_t nid) {
+    if (nid < 0)
+        return 0;
+    art_hdr_t *h = art_hdr(kv, nid);
+    if (!h)
+        return -1;
+    if (h->has_value)
+        return 1;
+    const int32_t *children;
+    int count = h->count;
+    switch (h->type) {
+    case ART_N4:
+        children = ((art_n4_t *)h)->children;
+        break;
+    case ART_N16:
+        children = ((art_n16_t *)h)->children;
+        break;
+    case ART_N48:
+        children = ((art_n48_t *)h)->children;
+        break;
+    case ART_N256:
+        children = ((art_n256_t *)h)->children;
+        count = 256;
+        break;
+    default:
+        return 0;
+    }
+    for (int i = 0; i < count; i++) {
+        int live = art_has_live_value(kv, children[i]);
+        if (live != 0)
+            return live;
+    }
+    return 0;
+}
+
+static int art_scan_children(kvspace_t *kv, int32_t nid, char *buf, int bpos, int bcap,
+                             int plen, keyscan_t *scan) {
     if (nid < 0)
         return 0;
     art_hdr_t *h = art_hdr(kv, nid);
     if (!h || h->prefix_len > bcap - bpos - 1)
         return -1;
+    /* Recheck the last parent byte for a split U+00B7. */
+    int start = bpos > plen + 1 ? bpos - plen - 2 : 0;
     for (int i = 0; i < h->prefix_len; i++)
         buf[bpos++] = h->prefix[i];
-    if (h->has_value) {
-        buf[bpos] = 0;
-        if (bpos >= plen && memcmp(buf, pfx, (size_t)plen) == 0 &&
-            keyscan_add_n(scan, buf, (size_t)bpos) != 0)
+    buf[bpos] = 0;
+    if (bpos > plen) {
+        const char *rest = buf + plen;
+        int restlen = bpos - plen;
+        int len = start + child_name_len(rest + start, restlen - start);
+        /* Stop at the child boundary. */
+        if (len < restlen) {
+            if (len == 0)
+                return 0;
+            int live = art_has_live_value(kv, nid);
+            if (live <= 0)
+                return live;
+            if (rest[len] == '/' && len + 1 == restlen && h->has_value)
+                len++;
+            return keyscan_add_n(scan, rest, (size_t)len);
+        }
+        if (h->has_value && keyscan_add_n(scan, rest, (size_t)len) != 0)
             return -1;
     }
     switch (h->type) {
@@ -1047,8 +1110,8 @@ static int art_scan(kvspace_t *kv, int32_t nid, char *buf, int bpos, int bcap,
             if (bpos + 1 >= bcap)
                 return -1;
             buf[bpos] = x->keys[i];
-            if (art_scan(kv, x->children[i], buf, bpos + 1, bcap,
-                         pfx, plen, scan) != 0)
+            if (art_scan_children(kv, x->children[i], buf, bpos + 1, bcap,
+                                  plen, scan) != 0)
                 return -1;
         }
         break;
@@ -1059,8 +1122,8 @@ static int art_scan(kvspace_t *kv, int32_t nid, char *buf, int bpos, int bcap,
             if (bpos + 1 >= bcap)
                 return -1;
             buf[bpos] = x->keys[i];
-            if (art_scan(kv, x->children[i], buf, bpos + 1, bcap,
-                         pfx, plen, scan) != 0)
+            if (art_scan_children(kv, x->children[i], buf, bpos + 1, bcap,
+                                  plen, scan) != 0)
                 return -1;
         }
         break;
@@ -1073,8 +1136,8 @@ static int art_scan(kvspace_t *kv, int32_t nid, char *buf, int bpos, int bcap,
             if (bpos + 1 >= bcap)
                 return -1;
             buf[bpos] = (uint8_t)i;
-            if (art_scan(kv, x->children[x->index[i]], buf, bpos + 1,
-                         bcap, pfx, plen, scan) != 0)
+            if (art_scan_children(kv, x->children[x->index[i]], buf, bpos + 1,
+                                  bcap, plen, scan) != 0)
                 return -1;
         }
         break;
@@ -1087,8 +1150,8 @@ static int art_scan(kvspace_t *kv, int32_t nid, char *buf, int bpos, int bcap,
             if (bpos + 1 >= bcap)
                 return -1;
             buf[bpos] = (uint8_t)i;
-            if (art_scan(kv, x->children[i], buf, bpos + 1, bcap,
-                         pfx, plen, scan) != 0)
+            if (art_scan_children(kv, x->children[i], buf, bpos + 1, bcap,
+                                  plen, scan) != 0)
                 return -1;
         }
         break;
@@ -1106,7 +1169,7 @@ static int art_scan_pfx(kvspace_t *kv, const char *pfx, int plen, char *buf,
                             plen, buf, bcap, &bpos);
     if (nid < 0)
         return 0;
-    return art_scan(kv, nid, buf, bpos, bcap, pfx, plen, scan);
+    return art_scan_children(kv, nid, buf, bpos, bcap, plen, scan);
 }
 
 /* ============ lifecycle ============ */
@@ -2018,18 +2081,6 @@ int kvspaceShmMkindex(kvspace_t *kv, const char *path, uint32_t capacity) {
     return r;
 }
 
-/* 提取直接成员名长度：到第一个 / 或 ·（U+00B7，2 字节）为止。 */
-static int child_name_len(const char *rest, int restlen) {
-    for (int i = 0; i < restlen; i++) {
-        if (rest[i] == '/')
-            return i;
-        if (i + 1 < restlen && (unsigned char)rest[i] == 0xC2 &&
-            (unsigned char)rest[i + 1] == 0xB7)
-            return i;
-    }
-    return restlen;
-}
-
 static int child_cmp(const void *a, const void *b) {
     const char *x = *(const char *const *)a;
     const char *y = *(const char *const *)b;
@@ -2047,25 +2098,6 @@ static int same_child(const char *a, const char *b) {
     if (na && a[na - 1] == '/') na--;
     if (nb && b[nb - 1] == '/') nb--;
     return na == nb && memcmp(a, b, na) == 0;
-}
-
-static int append_direct_children(keyscan_t *children, const keyscan_t *keys,
-                                  size_t prefix_len) {
-    for (int32_t i = 0; i < keys->count; i++) {
-        const char *key = keys->keys[i];
-        size_t key_len = strlen(key);
-        if (key_len <= prefix_len)
-            continue;
-        const char *rest = key + prefix_len;
-        int len = child_name_len(rest, (int)(key_len - prefix_len));
-        if (len <= 0)
-            continue;
-        if (rest[len] == '/' && (size_t)len + 1 == key_len - prefix_len)
-            len++;
-        if (keyscan_add_n(children, rest, (size_t)len) != 0)
-            return -1;
-    }
-    return 0;
 }
 
 int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
@@ -2086,14 +2118,11 @@ int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
     }
     if (reserved_meta_path(pfx))
         return 0;
-    keyscan_t keys = {0}, children = {0};
+    keyscan_t children = {0};
     char buf[4096];
     if (kv->hdr->art_root >= 0 &&
-        art_scan_pfx(kv, pfx, (int)strlen(pfx), buf, (int)sizeof buf, &keys) != 0)
+        art_scan_pfx(kv, pfx, (int)strlen(pfx), buf, (int)sizeof buf, &children) != 0)
         goto fail;
-    if (append_direct_children(&children, &keys, strlen(pfx)) != 0)
-        goto fail;
-    keyscan_free(&keys);
 
     if (ex) {
         char extpath[1024];
@@ -2104,10 +2133,8 @@ int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
         free(dir);
         if (has_ext) {
             if (art_scan_pfx(kv, extpath, (int)strlen(extpath), buf,
-                             (int)sizeof buf, &keys) != 0 ||
-                append_direct_children(&children, &keys, strlen(extpath)) != 0)
+                             (int)sizeof buf, &children) != 0)
                 goto fail;
-            keyscan_free(&keys);
         }
     }
     if (children.count > 1)
@@ -2137,7 +2164,6 @@ int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
     return 0;
 
 fail:
-    keyscan_free(&keys);
     keyscan_free(&children);
     return -1;
 }

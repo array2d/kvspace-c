@@ -23,8 +23,9 @@ static int failures = 0;
   } while (0)
 #define REQUIRE(cond, ...)                                                     \
   do {                                                                         \
-    CHECK(cond, __VA_ARGS__);                                                  \
-    if (!(cond))                                                               \
+    int require_ok = (cond);                                                   \
+    CHECK(require_ok, __VA_ARGS__);                                             \
+    if (!require_ok)                                                           \
       return;                                                                  \
   } while (0)
 
@@ -309,6 +310,103 @@ static void t_wide(const char *db) {
   kvspaceShmClose(kv);
 }
 
+static void expect_children(kvspace_t *kv, const char *prefix, bool ex,
+                            const char **expected, int32_t count) {
+  char **names = NULL;
+  int32_t n = 0;
+  REQUIRE(kvspaceShmList(kv, prefix, ex, 0, &names, &n) == 0,
+          "list %s", prefix);
+  CHECK(n == count, "%s count %d, expected %d", prefix, n, count);
+  for (int32_t i = 0; i < n && i < count; i++)
+    CHECK(strcmp(names[i], expected[i]) == 0, "%s child %d: %s != %s",
+          prefix, i, names[i], expected[i]);
+  list_free(names, n);
+  int32_t length = -1;
+  CHECK(kvspaceShmListLen(kv, prefix, ex, 0, &length) == 0 && length == count,
+        "%s ListLen %d, expected %d", prefix, length, count);
+}
+
+static void t_direct_children(const char *db) {
+  printf("[children] markers, tombstones, split UTF-8, fanout, extindex, reopen\n");
+  kvspace_t *kv = kvspaceShmOpen(db, SBO_DATA_SIZE);
+  REQUIRE(kv != NULL, "open children failed");
+  /* Split U+00B7 across a prefix and edge. */
+  CHECK(set_int32(kv, "/abc/name·field/value", 5) == 0, "split separator");
+  const char *utf8[] = {"name"};
+  expect_children(kv, "/abc/", false, utf8, 1);
+  CHECK(set_int32(kv, "/case/a", 1) == 0, "scalar child");
+  CHECK(set_int32(kv, "/case/ab", 2) == 0, "shared name prefix");
+  CHECK(kvspaceShmMkindex(kv, "/case/a/", 0) == 0, "directory marker");
+  CHECK(set_int32(kv, "/case/a/deep/value", 3) == 0, "nested child");
+  CHECK(set_int32(kv, "/case/a·field", 4) == 0, "attribute child");
+  const char *marked[] = {"a/", "ab"};
+  expect_children(kv, "/case/", false, marked, 2);
+  CHECK(kvspaceShmDel(kv, "/case/a/") == 0, "delete marker");
+  const char *unmarked[] = {"a", "ab"};
+  expect_children(kv, "/case/", false, unmarked, 2);
+
+  CHECK(set_int32(kv, "/中文/子项·属性/值", 6) == 0, "UTF-8 child");
+  const char *chinese[] = {"子项"};
+  expect_children(kv, "/中文/", false, chinese, 1);
+
+  CHECK(set_int32(kv, "/coords/[10]/x", 10) == 0, "coord 10");
+  CHECK(set_int32(kv, "/coords/[2]/x", 2) == 0, "coord 2");
+  CHECK(set_int32(kv, "/coords/[-1]/x", -1) == 0, "coord -1");
+  CHECK(kvspaceShmMkindex(kv, "/coords/[10]/", 0) == 0, "coord marker");
+  const char *coords[] = {"[-1]", "[2]", "[10]/"};
+  expect_children(kv, "/coords/", false, coords, 3);
+
+  CHECK(kvspaceShmMkindex(kv, "/remote/", 0) == 0, "remote index");
+  CHECK(kvspaceShmMkindex(kv, "/remote/a/", 0) == 0, "remote marker");
+  CHECK(set_int32(kv, "/remote/a/deep/value", 7) == 0, "remote child");
+  CHECK(set_int32(kv, "/remote/z/value", 8) == 0, "remote z");
+  CHECK(set_int32(kv, "/local/a/value", 9) == 0, "local child");
+  CHECK(kvspaceShmExtindex(kv, "/local/", "/remote/") == 0, "extend index");
+  const char *extended[] = {"a/", "z"};
+  expect_children(kv, "/local/", true, extended, 2);
+  const char *local[] = {"a"};
+  expect_children(kv, "/local/", false, local, 1);
+
+  /* Tombstones across all ART fanouts. */
+  for (int c = 1; c < 256; c++) {
+    if (c == '/' || c == 0xC2)
+      continue;
+    char key[32];
+    snprintf(key, sizeof key, "/dead/child/%c/value", c);
+    REQUIRE(set_int32(kv, key, c) == 0, "set fanout %d", c);
+    REQUIRE(kvspaceShmDel(kv, key) == 0, "delete fanout %d", c);
+  }
+  expect_children(kv, "/dead/", false, NULL, 0);
+  CHECK(set_int32(kv, "/dead/child/last/value", 11) == 0, "revive branch");
+  const char *alive[] = {"child"};
+  expect_children(kv, "/dead/", false, alive, 1);
+  CHECK(kvspaceShmDel(kv, "/dead/child/last/value") == 0, "delete revived branch");
+  expect_children(kv, "/dead/", false, NULL, 0);
+
+  for (int i = 0; i < 3000; i++) {
+    char key[64];
+    snprintf(key, sizeof key, "/many/child/deep/%04d/value", i);
+    REQUIRE(set_int32(kv, key, i) == 0, "set descendant %d", i);
+  }
+  expect_children(kv, "/many/", false, alive, 1);
+  for (int i = 0; i < 3000; i++) {
+    char key[64];
+    snprintf(key, sizeof key, "/many/child/deep/%04d/value", i);
+    REQUIRE(kvspaceShmDel(kv, key) == 0, "delete descendant %d", i);
+  }
+  expect_children(kv, "/many/", false, NULL, 0);
+  CHECK(kvspaceShmMkindex(kv, "/many/child/", 0) == 0, "marker on dead branch");
+  const char *marker_only[] = {"child/"};
+  expect_children(kv, "/many/", false, marker_only, 1);
+  kvspaceShmClose(kv);
+  kv = kvspaceShmOpen(db, SBO_DATA_SIZE);
+  REQUIRE(kv != NULL, "reopen children failed");
+  expect_children(kv, "/many/", false, marker_only, 1);
+  expect_children(kv, "/local/", true, extended, 2);
+  expect_children(kv, "/dead/", false, NULL, 0);
+  kvspaceShmClose(kv);
+}
+
 int main(int argc, char **argv) {
   char tmpl[] = "/tmp/kvspace-artscan-XXXXXX";
   const char *dir = argc > 1 ? argv[1] : mkdtemp(tmpl);
@@ -316,14 +414,16 @@ int main(int argc, char **argv) {
     perror("mkdtemp");
     return 2;
   }
-  char db[512], db2[512], db3[512];
+  char db[512], db2[512], db3[512], db4[512];
   snprintf(db, sizeof db, "%s/db", dir);
   snprintf(db2, sizeof db2, "%s/db2", dir);
   snprintf(db3, sizeof db3, "%s/db3", dir);
+  snprintf(db4, sizeof db4, "%s/db4", dir);
 
   t_correct(db);
   t_scale(db2);
   t_wide(db3);
+  t_direct_children(db4);
 
   if (argc <= 1) {
     char cmd[700];
