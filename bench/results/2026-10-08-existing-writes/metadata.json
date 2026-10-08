@@ -1,0 +1,67 @@
+{
+  "base_commit": "0e5660c37d5584fe774b1c75d71eca3777115671",
+  "reviewed_source_sha256": "6c6d6b93a5c5856616460280d0d8f63dad9539e68d5387ad769aaf2a758e73ab",
+  "reviewed_test_sha256": "a0d09b84e28a3569a064dcc452cb77cbb3cd726a475e5693645fe86ce956a59c",
+  "base_binary_sha256": "a6a8d894675173fc6c005bd29b45e857d0da16f4a40c50cd669f4e39416e91bf",
+  "candidate_binary_sha256": "dfa5fd3b3ef9a8393fb7bb142767e592c979276c23a2cf7ce65bc1dee5abf65a",
+  "cpu": 25,
+  "cpu_model": "Intel(R) Xeon(R) Gold 6418H",
+  "compiler": "GCC 14.3.0",
+  "c_flags": "-O3 -g -DNDEBUG",
+  "allocator": "slotsboxmalloc v0.1.5",
+  "blockmalloc": "v0.1.4",
+  "timing": "Setter loop only; keys formatted and update keys seeded before timing. Fresh store per run, alternating pair order. 128 MiB initial data.",
+  "value": "40-byte int64 XValue; ro=0; vid=0",
+  "results": {
+    "insert-long": {
+      "completed_pairs": 5,
+      "sets_per_run": 50000,
+      "median_ns": {
+        "base": 201867.628,
+        "candidate": 201485.718
+      },
+      "base_over_candidate": 1.0018954693354494,
+      "change_percent": -0.1891883328613786
+    },
+    "insert-short": {
+      "completed_pairs": 13,
+      "sets_per_run": 50000,
+      "median_ns": {
+        "base": 201249.918,
+        "candidate": 201783.548
+      },
+      "base_over_candidate": 0.9973554335559607,
+      "change_percent": 0.265157872014643
+    },
+    "update-128": {
+      "completed_pairs": 13,
+      "sets_per_run": 400000,
+      "median_ns": {
+        "base": 208.093,
+        "candidate": 166.941
+      },
+      "base_over_candidate": 1.2465062507113291,
+      "change_percent": -19.77577333211592
+    },
+    "update-one": {
+      "completed_pairs": 13,
+      "sets_per_run": 400000,
+      "median_ns": {
+        "base": 160.446,
+        "candidate": 112.875
+      },
+      "base_over_candidate": 1.4214485049833887,
+      "change_percent": -29.64922777757002
+    }
+  },
+  "measured_harness_sha256": "9c15c06a38044ac0a3591a2383b50782202160e84b5b74e2f860624ea5d2d8cd",
+  "published_harness_changes": "Formatting, argument/symbol validation and a generic temporary-directory prefix; timed loop unchanged.",
+  "excluded_unpaired_samples": [
+    {
+      "case": "insert-long",
+      "pair": 5,
+      "variant": "candidate",
+      "reason": "Run stopped after five complete pairs; no baseline partner."
+    }
+  ]
+}
