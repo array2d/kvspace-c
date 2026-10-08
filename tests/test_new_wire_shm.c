@@ -116,6 +116,24 @@ int main(void) {
     CHECK(stored && kvspaceXhDecode(stored, got, &head) == 0 && head.a == 3 &&
           head.b == 9 && got == 73 &&
           memcmp(head.body, utf8, sizeof utf8) == 0);
+    body[0] = 0xff;
+    CHECK(kvspaceShmGet(kv, "/text", 0, &got) == NULL);
+    CHECK(kvspaceShmGet(kv, "/text", 1, &got) == NULL);
+    body[0] = utf8[0];
+    CHECK(kvspaceShmGet(kv, "/text", 1, &got) != NULL);
+
+    uint8_t boolean = 1;
+    CHECK(kvspaceXhNewScalar("bool", &boolean, 1, &value, &n) == 0);
+    CHECK(kvspaceShmSet(kv, "/flag", value, (int32_t)n) == 0);
+    free(value);
+    stored = kvspaceShmGet(kv, "/flag", 0, &got);
+    CHECK(stored && kvspaceXhDecode(stored, got, &head) == 0);
+    uint8_t *flag_body = (uint8_t *)head.body;
+    flag_body[0] = 2;
+    CHECK(kvspaceShmGet(kv, "/flag", 0, &got) == NULL);
+    CHECK(kvspaceShmGet(kv, "/flag", 1, &got) == NULL);
+    flag_body[0] = 1;
+    CHECK(kvspaceShmGet(kv, "/flag", 1, &got) != NULL);
     kvspaceShmClose(kv);
     unlink(path);
     char extra[144];

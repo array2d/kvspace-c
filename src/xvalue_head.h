@@ -42,6 +42,8 @@ typedef struct kvspaceXh {
 
 /* 0 on success. -1 and *out cleared on failure. Bytes past total are ignored. */
 int kvspaceXhDecode(const uint8_t *data, uint64_t len, kvspaceXh *out);
+/* Borrow the head; validate payloads that need semantic checks. */
+int kvspaceXhView(const uint8_t *data, uint64_t len, kvspaceXh *out);
 
 int kvspaceXhNewNone(uint8_t **out, uint64_t *out_len);
 int kvspaceXhNewScalar(const char *langtype, const uint8_t *raw, uint32_t raw_len,

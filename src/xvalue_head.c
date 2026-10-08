@@ -473,7 +473,7 @@ int kvspaceXhReserve(uint8_t kind, const char *langtype, uint64_t body_len,
                 NULL, 0, reserve, out, out_len);
 }
 
-int kvspaceXhDecode(const uint8_t *data, uint64_t len, kvspaceXh *out) {
+static int xh_header(const uint8_t *data, uint64_t len, kvspaceXh *out) {
     if (!out)
         return -1;
     memset(out, 0, sizeof *out);
@@ -493,10 +493,6 @@ int kvspaceXhDecode(const uint8_t *data, uint64_t len, kvspaceXh *out) {
     uint32_t ltlen = 0;
     while (ltlen < region && lt[ltlen] != 0)
         ltlen++;
-    uint64_t type_chars = 0;
-    if (slack_count(0, lt, ltlen, &type_chars) != 0)
-        return -1;
-
     uint64_t content = 0;
     uint64_t cap = 0;
     if (kind == KVSPACE_XH_FIXED_SMALL) {
@@ -525,11 +521,6 @@ int kvspaceXhDecode(const uint8_t *data, uint64_t len, kvspaceXh *out) {
     } else if (kind == KVSPACE_XH_FIXED_LARGE) {
         if (pow != KVSPACE_XH_POW_TENSOR)
             return -1;
-        uint64_t numel = 0;
-        int width = 0;
-        if (parse_tensor(lt, ltlen, &numel, &width) != 0 || numel != a ||
-            (uint64_t)width != b)
-            return -1;
         if (b != 0 && a > UINT64_MAX / b)
             return -1;
         content = a * b;
@@ -542,24 +533,10 @@ int kvspaceXhDecode(const uint8_t *data, uint64_t len, kvspaceXh *out) {
     if (kind == KVSPACE_XH_FIXED_SMALL && type_eq(lt, ltlen, "bool") &&
         data[headlen] > 1)
         return -1;
-    if (kind == KVSPACE_XH_SLACK) {
-        if (type_eq(lt, ltlen, "rwir") || type_eq(lt, ltlen, "def langtype") ||
-            type_eq(lt, ltlen, "rwfunc")) {
-            if (pow != KVSPACE_XH_POW_SCALAR ||
-                (type_eq(lt, ltlen, "rwir") && content < 5) ||
-                (type_eq(lt, ltlen, "rwfunc") && content < 5))
-                return -1;
-        } else if (parse_slack(lt, ltlen, data + headlen, content) != 0) {
-            return -1;
-        }
-    } else if (kind == KVSPACE_XH_EXT ||
-               kind == (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG)) {
-        if (memchr(data + headlen, 0, (size_t)content))
-            return -1;
-        uint64_t path_chars = 0;
-        if (slack_count(0, data + headlen, content, &path_chars) != 0)
-            return -1;
-    }
+    if (kind == KVSPACE_XH_SLACK &&
+        ((type_eq(lt, ltlen, "rwir") && content < 5) ||
+         (type_eq(lt, ltlen, "rwfunc") && content < 5)))
+        return -1;
 
     out->pow = pow;
     out->kind = kind;
@@ -573,4 +550,62 @@ int kvspaceXhDecode(const uint8_t *data, uint64_t len, kvspaceXh *out) {
     out->headlen = headlen;
     out->total = (uint64_t)headlen + cap;
     return 0;
+}
+
+static int xh_validate(const kvspaceXh *view) {
+    uint64_t type_chars = 0;
+    if (slack_count(0, view->langtype, view->langtype_len, &type_chars) != 0)
+        return -1;
+    if (view->kind == KVSPACE_XH_SLACK) {
+        if (!type_eq(view->langtype, view->langtype_len, "rwir") &&
+            !type_eq(view->langtype, view->langtype_len, "def langtype") &&
+            !type_eq(view->langtype, view->langtype_len, "rwfunc") &&
+            parse_slack(view->langtype, view->langtype_len, view->body,
+                        view->content_len) != 0)
+            return -1;
+    } else if (view->kind == KVSPACE_XH_FIXED_LARGE) {
+        uint64_t numel = 0;
+        int width = 0;
+        if (parse_tensor(view->langtype, view->langtype_len, &numel, &width) != 0 ||
+            numel != view->a || (uint64_t)width != view->b)
+            return -1;
+    } else if (view->kind == KVSPACE_XH_EXT ||
+               view->kind == (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG)) {
+        if (memchr(view->body, 0, (size_t)view->content_len))
+            return -1;
+        uint64_t path_chars = 0;
+        if (slack_count(0, view->body, view->content_len, &path_chars) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+int kvspaceXhDecode(const uint8_t *data, uint64_t len, kvspaceXh *out) {
+    if (xh_header(data, len, out) != 0)
+        return -1;
+    if (xh_validate(out) == 0)
+        return 0;
+    memset(out, 0, sizeof *out);
+    return -1;
+}
+
+int kvspaceXhView(const uint8_t *data, uint64_t len, kvspaceXh *out) {
+    if (xh_header(data, len, out) != 0)
+        return -1;
+    const uint8_t *lt = out->langtype;
+    uint32_t n = out->langtype_len;
+    if (out->kind == KVSPACE_XH_FIXED_SMALL &&
+        (n == 0 || scalar_width(lt, n) >= 0 ||
+         type_eq(lt, n, "def rwir") || type_eq(lt, n, "time") ||
+         type_eq(lt, n, "duration") || type_eq(lt, n, "def struct") ||
+         type_eq(lt, n, "lib") || type_eq(lt, n, "rwfunc")))
+        return 0;
+    if (out->kind == KVSPACE_XH_SLACK &&
+        (type_eq(lt, n, "rwir") || type_eq(lt, n, "rwfunc") ||
+         type_eq(lt, n, "def langtype")))
+        return 0;
+    if (xh_validate(out) == 0)
+        return 0;
+    memset(out, 0, sizeof *out);
+    return -1;
 }
