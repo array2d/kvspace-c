@@ -7,3 +7,6 @@ __pycache__/
 
 # Rust 构建产物
 rust/target/
+
+# OMC 状态目录
+.omc/
