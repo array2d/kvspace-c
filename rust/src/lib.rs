@@ -51,152 +51,151 @@ mod ffi {
             path: *const c_char,
             extpath: *const c_char,
         ) -> i32;
+        // Codec (kvspace ABI, no handle) — the single source of wire truth.
+        pub fn kvspaceTlvEncodeMode(
+            kind: *const c_char,
+            raw: *const u8,
+            raw_len: u32,
+            dims: *const i32,
+            ndim: i32,
+            r#ref: i32,
+            ro: u8,
+            vid: u32,
+            out: *mut *mut u8,
+            out_len: *mut u32,
+        ) -> i32;
+        pub fn kvspaceDecodeHead(data: *const u8, data_len: u32, out: *mut kvspaceHead_t) -> i32;
+        // Codec output is frontend malloc; release it with libc free.
+        pub fn free(p: *mut std::ffi::c_void);
+    }
+
+    #[repr(C)]
+    pub struct kvspaceHead_t {
+        pub headlen: u16,
+        pub r#ref: u8,
+        pub storetype: u8,
+        pub ro: u8,
+        pub vid: u32,
+        pub body_len: i32,
+        pub ndim: i32,
+        pub dims: [i32; 8],
+        pub langtype: [u8; 256],
+        pub langtype_len: i32,
+        pub body_offset: i32,
+        pub body_cap: u64,
     }
 }
 
 // ── xvalue TLV helpers ──────────────────────────────────────
+//
+// 编解码一律委托权威 C codec（kvspaceTlvEncodeMode / kvspaceDecodeHead），
+// 本地不再复刻 wire 布局。wire：[pow:u8][flags:u8][a:u64le][b:u64le][langtype][padding][body]，
+// headlen = 1 << pow，flags 低 2 位为 storage class、bit2 为指针位。
 
 pub mod xvalue {
-    /// Encode 三正交轴 head：[headlen u16][ref u8][storetype u8][ro u8][vid u32][body_len u32]
-    ///   [物理字段（store_has_dims 时 ndim u8 + dims[ndim] u32）][langtype（占至 headlen）] + raw
-    /// 入参 kindexpr 允许带 `*`/`@` 前缀（测试便利）：前缀升格为 ref、langtype 不再落前缀。
-    fn store_has_dims(st: u8) -> bool {
-        st == 2 || st == 3 || st == 4
-    }
+    use super::ffi;
+    use super::*;
 
-    /// 由 base 种类名（含 [dims]，无前缀）推 storetype。
-    fn storetype_of(kx: &str) -> u8 {
-        if kx.is_empty() {
-            return 0;
-        } // NONE
-        let base = kx_base(kx);
-        if base == "extindex" {
-            return 4;
-        } // EXTINDEX
-        if base == "index"
-            || base == "rwfunc"
-            || base == "defrwir"
-            || base.starts_with('/')
-            || base.contains('·')
-        {
-            return 3;
-        } // INDEX
-        if kx.starts_with('[') {
-            return 2;
-        } // ARRAYND
-        1 // ATOM
-    }
+    /// langtype 起于固定前缀偏移（KVSPACE_XH_PREFIX）。
+    const XH_PREFIX: usize = 18;
+    /// 存储位置：与 KVSPACE_REF_* 对齐。
+    pub const REF_INLINE: i32 = 0;
+    pub const REF_PTR: i32 = 1;
+    pub const REF_EXT: i32 = 2;
 
-    fn parse_dims(kx: &str) -> Vec<i32> {
-        if kx.starts_with('[') {
-            let end = kx.find(']').unwrap_or(kx.len());
-            kx[1..end]
-                .split(',')
-                .filter_map(|s| s.parse().ok())
-                .collect()
-        } else {
-            Vec::new()
+    /// 编码 XValue head+body：绑定 C codec `kvspaceTlvEncodeMode`。
+    /// dims 落形状（tensor），ref 选存储位置（inline/ptr/ext）。
+    fn tlv_encode(kind: &str, raw: &[u8], dims: &[i32], r#ref: i32) -> Vec<u8> {
+        let ckind = CString::new(kind).expect("kind 含 NUL");
+        let rp = if raw.is_empty() { ptr::null() } else { raw.as_ptr() };
+        let dp = if dims.is_empty() { ptr::null() } else { dims.as_ptr() };
+        let mut out: *mut u8 = ptr::null_mut();
+        let mut len: u32 = 0;
+        let rc = unsafe {
+            ffi::kvspaceTlvEncodeMode(
+                ckind.as_ptr(),
+                rp,
+                raw.len() as u32,
+                dp,
+                dims.len() as i32,
+                r#ref,
+                0,
+                0,
+                &mut out,
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Vec::new();
         }
+        let bytes = unsafe { std::slice::from_raw_parts(out, len as usize).to_vec() };
+        unsafe { ffi::free(out as *mut std::ffi::c_void) };
+        bytes
     }
 
-    fn encode(kindexpr: &str, raw: &[u8]) -> Vec<u8> {
-        let (reff, kx) = if let Some(r) = kindexpr.strip_prefix('*') {
-            (1u8, r)
-        } else if let Some(r) = kindexpr.strip_prefix('@') {
-            (2u8, r)
-        } else {
-            (0u8, kindexpr)
-        };
-        let st = storetype_of(kx);
-        // ptr 物理字段恒空（ndim=0）；ARRAYND 从 langtype 的 [dims] 落物理字段。
-        let dims: Vec<i32> = if reff == 1 || st != 2 {
-            Vec::new()
-        } else {
-            parse_dims(kx)
-        };
-        let lt = kx.as_bytes();
-        let phys = if store_has_dims(st) {
-            1 + 4 * dims.len()
-        } else {
-            0
-        };
-        let headlen = 13 + phys + lt.len();
-        let mut buf = Vec::with_capacity(headlen + raw.len());
-        buf.extend_from_slice(&(headlen as u16).to_le_bytes());
-        buf.push(reff);
-        buf.push(st);
-        buf.push(0); // ro
-        buf.extend_from_slice(&0u32.to_le_bytes()); // vid
-        buf.extend_from_slice(&(raw.len() as u32).to_le_bytes());
-        if store_has_dims(st) {
-            buf.push(dims.len() as u8);
-            for d in &dims {
-                buf.extend_from_slice(&(*d as u32).to_le_bytes());
+    /// 剥掉纯数字 `[dims]` 段取 base kind；含 `·` 的 map langtype 整串即基 kind（不剥）。
+    fn kx_base(kx: &str) -> &str {
+        if kx.contains('·') {
+            return kx;
+        }
+        if let Some(rest) = kx.strip_prefix('[') {
+            if let Some(end) = rest.find(']') {
+                let inner = &kx[1..end + 1];
+                if inner.split(',').all(|d| d.is_empty() || d.parse::<i32>().is_ok()) {
+                    return &kx[end + 2..];
+                }
             }
         }
-        buf.extend_from_slice(lt);
-        buf.extend_from_slice(raw);
-        buf
+        kx
     }
 
-    /// 剥掉 kindexpr 的 dims 段取 base kind。
-    fn kx_base(kx: &str) -> &str {
-        if kx.starts_with('[') {
-            let end = kx.find(']').map(|e| e + 1).unwrap_or(0);
-            &kx[end..]
-        } else {
-            kx
-        }
+    pub fn int64(v: i64) -> Vec<u8> {
+        tlv_encode("int64", &v.to_le_bytes(), &[], REF_INLINE)
+    }
+    pub fn float64(v: f64) -> Vec<u8> {
+        tlv_encode("float64", &v.to_le_bytes(), &[], REF_INLINE)
+    }
+    pub fn string(s: &str) -> Vec<u8> {
+        tlv_encode("char/utf8", s.as_bytes(), &[], REF_INLINE)
+    }
+    /// 目录值。旧 `index` 值类型已由「值/索引分离」移除，现行目录值 kind 为 `lib`。
+    pub fn index() -> Vec<u8> {
+        tlv_encode("lib", &[], &[], REF_INLINE)
+    }
+    /// 指针值（ptr 位）：body = 目标 key，langtype = 目标 kindexpr。
+    pub fn link(target: &str) -> Vec<u8> {
+        tlv_encode("lib", target.as_bytes(), &[], REF_PTR)
+    }
+    /// 外部定位符（EXT class）：body = locator，langtype = 目标 kindexpr。
+    pub fn ext(locator: &str) -> Vec<u8> {
+        tlv_encode("lib", locator.as_bytes(), &[], REF_EXT)
     }
 
-    /// Decode head → (kind, array_len, raw)
+    /// 解码 head → (kind, array_len, raw)：绑定 C codec `kvspaceDecodeHead`，借用 data。
     pub fn decode(data: &[u8]) -> (&str, i32, &[u8]) {
-        if data.len() < 13 {
+        if data.is_empty() {
             return ("", 0, &[]);
         }
-        let headlen = u16::from_le_bytes(data[0..2].try_into().unwrap()) as usize;
-        let st = data[3];
-        let body_len = u32::from_le_bytes(data[9..13].try_into().unwrap()) as usize;
-        let mut o = 13;
-        let mut dims: Vec<i32> = Vec::new();
-        if store_has_dims(st) {
-            let ndim = data[o] as usize;
-            o += 1;
-            for _ in 0..ndim {
-                dims.push(i32::from_le_bytes(data[o..o + 4].try_into().unwrap()));
-                o += 4;
-            }
+        let mut h: ffi::kvspaceHead_t = unsafe { std::mem::zeroed() };
+        if unsafe { ffi::kvspaceDecodeHead(data.as_ptr(), data.len() as u32, &mut h) } != 0 {
+            return ("", 0, &[]);
         }
-        let langtype = std::str::from_utf8(&data[o..headlen]).unwrap_or("");
-        let raw = &data[headlen..headlen + body_len];
+        let lt_end = XH_PREFIX + h.langtype_len.max(0) as usize;
+        let langtype = data
+            .get(XH_PREFIX..lt_end)
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or("");
         let kind = kx_base(langtype);
-        let al: i32 = if dims.is_empty() {
+        let dims = &h.dims[..h.ndim.clamp(0, 8) as usize];
+        let array_len: i32 = if dims.is_empty() {
             1
         } else {
             dims.iter().product()
         };
-        (kind, al, raw)
-    }
-
-    pub fn int64(v: i64) -> Vec<u8> {
-        encode("int64", &v.to_le_bytes())
-    }
-    pub fn float64(v: f64) -> Vec<u8> {
-        encode("float64", &v.to_le_bytes())
-    }
-    pub fn string(s: &str) -> Vec<u8> {
-        encode(&format!("[{}]char/utf8", s.len()), s.as_bytes())
-    }
-    pub fn index() -> Vec<u8> {
-        encode("index", &0u32.to_le_bytes())
-    }
-    pub fn link(target: &str) -> Vec<u8> {
-        encode("*index", target.as_bytes())
-    }
-    pub fn ext(extpath: &str) -> Vec<u8> {
-        let mut raw = 0u32.to_le_bytes().to_vec();
-        raw.extend_from_slice(format!("…{}", extpath).as_bytes());
-        encode("extindex", &raw)
+        let off = h.body_offset.max(0) as usize;
+        let blen = h.body_len.max(0) as usize;
+        let raw = data.get(off..off + blen).unwrap_or(&[]);
+        (kind, array_len, raw)
     }
 
     pub fn kind(data: &[u8]) -> String {
