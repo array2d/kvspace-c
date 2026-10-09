@@ -10,3 +10,6 @@ rust/target/
 
 # OMC 状态目录
 .omc/
+
+# CodeGraph 索引（本地知识图，不入库）
+.codegraph/
