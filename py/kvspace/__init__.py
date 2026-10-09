@@ -2,13 +2,14 @@
 kvspace-c Python wrapper — ctypes FFI over libkvspace-c.so
 """
 
-import ctypes, os, struct
+import ctypes, os, struct, sys
 from pathlib import Path
 from typing import Optional
 
 _SO = os.environ.get("KVSPACE_C_SO")
 if not _SO:
-    _SO = str(Path(__file__).parent.parent.parent / "build" / "libkvspace-c.so")
+    _ext = ".dylib" if sys.platform == "darwin" else ".so"
+    _SO = str(Path(__file__).resolve().parent.parent.parent / "build" / f"libkvspace-c{_ext}")
 _lib = ctypes.CDLL(_SO)
 
 
