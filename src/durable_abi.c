@@ -88,12 +88,7 @@ int kvspaceGet(void *h, const char *key, int resolve, uint8_t **out,
     return 0;
 }
 
-int kvspaceSetValue(void *h, const char *key, const uint8_t *value,
-                    uint32_t value_len, uint8_t ro, uint32_t vid,
-                    char *err, uint32_t err_cap) {
-    int rc = value_len > INT32_MAX ? -2 :
-             kvspaceShmSetValue((kvspace_t *)h, key, value,
-                                (int32_t)value_len, ro, vid);
+static int set_value_result(int rc, const char *key, char *err, uint32_t err_cap) {
     if (rc == -2) {
         if (err && err_cap)
             snprintf(err, err_cap, "invalid XValue");
@@ -105,6 +100,15 @@ int kvspaceSetValue(void *h, const char *key, const uint8_t *value,
         return 1;
     }
     return 0;
+}
+
+int kvspaceSetValue(void *h, const char *key, const uint8_t *value,
+                    uint32_t value_len, uint8_t ro, uint32_t vid,
+                    char *err, uint32_t err_cap) {
+    int rc = value_len > INT32_MAX ? -2 :
+             kvspaceShmSetValue((kvspace_t *)h, key, value,
+                                (int32_t)value_len, ro, vid);
+    return set_value_result(rc, key, err, err_cap);
 }
 
 int kvspaceResolveRef(void *h, const char *key, kvspaceRef_t *ref) {
@@ -123,6 +127,14 @@ int kvspaceGetByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
     *out = d;
     *out_len = (uint32_t)len;
     return 0;
+}
+
+int kvspaceSetValueByRef(void *h, kvspaceRef_t *ref, const char *key,
+                         const uint8_t *value, uint32_t value_len,
+                         uint8_t ro, uint32_t vid, char *err, uint32_t err_cap) {
+    int rc = value_len > INT32_MAX ? -2 :
+             kvspaceShmSetValueByRef(h, ref, key, value, (int32_t)value_len, ro, vid);
+    return set_value_result(rc, key, err, err_cap);
 }
 
 int kvspaceSetPartByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,

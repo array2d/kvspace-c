@@ -54,6 +54,9 @@ int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
                   int32_t val_len);
 int kvspaceShmSetValue(kvspace_t *kv, const char *key, const uint8_t *val,
                        int32_t val_len, uint8_t ro, uint32_t vid);
+int kvspaceShmSetValueByRef(kvspace_t *kv, kvspaceRef_t *ref, const char *key,
+                            const uint8_t *val, int32_t val_len,
+                            uint8_t ro, uint32_t vid);
 
 // 零拷贝写原语——返回 SHM 常驻 body 偏移指针供调用方直接写；写即持久，无收尾。
 // WriteInPlace: key 必须已存在、body_len 必须等于原 body_len（同 kind

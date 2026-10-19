@@ -1516,8 +1516,9 @@ uint8_t *kvspaceShmGetByRef(kvspace_t *kv, kvspaceRef_t *ref,
     if (!key_fallback)
         return NULL;
     uint8_t *raw = kvspaceShmGet(kv, key_fallback, 0, ol);
-    if (raw)
-        kvspaceShmResolveRef(kv, key_fallback, ref);
+    kvspaceRef_t refreshed;
+    if (raw && kvspaceShmResolveRef(kv, key_fallback, &refreshed) == 0)
+        *ref = refreshed;
     return raw;
 }
 
@@ -1540,7 +1541,9 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
         if (!d || offset + buf_len > (uint32_t)rl)
             return -1;
         memcpy(d + offset, buf, buf_len);
-        kvspaceShmResolveRef(kv, key_fallback, ref);
+        kvspaceRef_t refreshed;
+        if (kvspaceShmResolveRef(kv, key_fallback, &refreshed) == 0)
+            *ref = refreshed;
         return 0;
     }
     uint8_t *raw;
@@ -1707,6 +1710,31 @@ int kvspaceShmSetValue(kvspace_t *kv, const char *key, const uint8_t *val,
         head.total != (uint64_t)val_len)
         return -2;
     return shm_set_validated(kv, key, val, val_len, &head, ro, vid);
+}
+
+int kvspaceShmSetValueByRef(kvspace_t *kv, kvspaceRef_t *ref, const char *key,
+                            const uint8_t *val, int32_t val_len,
+                            uint8_t ro, uint32_t vid) {
+    kvspaceXh wire;
+    if (!kv || !ref || !key || !val || val_len <= 0 ||
+        kvspaceXhDecode(val, (uint64_t)val_len, &wire) != 0 ||
+        wire.total != (uint64_t)val_len)
+        return -2;
+    if (kv_sync(kv) != 0 || strlen(key) >= 1024 || strstr(key, "//") ||
+        reserved_meta_path(key))
+        return -1;
+    int32_t id = ref->gen == 0 ? ref_leaf(kv, ref, key) : -1;
+    art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
+    if (h && h->has_value) {
+        if (shm_set_local(kv, key, val, val_len, h) != 0)
+            return -1;
+        return sync_metadata(kv, key, ro, vid);
+    }
+    int rc = shm_set_validated(kv, key, val, val_len, &wire, ro, vid);
+    kvspaceRef_t refreshed;
+    if (rc == 0 && kvspaceShmResolveRef(kv, key, &refreshed) == 0)
+        *ref = refreshed;
+    return rc;
 }
 
 int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
