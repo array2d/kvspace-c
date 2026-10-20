@@ -107,6 +107,27 @@ int kvspaceSetValue(void *h, const char *key, const uint8_t *value,
     return 0;
 }
 
+int kvspaceSetValueByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
+                         const uint8_t *value, uint32_t value_len, uint8_t ro,
+                         uint32_t vid, char *err, uint32_t err_cap) {
+    int rc = value_len > INT32_MAX
+                 ? -2
+                 : kvspaceShmSetValueByRef((kvspace_t *)h, ref, key_fallback,
+                                           value, (int32_t)value_len, ro, vid);
+    if (rc == -2) {
+        if (err && err_cap)
+            snprintf(err, err_cap, "invalid XValue");
+        return 1;
+    }
+    if (rc != 0) {
+        if (err && err_cap)
+            snprintf(err, err_cap, "kvspace: set-value-by-ref failed at %s",
+                     key_fallback ? key_fallback : "");
+        return 1;
+    }
+    return 0;
+}
+
 int kvspaceResolveRef(void *h, const char *key, kvspaceRef_t *ref) {
     return kvspaceShmResolveRef((kvspace_t *)h, key, ref);
 }
