@@ -1717,6 +1717,33 @@ int kvspaceShmSetValue(kvspace_t *kv, const char *key, const uint8_t *val,
     return shm_set_validated(kv, key, val, val_len, &head, ro, vid);
 }
 
+int kvspaceShmSetValueByRef(kvspace_t *kv, kvspaceRef_t *ref,
+                            const char *key_fallback, const uint8_t *val,
+                            int32_t val_len, uint8_t ro, uint32_t vid) {
+    kvspaceXh head;
+    if (!kv || !ref || !key_fallback || !val || val_len <= 0 ||
+        kvspaceXhDecode(val, (uint64_t)val_len, &head) != 0 ||
+        head.total != (uint64_t)val_len)
+        return -2;
+    if (kv_sync(kv) != 0)
+        return -1;
+    if (strlen(key_fallback) >= 1024 || strstr(key_fallback, "//") ||
+        reserved_meta_path(key_fallback))
+        return -1;
+    int32_t id = ref_leaf(kv, ref, key_fallback);
+    art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
+    if (h && h->has_value) {
+        if (shm_set_local(kv, key_fallback, val, val_len, h) != 0)
+            return -1;
+        return sync_metadata(kv, key_fallback, ro, vid);
+    }
+    /* ref 过期或尚无值：退回完整按 key 写（含 extindex 检查），成功后重解析。 */
+    int rc = shm_set_validated(kv, key_fallback, val, val_len, &head, ro, vid);
+    if (rc == 0)
+        kvspaceShmResolveRef(kv, key_fallback, ref);
+    return rc;
+}
+
 int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
                            int32_t body_len, uint8_t **body) {
     if (!kv || !key || !body || body_len < 0 || reserved_meta_path(key))
