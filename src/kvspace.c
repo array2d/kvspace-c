@@ -7,6 +7,7 @@
  * blockmalloc 必须先于 slotsboxmalloc（后者在其实现体里调用前者）。 */
 #define BLOCKMALLOC_IMPLEMENTATION
 #include <blockmalloc/blockmalloc.h>
+#define SBO_MIN_SHARD_BYTES (1ULL << 40)
 #define SLOTSBOXMALLOC_IMPLEMENTATION
 #include "slotsboxmalloc/slotsboxobj.h"
 #include "kvspace_shm.h"
@@ -109,17 +110,17 @@ _Static_assert(
 #define SBO_HEAD_FIXED                                                         \
     (sizeof(sbo_meta_t) + sizeof(blocks_meta_t) + sizeof(sbo_lock_t))
 static blocks_meta_t *sbo_pool(sbo_meta_t *m) {
-    return (blocks_meta_t *)(m + 1);
+    return sbo_pool_meta(m, 0);
 }
 static sbo_lock_t *sbo_plock(sbo_meta_t *m) {
-    return (sbo_lock_t *)(sbo_pool(m) + 1);
+    return sbo_pool_lock(m, 0);
 }
 static uint8_t *sbo_pmem(sbo_meta_t *m) {
-    return (uint8_t *)(sbo_plock(m) + 1);
+    return sbo_pool_mem(m, 0);
 }
 static sbo_box_t *sbo_box(sbo_meta_t *m, int32_t id) {
     return (sbo_box_t *)(sbo_pmem(m) + (size_t)id * m->block_stride +
-                         m->sizeof_block_head);
+                         m->box_off);
 }
 
 typedef struct {
@@ -229,15 +230,15 @@ static int sbo_head_grow(kvspace_t *kv) {
     if (want > cap)
         want = cap;
     if (SBO_HEAD_FIXED + want > kv->r_head.reserve)
-        want = kv->r_head.reserve - SBO_HEAD_FIXED;
+        want = (kv->r_head.reserve - SBO_HEAD_FIXED) & ~(uint64_t)7;
     if (want <= cur ||
         ftruncate(kv->r_head.fd, (off_t)(SBO_HEAD_FIXED + want)) != 0 ||
         region_map(&kv->r_head, SBO_HEAD_FIXED + (size_t)want) != 0)
         return -1;
     p->total_size = want;
     m->per_slot_meta = want;
-    m->head_size = SBO_HEAD_FIXED + want;
-    kv->hdr->sbo_head_size = m->head_size;
+    m->max_blocks = (uint32_t)(want / m->block_stride);
+    kv->hdr->sbo_head_size = SBO_HEAD_FIXED + want;
     return 0;
 }
 
@@ -259,25 +260,32 @@ static int sbo_data_grow(kvspace_t *kv) {
     sbo_box_t *root = sbo_box(m, 0), *b = sbo_box(m, (int32_t)nid);
     memcpy(b, root, sizeof *b);
     b->parent = 0;
-    for (int i = 0; i < SBO_N; i++)
-        if (root->slots[i].state == SBO_BOX)
-            sbo_box(m, root->children[i])->parent = (int32_t)nid;
-    uint8_t lvl = (uint8_t)(root->objlevel + 1);
-    root->objlevel = lvl;
-    root->box_boundary = 1;
-    root->obj_boundary = SBO_N - 1;
-    memset(root->free_bitmap, 0xFF, SBO_BITMAP_B);
-    root->free_bitmap[0] &= 0xFE;
-    for (int i = 0; i < SBO_N; i++) {
-        root->slots[i].state = SBO_FREE;
-        root->children[i] = -1;
+    b->parent_slot = 0;
+    b->self_id = (int32_t)nid;
+    uint64_t mm = root->child_mask;
+    while (mm) {
+        int i = __builtin_ctzll(mm);
+        mm &= mm - 1;
+        sbo_box(m, root->children[i])->parent = (int32_t)nid;
     }
-    root->slots[0].state = SBO_BOX;
+    sbo_lock_t *lk = sbo_plock(m);
+    uint8_t old_lvl = b->objlevel;
+    if (old_lvl >= 1 && old_lvl <= 3 && lk->hot_id1[old_lvl - 1] == 1)
+        lk->hot_id1[old_lvl - 1] = (uint32_t)nid + 1;
+    uint8_t lvl = (uint8_t)(old_lvl + 1);
+    sbo_box_format(root, lvl, -1, 255, 0);
+    root->free_mask = ~1ULL;
+    root->child_mask = 1ULL;
+    root->states[0] = SBO_BOX;
     root->children[0] = (int32_t)nid;
-    root->max_obj_cap = SBO_N - 1;
-    root->child_max_cap = (sbo_usage_t){(uint8_t)(lvl + 1), 1};
+    uint16_t b_comb = sbo_combined(b);
+    root->child_cap[0] = b_comb;
+    root->child_max_enc = b_comb;
+    root->child_max_count = 1;
+    root->max_obj_cap = SBO_MULT_MAX;
+    root->hint_child = 0;
     m->data_size = want;
-    m->slot_bytes = want;
+    m->slot_shift = (uint8_t)__builtin_ctzll(want);
     kv->hdr->sbo_data_size = want;
     return 0;
 }

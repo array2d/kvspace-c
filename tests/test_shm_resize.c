@@ -309,16 +309,17 @@ static void t_bad_root_slots(const char *dir) {
   kvspace_t *kv = kvspaceShmOpen(db, DATA_2MB);
   REQUIRE(kv != NULL, "open failed");
   kvspaceShmClose(kv);
-  /* sbo_meta_t: magic[16] head_size data_size slot_bytes per_slot_meta -> 48 */
+  /* sbo_meta_t (v3): magic[16] data_size(8) per_slot_meta(8) next_shard(4)
+     block_stride(2) -> root_slots at byte 38 */
   int fd = open(head, O_RDWR);
   REQUIRE(fd >= 0, "open head");
   uint8_t one = 0;
-  REQUIRE(pread(fd, &one, 1, 48) == 1 && one == 1, "root_slots byte is %u",
+  REQUIRE(pread(fd, &one, 1, 38) == 1 && one == 1, "root_slots byte is %u",
           one);
   uint8_t two = 2;
-  CHECK(pwrite(fd, &two, 1, 48) == 1, "pwrite");
+  CHECK(pwrite(fd, &two, 1, 38) == 1, "pwrite");
   CHECK(kvspaceShmOpen(db, DATA_2MB) == NULL, "root_slots=2 accepted");
-  CHECK(pwrite(fd, &one, 1, 48) == 1, "restore");
+  CHECK(pwrite(fd, &one, 1, 38) == 1, "restore");
   close(fd);
   kv = kvspaceShmOpen(db, DATA_2MB);
   CHECK(kv != NULL, "reopen after restore");
