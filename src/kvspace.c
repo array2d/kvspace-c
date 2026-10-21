@@ -1589,27 +1589,31 @@ static int shm_set_raw(kvspace_t *kv, const char *key, const uint8_t *val,
     return shm_set_local(kv, key, val, val_len, old);
 }
 
+/* 键上限 1024 → meta key 最长 15 + 2*1023 + 1。 */
+#define META_KEY_MAX (16 + 2 * 1024)
+
 static int sync_metadata(kvspace_t *kv, const char *key, uint8_t ro, uint32_t vid) {
-    char *meta = NULL;
-    if (kvspaceMetaKey(key, &meta) != 0)
+    char meta[META_KEY_MAX];
+    if (kvspaceMetaKeyInto(key, meta, sizeof meta) != 0)
         return -1;
-    int rc = 0;
     if (ro || vid) {
         uint8_t *value = NULL;
         uint64_t len = 0;
         if (kvspaceMetaEncode(ro, vid, &value, &len) != 0)
-            rc = -1;
-        else
-            rc = shm_set_raw(kv, meta, value, (int32_t)len);
+            return -1;
+        int rc = shm_set_raw(kv, meta, value, (int32_t)len);
         free(value);
-    } else {
-        bool removed = false;
-        kv->hdr->art_root = art_del(kv, kv->hdr->art_root,
-                                    (const uint8_t *)meta, (int)strlen(meta),
-                                    0, &removed);
+        return rc;
     }
-    free(meta);
-    return rc;
+    /* ro=0/vid=0 是普通写的常态：没有 meta 就不必进 ART 删除。 */
+    if (!art_search(kv, kv->hdr->art_root, (const uint8_t *)meta,
+                    (int)strlen(meta)))
+        return 0;
+    bool removed = false;
+    kv->hdr->art_root = art_del(kv, kv->hdr->art_root,
+                                (const uint8_t *)meta, (int)strlen(meta), 0,
+                                &removed);
+    return 0;
 }
 
 int kvspaceShmMetaGetAt(kvspace_t *kv, const char *key, uint8_t *ro,
