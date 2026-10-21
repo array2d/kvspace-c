@@ -4,29 +4,42 @@
 #include <stdlib.h>
 #include <string.h>
 
-int kvspaceMetaKey(const char *key, char **out) {
+int kvspaceMetaKeyInto(const char *key, char *buf, size_t cap) {
     static const char prefix[] = "/.kvspace-meta/";
     static const char hex[] = "0123456789abcdef";
-    if (!out)
-        return -1;
-    *out = NULL;
-    if (!key || key[0] != '/' ||
+    if (!key || !buf || key[0] != '/' ||
         (strncmp(key, prefix, sizeof prefix - 2) == 0 &&
          (key[sizeof prefix - 2] == '/' || key[sizeof prefix - 2] == 0)))
         return -1;
     size_t len = strlen(key);
-    if (len > (SIZE_MAX - sizeof prefix) / 2)
+    if (len > (SIZE_MAX - sizeof prefix) / 2 || sizeof prefix + 2 * len > cap)
         return -1;
-    char *p = malloc(sizeof prefix + len * 2);
-    if (!p)
-        return -1;
-    memcpy(p, prefix, sizeof prefix - 1);
+    memcpy(buf, prefix, sizeof prefix - 1);
     for (size_t i = 0; i < len; i++) {
         unsigned char b = (unsigned char)key[i];
-        p[sizeof prefix - 1 + 2 * i] = hex[b >> 4];
-        p[sizeof prefix + 2 * i] = hex[b & 15];
+        buf[sizeof prefix - 1 + 2 * i] = hex[b >> 4];
+        buf[sizeof prefix + 2 * i] = hex[b & 15];
     }
-    p[sizeof prefix - 1 + 2 * len] = 0;
+    buf[sizeof prefix - 1 + 2 * len] = 0;
+    return 0;
+}
+
+int kvspaceMetaKey(const char *key, char **out) {
+    if (!out)
+        return -1;
+    *out = NULL;
+    if (!key)
+        return -1;
+    size_t len = strlen(key);
+    if (len > (SIZE_MAX - 17) / 2)
+        return -1;
+    char *p = malloc(17 + 2 * len);
+    if (!p)
+        return -1;
+    if (kvspaceMetaKeyInto(key, p, 17 + 2 * len) != 0) {
+        free(p);
+        return -1;
+    }
     *out = p;
     return 0;
 }
