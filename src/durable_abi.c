@@ -158,9 +158,6 @@ int kvspaceSetPartByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
     return 0;
 }
 
-/* 指令边界回收读借用池：SHM 常驻映射，借用恒有效，no-op。 */
-void kvspaceReadReset(void *h) { (void)h; }
-
 /* 定位读：*out 指向 SHM 常驻映射内 [offset, offset+len)（借用，不得 free）。
  * 越界/空 → *out=NULL、out_len=0。 */
 int kvspaceGetPart(void *h, const char *key, uint32_t offset, uint32_t len,
