@@ -1305,7 +1305,10 @@ static int read_tlv(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
         if (wire.total > INT32_MAX)
             return -1;
         *out = s;
-        *ol = wire.langtype_len ? (int32_t)wire.total : 0;
+        /* 空 langtype 只在 Ptr/Ext 上是合法值（“目标不约束”）；其余空 langtype = None。 */
+        bool ref = wire.kind == KVSPACE_XH_EXT ||
+                   wire.kind == (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG);
+        *ol = (wire.langtype_len || ref) ? (int32_t)wire.total : 0;
         return 0;
     }
     return -1;
@@ -1364,7 +1367,9 @@ static art_hdr_t *resolve_fetch(kvspace_t *kv, const char *path, char *out, int 
             if (wire.kind != (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG) ||
                 wire.content_len >= (uint64_t)osz) {
                 *raw = s;
-                *rl = wire.langtype_len ? (int32_t)wire.total : 0;
+                bool ref = wire.kind == KVSPACE_XH_EXT ||
+                           wire.kind == (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG);
+                *rl = (wire.langtype_len || ref) ? (int32_t)wire.total : 0;
                 *fetched = 1;
                 return h;
             }

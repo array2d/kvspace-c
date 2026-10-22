@@ -35,6 +35,15 @@ int main(void) {
     CHECK(stored && got == 40 && kvspaceXhDecode(stored, got, &head) == 0 &&
           head.body[0] == 42);
 
+    /* 空 kindexpr = 不约束：Ptr 目标为空，读写往返保留 ref 位与空 langtype。 */
+    CHECK(kvspaceXhNewPtr("", "/x", 2, &value, &n) == 0);
+    CHECK(kvspaceShmSet(kv, "/pe", value, (int32_t)n) == 0);
+    free(value);
+    stored = kvspaceShmGet(kv, "/pe", 0, &got);
+    CHECK(stored && got > 0 && kvspaceXhDecode(stored, got, &head) == 0 &&
+          head.kind == (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG) &&
+          head.langtype_len == 0 && head.content_len == 2);
+
     CHECK(kvspaceXhNewShort("[int64]·int64", NULL, 0, &value, &n) == 0);
     CHECK(kvspaceShmSet(kv, "/m", value, (int32_t)n) == 0);
     free(value);

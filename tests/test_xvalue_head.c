@@ -334,6 +334,15 @@ static void test_container_ptr_code(void) {
     CHECK(encoded_len == sizeof ptr && memcmp(encoded, ptr, sizeof ptr) == 0,
           "pointer wire");
     free(encoded);
+    /* 空 kindexpr = 不约束：Ptr 目标允许为空；`any` 不是类型名。 */
+    CHECK(kvspaceXhNewPtr("", "/varx", 8, &encoded, &encoded_len) == 0,
+          "empty pointer kindexpr");
+    CHECK(kvspaceXhDecode(encoded, encoded_len, &h) == 0 &&
+              h.kind == 5 && h.langtype_len == 0 && h.content_len == 5,
+          "empty pointer fields");
+    free(encoded);
+    CHECK(kvspaceXhNewPtr("any", "/varx", 8, &encoded, &encoded_len) != 0,
+          "any kindexpr rejected");
     ptr[1] |= 0x80;
     CHECK(kvspaceXhDecode(ptr, sizeof ptr, &h) != 0, "reserved pointer bit");
     ptr[1] &= 0x7f;
