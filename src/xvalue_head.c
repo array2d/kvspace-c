@@ -301,6 +301,9 @@ static int new_locator(uint8_t kind, const char *langtype, const char *locator,
     *out = NULL;
     if (!langtype || !locator)
         return -1;
+    /* `any` 不是类型名：Ptr/Ext 的 target kindexpr 不得为 any（空 = 不约束）。 */
+    if (strcmp(langtype, "any") == 0)
+        return -1;
     size_t lt = strlen(langtype);
     size_t locator_len = strlen(locator);
     if (lt > UINT32_MAX || cap < locator_len)
@@ -459,7 +462,7 @@ int kvspaceXhReserve(uint8_t kind, const char *langtype, uint64_t body_len,
         reserve = body_len;
     } else if (kind == KVSPACE_XH_EXT ||
                kind == (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG)) {
-        if (!lt || !body_len)
+        if (!body_len)
             return -1;
         pow = min_pow((uint32_t)lt);
         a = body_len;
@@ -514,7 +517,7 @@ static int xh_header(const uint8_t *data, uint64_t len, kvspaceXh *out) {
         cap = b;
     } else if (kind == KVSPACE_XH_EXT ||
                kind == (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG)) {
-        if (pow != min_pow(ltlen) || a == 0 || a > b || ltlen == 0)
+        if (pow != min_pow(ltlen) || a == 0 || a > b)
             return -1;
         content = a;
         cap = b;
