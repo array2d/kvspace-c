@@ -49,7 +49,7 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
                            const char *key_fallback, uint32_t offset,
                            const uint8_t *buf, uint32_t buf_len);
 
-// Set: 写入 value（TLV 编码的字节）。总是穿透 link 写入 target。
+// Set: 写入 value（XValue 字节）。总是穿透 link 写入 target。
 int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
                   int32_t val_len);
 int kvspaceShmSetValue(kvspace_t *kv, const char *key, const uint8_t *val,
@@ -109,7 +109,7 @@ int kvspaceShmDelextindex(kvspace_t *kv, const char *path); // 移除 extindex
 int kvspaceShmNotify(kvspace_t *kv, const char *key, const uint8_t *val,
                      int32_t val_len);
 
-// 阻塞等待通知，timeout_ms 毫秒。返回 malloc TLV，超时返回 NULL.
+// 阻塞等待通知，timeout_ms 毫秒。返回 malloc XValue，超时返回 NULL.
 uint8_t *kvspaceShmWatch(kvspace_t *kv, const char *key, int32_t timeout_ms,
                          int32_t *out_len);
 

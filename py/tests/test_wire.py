@@ -2,7 +2,7 @@
 """wrapper ↔ C 权威 codec 双向对拍 + ShmSet 读回。
 
 方向一：wrapper 编码 → C `kvspaceDecodeHead` 解头，断言 ref/class/langtype/body。
-方向二：C `kvspaceTlvEncodeMode` 编码 → wrapper `_xv_decode` 解头，断言 kind/array_len/body。
+方向二：C `kvspaceXvalueEncodeMode` 编码 → wrapper `_xv_decode` 解头，断言 kind/array_len/body。
 
 独立 oracle：测试自行绑定 C 符号，不经 wrapper 的编解码辅助。
 """
@@ -30,11 +30,11 @@ class Head(ctypes.Structure):
     ]
 
 _U8P = ctypes.POINTER(ctypes.c_uint8)
-_lib.kvspaceTlvEncodeMode.argtypes = [ctypes.c_char_p, _U8P, ctypes.c_uint32,
+_lib.kvspaceXvalueEncodeMode.argtypes = [ctypes.c_char_p, _U8P, ctypes.c_uint32,
                                       ctypes.POINTER(ctypes.c_int32), ctypes.c_int32,
                                       ctypes.c_int32, ctypes.c_uint8, ctypes.c_uint32,
                                       ctypes.POINTER(_U8P), ctypes.POINTER(ctypes.c_uint32)]
-_lib.kvspaceTlvEncodeMode.restype = ctypes.c_int
+_lib.kvspaceXvalueEncodeMode.restype = ctypes.c_int
 _lib.kvspaceDecodeHead.argtypes = [_U8P, ctypes.c_uint32, ctypes.POINTER(Head)]
 _lib.kvspaceDecodeHead.restype = ctypes.c_int
 
@@ -44,7 +44,7 @@ def c_encode(kind, raw=b"", dims=(), ref=0):
     d = (ctypes.c_int32 * len(dims))(*dims) if dims else None
     out = _U8P()
     ol = ctypes.c_uint32()
-    rc = _lib.kvspaceTlvEncodeMode(kind.encode(),
+    rc = _lib.kvspaceXvalueEncodeMode(kind.encode(),
                                    ctypes.cast(buf, _U8P) if buf is not None else None,
                                    len(raw), d, len(dims), ref, 0, 0,
                                    ctypes.byref(out), ctypes.byref(ol))

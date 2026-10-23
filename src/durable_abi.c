@@ -28,7 +28,7 @@
 #define KVSPACE_KIND_INT64 "int64"
 #define KVSPACE_KIND_FLOAT64 "float64"
 
-int kvspaceTlvEncodeMode(const char *kind, const uint8_t *raw, uint32_t raw_len,
+int kvspaceXvalueEncodeMode(const char *kind, const uint8_t *raw, uint32_t raw_len,
                          const int32_t *dims, int32_t ndim, int32_t ref,
                          uint8_t ro, uint32_t vid, uint8_t **out,
                          uint32_t *out_len);
@@ -353,12 +353,12 @@ static int locator(int ext, const char *type, const uint8_t *raw, uint32_t len,
     return rc == 0 ? finish(value, total, out, out_len) : 1;
 }
 
-int kvspaceTlvEncode(const char *kind, const uint8_t *raw, uint32_t raw_len,
+int kvspaceXvalueEncode(const char *kind, const uint8_t *raw, uint32_t raw_len,
                      const int32_t *dims, int32_t ndim, uint8_t **out, uint32_t *out_len) {
-    return kvspaceTlvEncodeMode(kind, raw, raw_len, dims, ndim, 0, 0, 0, out, out_len);
+    return kvspaceXvalueEncodeMode(kind, raw, raw_len, dims, ndim, 0, 0, 0, out, out_len);
 }
 
-int kvspaceTlvEncodeMode(const char *kind, const uint8_t *raw, uint32_t raw_len,
+int kvspaceXvalueEncodeMode(const char *kind, const uint8_t *raw, uint32_t raw_len,
                          const int32_t *dims, int32_t ndim, int32_t ref, uint8_t ro, uint32_t vid,
                          uint8_t **out, uint32_t *out_len) {
     if (!out || !out_len || !kind || ndim < 0 || ndim > 8 ||
@@ -463,19 +463,19 @@ int kvspaceNewPtr(const char *target_kindexpr, const char *target,
 }
 
 int kvspaceNewChar(const uint8_t *bytes, uint32_t len, uint8_t **out, uint32_t *out_len) {
-    return kvspaceTlvEncode(KVSPACE_KIND_CHAR_UTF8, bytes, len, NULL, 0, out, out_len);
+    return kvspaceXvalueEncode(KVSPACE_KIND_CHAR_UTF8, bytes, len, NULL, 0, out, out_len);
 }
 
 int kvspaceNewBool(uint8_t v, uint8_t **out, uint32_t *out_len) {
     uint8_t b = v ? 1 : 0;
-    return kvspaceTlvEncode(KVSPACE_KIND_BOOL, &b, 1, NULL, 0, out, out_len);
+    return kvspaceXvalueEncode(KVSPACE_KIND_BOOL, &b, 1, NULL, 0, out, out_len);
 }
 
 int kvspaceNewInt64(int64_t v, uint8_t **out, uint32_t *out_len) {
     uint8_t raw[8];
     for (int i = 0; i < 8; i++)
         raw[i] = (uint8_t)((uint64_t)v >> (8 * i));
-    return kvspaceTlvEncode(KVSPACE_KIND_INT64, raw, 8, NULL, 0, out, out_len);
+    return kvspaceXvalueEncode(KVSPACE_KIND_INT64, raw, 8, NULL, 0, out, out_len);
 }
 
 int kvspaceNewFloat64(double v, uint8_t **out, uint32_t *out_len) {
@@ -484,7 +484,7 @@ int kvspaceNewFloat64(double v, uint8_t **out, uint32_t *out_len) {
     uint8_t raw[8];
     for (int i = 0; i < 8; i++)
         raw[i] = (uint8_t)(bits >> (8 * i));
-    return kvspaceTlvEncode(KVSPACE_KIND_FLOAT64, raw, 8, NULL, 0, out, out_len);
+    return kvspaceXvalueEncode(KVSPACE_KIND_FLOAT64, raw, 8, NULL, 0, out, out_len);
 }
 
 int kvspaceWatch(void *h, const char *key, const uint8_t *target,

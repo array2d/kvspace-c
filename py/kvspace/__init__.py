@@ -51,7 +51,7 @@ class _Head(ctypes.Structure):
     ]
 
 _U8P = ctypes.POINTER(ctypes.c_uint8)
-_bind(_lib.kvspaceTlvEncodeMode,
+_bind(_lib.kvspaceXvalueEncodeMode,
       [ctypes.c_char_p, _U8P, ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32), ctypes.c_int32,
        ctypes.c_int32, ctypes.c_uint8, ctypes.c_uint32, ctypes.POINTER(_U8P), ctypes.POINTER(ctypes.c_uint32)],
       ctypes.c_int)
@@ -60,8 +60,8 @@ _bind(_lib.kvspaceDecodeHead, [_U8P, ctypes.c_uint32, ctypes.POINTER(_Head)], ct
 REF_INLINE, REF_PTR, REF_EXT = 0, 1, 2
 
 
-# ── XValue TLV helpers ──────────────────────────────────────────
-# 编解码一律委托权威 C codec（kvspaceTlvEncodeMode / kvspaceDecodeHead），
+# ── XValue 编解码 helpers ──────────────────────────────────────────
+# 编解码一律委托权威 C codec（kvspaceXvalueEncodeMode / kvspaceDecodeHead），
 # 本地不再复刻 wire 布局。
 
 def _take(out, ol: ctypes.c_uint32) -> bytes:
@@ -71,17 +71,17 @@ def _take(out, ol: ctypes.c_uint32) -> bytes:
 
 
 def _xv_encode(kind: str, raw: bytes = b"", dims: tuple = (), ref: int = REF_INLINE) -> bytes:
-    """编码 XValue head+body：绑定 C codec `kvspaceTlvEncodeMode`。
+    """编码 XValue head+body：绑定 C codec `kvspaceXvalueEncodeMode`。
     dims 落形状（tensor），ref 选存储位置（inline/ptr/ext）。"""
     buf = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw) if raw else None
     d = (ctypes.c_int32 * len(dims))(*dims) if dims else None
     out = _U8P()
     ol = ctypes.c_uint32()
-    rc = _lib.kvspaceTlvEncodeMode(kind.encode(), ctypes.cast(buf, _U8P) if buf is not None else None,
+    rc = _lib.kvspaceXvalueEncodeMode(kind.encode(), ctypes.cast(buf, _U8P) if buf is not None else None,
                                    len(raw), d, len(dims), ref, 0, 0,
                                    ctypes.byref(out), ctypes.byref(ol))
     if rc:
-        raise ValueError(f"kvspaceTlvEncodeMode({kind!r}, ref={ref}) failed: {rc}")
+        raise ValueError(f"kvspaceXvalueEncodeMode({kind!r}, ref={ref}) failed: {rc}")
     return _take(out, ol)
 
 

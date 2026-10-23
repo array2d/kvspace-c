@@ -52,7 +52,7 @@ mod ffi {
             extpath: *const c_char,
         ) -> i32;
         // Codec (kvspace ABI, no handle) — the single source of wire truth.
-        pub fn kvspaceTlvEncodeMode(
+        pub fn kvspaceXvalueEncodeMode(
             kind: *const c_char,
             raw: *const u8,
             raw_len: u32,
@@ -86,9 +86,9 @@ mod ffi {
     }
 }
 
-// ── xvalue TLV helpers ──────────────────────────────────────
+// ── xvalue 编解码 helpers ──────────────────────────────────────
 //
-// 编解码一律委托权威 C codec（kvspaceTlvEncodeMode / kvspaceDecodeHead），
+// 编解码一律委托权威 C codec（kvspaceXvalueEncodeMode / kvspaceDecodeHead），
 // 本地不再复刻 wire 布局。wire：[pow:u8][flags:u8][a:u64le][b:u64le][langtype][padding][body]，
 // headlen = 1 << pow，flags 低 2 位为 storage class、bit2 为指针位。
 
@@ -103,16 +103,16 @@ pub mod xvalue {
     pub const REF_PTR: i32 = 1;
     pub const REF_EXT: i32 = 2;
 
-    /// 编码 XValue head+body：绑定 C codec `kvspaceTlvEncodeMode`。
+    /// 编码 XValue head+body：绑定 C codec `kvspaceXvalueEncodeMode`。
     /// dims 落形状（tensor），ref 选存储位置（inline/ptr/ext）。
-    fn tlv_encode(kind: &str, raw: &[u8], dims: &[i32], r#ref: i32) -> Vec<u8> {
+    fn xvalue_encode(kind: &str, raw: &[u8], dims: &[i32], r#ref: i32) -> Vec<u8> {
         let ckind = CString::new(kind).expect("kind 含 NUL");
         let rp = if raw.is_empty() { ptr::null() } else { raw.as_ptr() };
         let dp = if dims.is_empty() { ptr::null() } else { dims.as_ptr() };
         let mut out: *mut u8 = ptr::null_mut();
         let mut len: u32 = 0;
         let rc = unsafe {
-            ffi::kvspaceTlvEncodeMode(
+            ffi::kvspaceXvalueEncodeMode(
                 ckind.as_ptr(),
                 rp,
                 raw.len() as u32,
@@ -150,25 +150,25 @@ pub mod xvalue {
     }
 
     pub fn int64(v: i64) -> Vec<u8> {
-        tlv_encode("int64", &v.to_le_bytes(), &[], REF_INLINE)
+        xvalue_encode("int64", &v.to_le_bytes(), &[], REF_INLINE)
     }
     pub fn float64(v: f64) -> Vec<u8> {
-        tlv_encode("float64", &v.to_le_bytes(), &[], REF_INLINE)
+        xvalue_encode("float64", &v.to_le_bytes(), &[], REF_INLINE)
     }
     pub fn string(s: &str) -> Vec<u8> {
-        tlv_encode("char/utf8", s.as_bytes(), &[], REF_INLINE)
+        xvalue_encode("char/utf8", s.as_bytes(), &[], REF_INLINE)
     }
     /// 目录值。旧 `index` 值类型已由「值/索引分离」移除，现行目录值 kind 为 `lib`。
     pub fn index() -> Vec<u8> {
-        tlv_encode("lib", &[], &[], REF_INLINE)
+        xvalue_encode("lib", &[], &[], REF_INLINE)
     }
     /// 指针值（ptr 位）：body = 目标 key，langtype = 目标 kindexpr。
     pub fn link(target: &str) -> Vec<u8> {
-        tlv_encode("lib", target.as_bytes(), &[], REF_PTR)
+        xvalue_encode("lib", target.as_bytes(), &[], REF_PTR)
     }
     /// 外部定位符（EXT class）：body = locator，langtype = 目标 kindexpr。
     pub fn ext(locator: &str) -> Vec<u8> {
-        tlv_encode("lib", locator.as_bytes(), &[], REF_EXT)
+        xvalue_encode("lib", locator.as_bytes(), &[], REF_EXT)
     }
 
     /// 解码 head → (kind, array_len, raw)：绑定 C codec `kvspaceDecodeHead`，借用 data。

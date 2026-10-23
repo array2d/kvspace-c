@@ -1,7 +1,7 @@
 /* test_set_part_fastpath — SLACK pow=6 part-write 快路径与回退。
  *
  * 快路径：kvspaceShmSetPartByRef 在 ref.gen==0、SLACK/pow=6、head 的 b 与
- * offset/buf_len 全部自洽时直接写正文，跳过 read_tlv。任何不自洽必须回退
+ * offset/buf_len 全部自洽时直接写正文，跳过 read_value。任何不自洽必须回退
  * 现有路径（行为与旧实现一致，不静默写坏数据）。
  *
  * 覆盖：长度边界 9/10、99/100、255/256；越界拒绝；损坏/截断 head 回退；
@@ -175,7 +175,7 @@ int main(void) {
         CHECK(rc != 0, "a>b must fail");
         memcpy(d, save, HEAD);
 
-        /* 空 langtype：read_tlv 视作 None，旧路径拒绝写入 */
+        /* 空 langtype：read_value 视作 None，旧路径拒绝写入 */
         char before[4];
         memcpy(before, d + HEAD, sizeof before);
         d[KVSPACE_XH_PREFIX] = 0;
