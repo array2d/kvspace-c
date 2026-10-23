@@ -19,12 +19,12 @@
 static int failures;
 
 static int set_i64(kvspace_t *kv, const char *key, int64_t v) {
-  uint8_t *tlv;
+  uint8_t *xv;
   uint64_t n = 0;
-  if (kvspaceXhNewScalar("int64", (const uint8_t *)&v, 8, &tlv, &n) != 0)
+  if (kvspaceXhNewScalar("int64", (const uint8_t *)&v, 8, &xv, &n) != 0)
     return -1;
-  int rc = kvspaceShmSet(kv, key, tlv, (int32_t)n);
-  free(tlv);
+  int rc = kvspaceShmSet(kv, key, xv, (int32_t)n);
+  free(xv);
   return rc;
 }
 

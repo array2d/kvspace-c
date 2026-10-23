@@ -1297,7 +1297,7 @@ void kvspaceShmClose(kvspace_t *kv) {
 }
 
 /* ---- link resolve helpers ---- */
-static int read_tlv(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
+static int read_value(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
     uint8_t *s = kv->sbo_data + off;
     size_t sz = sbo_allocated_size(kv->sbo_meta, off);
     kvspaceXh wire;
@@ -1328,7 +1328,7 @@ static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
             return;
         uint8_t *raw;
         int32_t rl;
-        if (read_tlv(kv, h->box_offset, &raw, &rl) < 0)
+        if (read_value(kv, h->box_offset, &raw, &rl) < 0)
             return;
         kvspaceXh wire;
         if (rl > 0 && kvspaceXhView(raw, (uint64_t)rl, &wire) == 0) {
@@ -1344,9 +1344,9 @@ static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
 }
 
 /* resolve_path 的融合版：解析 link 链的同时把终端叶子的值一并取出，令调用方省掉
- * 「解析后再 art_search + read_tlv」的整套重复下降。每跳只解一次 head（ref 判定与
- * TLV 长度共用），命中带值节点即返 fetched=1（*raw/*rl 就位）。语义与
- * resolve_path + art_search + read_tlv 逐字等价：未命中/无值 → 返回该节点、fetched=0，
+ * 「解析后再 art_search + read_value」的整套重复下降。每跳只解一次 head（ref 判定与
+ * 值长度共用），命中带值节点即返 fetched=1（*raw/*rl 就位）。语义与
+ * resolve_path + art_search + read_value 逐字等价：未命中/无值 → 返回该节点、fetched=0，
  * 交调用方走 extindex/dir 兜底。 */
 static art_hdr_t *resolve_fetch(kvspace_t *kv, const char *path, char *out, int osz,
                                 uint8_t **raw, int32_t *rl, int *fetched) {
@@ -1391,7 +1391,7 @@ static int dir_ext_path(kvspace_t *kv, const char *dir, char *out, int osz) {
         return 0;
     uint8_t *raw;
     int32_t rl;
-    if (read_tlv(kv, h->box_offset, &raw, &rl) < 0)
+    if (read_value(kv, h->box_offset, &raw, &rl) < 0)
         return 0;
     kvspaceXh wire;
     if (rl <= 0 || kvspaceXhDecode(raw, (uint64_t)rl, &wire) != 0 ||
@@ -1438,7 +1438,7 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
             if (eh && eh->has_value) {
                 uint8_t *raw;
                 int32_t rl;
-                if (read_tlv(kv, eh->box_offset, &raw, &rl) == 0) {
+                if (read_value(kv, eh->box_offset, &raw, &rl) == 0) {
                     *ol = rl;
                     free(parent);
                     free(name);
@@ -1450,7 +1450,7 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
         free(name);
         return NULL;
     }
-    if (!fetched && read_tlv(kv, h->box_offset, &raw, &rl) < 0)
+    if (!fetched && read_value(kv, h->box_offset, &raw, &rl) < 0)
         return NULL;
     *ol = rl;
     return raw;
@@ -1518,7 +1518,7 @@ uint8_t *kvspaceShmGetByRef(kvspace_t *kv, kvspaceRef_t *ref,
     if (h && h->has_value) {
         uint8_t *raw;
         int32_t rl;
-        if (read_tlv(kv, h->box_offset, &raw, &rl) == 0) {
+        if (read_value(kv, h->box_offset, &raw, &rl) == 0) {
             *ol = rl;
             return raw;
         }
@@ -1543,7 +1543,7 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
         return -1;
     int32_t id = ref_leaf(kv, ref, key_fallback);
     art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
-    /* SLACK、pow=6（headlen=64）的 part-write 快路径：跳过 xh_view/TLV 解析，
+    /* SLACK、pow=6（headlen=64）的 part-write 快路径：跳过 xh_view 结构解码，
      * 只做必要的 head 自洽 + per-box 物理容量校验后写正文。任何不自洽
      * （gen>0、无值、head 不足 64B、pow/kind/Ptr 不符、langtype 无 NUL、
      * a>b、b/offset/buf_len 越界、超出 box 物理容量）一律回退现有路径，
@@ -1598,7 +1598,7 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
     }
     uint8_t *raw;
     int32_t rl;
-    if (read_tlv(kv, h->box_offset, &raw, &rl) < 0 ||
+    if (read_value(kv, h->box_offset, &raw, &rl) < 0 ||
         offset + buf_len > (uint32_t)rl)
         return -1;
     memcpy(raw + offset, buf, buf_len);
@@ -1814,7 +1814,7 @@ int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
     }
     if (!h || !h->has_value)
         return -1;
-    if ((!fetched && read_tlv(kv, h->box_offset, &raw, &rl) < 0) || rl <= 0)
+    if ((!fetched && read_value(kv, h->box_offset, &raw, &rl) < 0) || rl <= 0)
         return -1; /* None 或读失败 → 强制走 NewPlace */
     kvspaceXh wire;
     if (kvspaceXhDecode(raw, (uint64_t)rl, &wire) == 0) {
@@ -1916,7 +1916,7 @@ int kvspaceShmDeltree(kvspace_t *kv, const char *prefix) {
     if (h && h->has_value) {
         uint8_t *raw;
         int32_t rl;
-        read_tlv(kv, h->box_offset, &raw, &rl);
+        read_value(kv, h->box_offset, &raw, &rl);
         kvspaceXh wire;
         int is_ptr = rl > 0 && kvspaceXhDecode(raw, (uint64_t)rl, &wire) == 0 &&
                      (wire.kind & KVSPACE_XH_PTR_FLAG) != 0;

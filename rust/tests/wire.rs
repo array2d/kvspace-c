@@ -1,7 +1,7 @@
 //! Wrapper ↔ C codec 双向对拍。
 //!
 //! wrapper 编码 → C 权威 `kvspaceDecodeHead` 解头；
-//! C 权威 `kvspaceTlvEncode(Mode)` 编码 → wrapper `xvalue::decode` 解头。
+//! C 权威 `kvspaceXvalueEncode(Mode)` 编码 → wrapper `xvalue::decode` 解头。
 //! 断言 langtype / body / storage class / 指针位一致。
 
 use std::ffi::c_void;
@@ -26,7 +26,7 @@ struct Head {
 }
 
 extern "C" {
-    fn kvspaceTlvEncodeMode(
+    fn kvspaceXvalueEncodeMode(
         kind: *const c_char,
         raw: *const u8,
         raw_len: u32,
@@ -50,7 +50,7 @@ fn c_encode(kind: &str, raw: &[u8], dims: &[i32], r#ref: i32) -> Vec<u8> {
     let mut out: *mut u8 = std::ptr::null_mut();
     let mut len: u32 = 0;
     let rc = unsafe {
-        kvspaceTlvEncodeMode(
+        kvspaceXvalueEncodeMode(
             ck.as_ptr(),
             rp,
             raw.len() as u32,

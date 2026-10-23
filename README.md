@@ -27,7 +27,7 @@ Two surfaces:
    `kvspaceConnect/Close/Disconnect`, `kvspaceGet` (zero-copy borrow) `/WriteInPlace/WriteNewPlace`,
    `kvspaceListLen/ListAt/Del/DelTree/Cp/CpTree`,
    `kvspaceMkindex/MkindexExt/RmindexExt/Watch/Clear`,
-   `kvspaceTlvEncode/TlvEncodeMode/DecodeHead`,
+   `kvspaceXvalueEncode/XvalueEncodeMode/DecodeHead`,
    `kvspaceNewPtr/NewChar/NewBool/NewInt64/NewFloat64`.
 
    A consumer (e.g. the kvlang layout) links this ABI and switches backends by DSN only, with no code change.
