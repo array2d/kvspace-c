@@ -1543,6 +1543,46 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
         return -1;
     int32_t id = ref_leaf(kv, ref, key_fallback);
     art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
+    /* SLACK、pow=6（headlen=64）的 part-write 快路径：跳过 xh_view/TLV 解析，
+     * 只做必要的 head 自洽 + per-box 物理容量校验后写正文。任何不自洽
+     * （gen>0、无值、head 不足 64B、pow/kind/Ptr 不符、langtype 无 NUL、
+     * a>b、b/offset/buf_len 越界、超出 box 物理容量）一律回退现有路径，
+     * 行为不变。不修改 head，不更新 a/b。 */
+    if (h && h->has_value && ref->gen == 0) {
+        uint64_t data_size = kv->hdr->sbo_data_size;
+        uint64_t off = h->box_offset;
+        if (off <= data_size && data_size - off >= 64) {
+            const uint8_t *hs = kv->sbo_data + off;
+            uint8_t flags = hs[1];
+            if (hs[0] == KVSPACE_XH_POW_SLACK &&
+                (flags & 3u) == KVSPACE_XH_SLACK &&
+                (flags & KVSPACE_XH_PTR_FLAG) == 0) {
+                /* langtype 必须在 64B head 内以 NUL 终止（不能只看首字节非空）。 */
+                bool lt_ok = false;
+                for (uint32_t i = KVSPACE_XH_PREFIX; i < 64; i++)
+                    if (hs[i] == 0) {
+                        lt_ok = i > KVSPACE_XH_PREFIX; /* 非空 */
+                        break;
+                    }
+                uint64_t a = 0, b = 0;
+                for (int i = 0; lt_ok && i < 8; i++) {
+                    a |= (uint64_t)hs[2 + i] << (8 * i);
+                    b |= (uint64_t)hs[10 + i] << (8 * i);
+                }
+                if (lt_ok && a <= b) {
+                    /* per-box 物理容量：损坏 head 的 b 可能大于 box 但仍在全局内，
+                     * 不做这一步会跨 box 写坏相邻值。 */
+                    uint64_t cap = sbo_allocated_size(kv->sbo_meta, off);
+                    if (cap >= 64 && cap <= data_size - off && b <= cap - 64 &&
+                        (uint64_t)offset <= 64 + b &&
+                        (uint64_t)buf_len <= 64 + b - (uint64_t)offset) {
+                        memcpy(kv->sbo_data + off + offset, buf, buf_len);
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
     if (!h || !h->has_value) {
         if (ref->gen != 0)
             return -1;
