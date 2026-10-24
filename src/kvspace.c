@@ -1605,6 +1605,82 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
     return 0;
 }
 
+/* /vthread/<vid>/‥status：合法内容长度上限与创建时物理容量下限。 */
+#define KVSPACE_STATUS_MAX_LEN 16u
+#define KVSPACE_STATUS_MIN_CAP 80u
+
+/* status 的规范形状：SLACK、headlen=64、langtype "[<digits>]char/utf8"。 */
+static int is_status_langtype(const kvspaceXh *w) {
+    if (!w->langtype || w->langtype_len < 12)
+        return 0;
+    const uint8_t *p = w->langtype;
+    uint32_t n = w->langtype_len, i = 0;
+    if (p[i++] != '[')
+        return 0;
+    uint32_t d0 = i;
+    while (i < n && p[i] >= '0' && p[i] <= '9')
+        i++;
+    if (i == d0 || i >= n || p[i++] != ']')
+        return 0;
+    static const char suf[] = "char/utf8";
+    return n - i == sizeof suf - 1 && memcmp(p + i, suf, sizeof suf - 1) == 0;
+}
+
+static int is_vthread_status_key(const char *key) {
+    static const char pfx[] = "/vthread/";
+    static const char suf[] = "/\xE2\x80\xA5status";
+    if (!key)
+        return 0;
+    size_t n = strlen(key), sl = sizeof suf - 1;
+    return n > sl && strncmp(key, pfx, sizeof pfx - 1) == 0 &&
+           memcmp(key + n - sl, suf, sl) == 0;
+}
+
+int kvspaceShmSlotView(kvspace_t *kv, const kvspaceRef_t *ref,
+                       const char *key_fallback, kvspaceSlotView_t *out) {
+    /* status 识别依赖 key_fallback；view 一律要求非 NULL（runtime 必须传）。 */
+    if (!kv || !ref || !out || !key_fallback)
+        return -1;
+    if (ref->gen != 0)
+        return -1;
+    if (kv_sync(kv) != 0)
+        return -1;
+    kvspaceRef_t r = *ref;
+    int32_t id = ref_leaf(kv, &r, key_fallback);
+    art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
+    if (!h || !h->has_value)
+        return -1;
+    uint8_t *raw = NULL;
+    int32_t rl = 0;
+    if (read_value(kv, h->box_offset, &raw, &rl) < 0 || !raw)
+        return -1;
+    kvspaceXh wire;
+    if (kvspaceXhDecode(raw, (uint64_t)rl, &wire) != 0)
+        return -1;
+    /* ptr/ext 槽不可视：没有稳定的 head/body 语义。 */
+    if (wire.kind == KVSPACE_XH_EXT ||
+        (wire.kind & KVSPACE_XH_PTR_FLAG))
+        return -1;
+    uint64_t cap = sbo_allocated_size(kv->sbo_meta, h->box_offset);
+    if (cap < wire.headlen || wire.content_len > cap - wire.headlen)
+        return -1;
+    /* status：只暴露规范形状且物理容量达标的槽；旧小 cap/异型 → -1，
+     * runtime 回退（旧 store 不自动升级）。 */
+    if (is_vthread_status_key(key_fallback)) {
+        if (wire.kind != KVSPACE_XH_SLACK ||
+            wire.headlen != (1u << KVSPACE_XH_POW_SLACK) ||
+            !is_status_langtype(&wire) || cap < KVSPACE_STATUS_MIN_CAP ||
+            wire.content_len > KVSPACE_STATUS_MAX_LEN)
+            return -1;
+    }
+    out->head = raw;
+    out->headlen = wire.headlen;
+    out->body = raw + wire.headlen;
+    out->cap = cap;
+    out->body_cap = cap - wire.headlen;
+    return 0;
+}
+
 /* 原始落盘（不处理容器/member 语义，供内部调用，避免递归）。 */
 static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
                          int32_t val_len, art_hdr_t *old) {
@@ -1618,7 +1694,10 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
         }
         kv_sbo_free(kv, old->box_offset);
     }
-    uint64_t off = kv_sbo_alloc(kv, (size_t)val_len);
+    size_t alloc_len = (size_t)val_len;
+    if (is_vthread_status_key(key) && alloc_len < KVSPACE_STATUS_MIN_CAP)
+        alloc_len = KVSPACE_STATUS_MIN_CAP;
+    uint64_t off = kv_sbo_alloc(kv, alloc_len);
     if (off == (uint64_t)-1)
         return -1;
     memcpy(kv->sbo_data + off, val, val_len);
@@ -1740,6 +1819,31 @@ static int shm_set_validated(kvspace_t *kv, const char *key,
         free(nn);
     }
 
+    /* status 固定档：形状固定（SLACK/headlen=64/[n]char/utf8）、内容 ≤16。
+     * 任一不符或现存槽 headlen 不同（旧 store）→ 硬错，不截断、不换 box、
+     * 不自动升级。创建时分配下限 80 字节，保证后续合法写入原地完成。 */
+    if (is_vthread_status_key(kbuf)) {
+        if (wire->content_len > KVSPACE_STATUS_MAX_LEN ||
+            wire->kind != KVSPACE_XH_SLACK ||
+            wire->headlen != (1u << KVSPACE_XH_POW_SLACK) ||
+            !is_status_langtype(wire))
+            return -1;
+        if (local && local->has_value) {
+            uint8_t *old_raw = kv->sbo_data + local->box_offset;
+            uint64_t old_sz = sbo_allocated_size(kv->sbo_meta, local->box_offset);
+            kvspaceXh old;
+            /* 旧 store 的不合规 status 槽（形状/尺寸/容量任一不符）：
+             * 不自动升级、不 realloc——写入硬错，需重建/重置。 */
+            if (kvspaceXhDecode(old_raw, old_sz, &old) != 0 ||
+                old.headlen != wire->headlen ||
+                old.kind != KVSPACE_XH_SLACK ||
+                old.headlen != (1u << KVSPACE_XH_POW_SLACK) ||
+                !is_status_langtype(&old) ||
+                old.content_len > KVSPACE_STATUS_MAX_LEN ||
+                old_sz < KVSPACE_STATUS_MIN_CAP)
+                return -1;
+        }
+    }
     if (shm_set_local(kv, kbuf, val, val_len, local) != 0)
         return -1;
     return sync_metadata(kv, kbuf, ro, vid);
