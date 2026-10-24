@@ -925,19 +925,6 @@ static char *pjoin(const char *a, const char *b) {
     memcpy(r + al + sep, b, bl + 1);
     return r;
 }
-static void psplit(const char *k, char **p, char **n) {
-    const char *s = strrchr(k, '/');
-    if (!s || s == k) {
-        *p = strdup("/");
-        *n = strdup(s ? s + 1 : k);
-        return;
-    }
-    size_t pl = (size_t)(s - k) + 1; /* 含尾 '/' */
-    *p = malloc(pl + 1);
-    memcpy(*p, k, pl);
-    (*p)[pl] = '\0';
-    *n = strdup(s + 1);
-}
 /* 非法目录前缀（不是 / 且不以 / 或 · 结尾）→ 返回非 0，对齐 durable
  * validate_dir。 */
 static int bad_dir_prefix(const char *p) {
@@ -1297,15 +1284,64 @@ void kvspaceShmClose(kvspace_t *kv) {
 }
 
 /* ---- link resolve helpers ---- */
+static uint64_t rd_u64(const uint8_t *d) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++)
+        v |= (uint64_t)d[i] << (8 * i);
+    return v;
+}
+
 static int read_value(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
     uint8_t *s = kv->sbo_data + off;
+    uint64_t dsz = kv->hdr->sbo_data_size;
+    if (off <= dsz && dsz - off >= 40 && s[0] == 5 && s[1] == 0 &&
+        rd_u64(s + 2) == 0 && rd_u64(s + 10) == 0) {
+        if (memcmp(s + 18, "int64", 6) == 0 ||
+            memcmp(s + 18, "float64", 8) == 0 ||
+            memcmp(s + 18, "uint64", 7) == 0) {
+            *out = s;
+            *ol = 40;
+            return 0;
+        }
+        if (memcmp(s + 18, "bool", 5) == 0 && s[32] <= 1) {
+            *out = s;
+            *ol = 33;
+            return 0;
+        }
+        if (memcmp(s + 18, "int32", 6) == 0 ||
+            memcmp(s + 18, "float32", 8) == 0 ||
+            memcmp(s + 18, "uint32", 7) == 0) {
+            *out = s;
+            *ol = 36;
+            return 0;
+        }
+        if (memcmp(s + 18, "uint8", 6) == 0 ||
+            memcmp(s + 18, "int8", 5) == 0) {
+            *out = s;
+            *ol = 33;
+            return 0;
+        }
+    }
+    if (off <= dsz && dsz - off >= 128 && s[0] == 7 && s[1] == 2 &&
+        s[18] == '[') {
+        uint64_t a = rd_u64(s + 2);
+        uint64_t b = rd_u64(s + 10);
+        if ((b == 8 || b == 4 || b == 2 || b == 1) && a <= (dsz - off - 128) / b &&
+            128 + a * b <= INT32_MAX && memchr(s + 18, 0, 110) != NULL) {
+            size_t sz = sbo_allocated_size(kv->sbo_meta, off);
+            if (sz >= 128 + a * b) {
+                *out = s;
+                *ol = (int32_t)(128 + a * b);
+                return 0;
+            }
+        }
+    }
     size_t sz = sbo_allocated_size(kv->sbo_meta, off);
     kvspaceXh wire;
     if (kvspaceXhView(s, sz, &wire) == 0) {
         if (wire.total > INT32_MAX)
             return -1;
         *out = s;
-        /* 空 langtype 只在 Ptr/Ext 上是合法值（“目标不约束”）；其余空 langtype = None。 */
         bool ref = wire.kind == KVSPACE_XH_EXT ||
                    wire.kind == (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG);
         *ol = (wire.langtype_len || ref) ? (int32_t)wire.total : 0;
@@ -1313,17 +1349,15 @@ static int read_value(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
     }
     return -1;
 }
-/* link 解析：ptr（ref=1）与 @ext（ref=2）的 XValue 恒为叶子（spec 硬规则——指针/扩展键
- * 之后不可能再有成员，成员只挂在 target 上），故路径中任何 `/` 分隔的容器前缀都绝不会是
- * link；唯一可能是 ptr 的只有整键叶子本身。因此只需查整键一次：非 ptr 即完成，ptr 则顺链
- * 到 target（本身又是一个完整叶子键）再查，最多追 16 跳。叶子不存在→非链，原样返回（调用
- * 方另做 extindex/dir 兜底）。取代旧的「逐前缀 1~3 次 art_search + 追加 rest」全下降探测。 */
 static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
-    strncpy(out, path, osz - 1);
-    out[osz - 1] = '\0';
+    size_t plen = strlen(path);
+    if (plen >= (size_t)osz)
+        plen = (size_t)osz - 1;
+    memcpy(out, path, plen);
+    out[plen] = '\0';
     for (int depth = 0; depth < 16; depth++) {
         art_hdr_t *h =
-            art_search(kv, kv->hdr->art_root, (const uint8_t *)out, (int)strlen(out));
+            art_search(kv, kv->hdr->art_root, (const uint8_t *)out, (int)plen);
         if (!h || !h->has_value)
             return;
         uint8_t *raw;
@@ -1335,27 +1369,26 @@ static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
             if (wire.kind != (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG) ||
                 wire.content_len >= (uint64_t)osz)
                 return;
-            memcpy(out, wire.body, (size_t)wire.content_len);
-            out[wire.content_len] = 0;
+            plen = (size_t)wire.content_len;
+            memcpy(out, wire.body, plen);
+            out[plen] = 0;
             continue;
         }
         return;
     }
 }
 
-/* resolve_path 的融合版：解析 link 链的同时把终端叶子的值一并取出，令调用方省掉
- * 「解析后再 art_search + read_value」的整套重复下降。每跳只解一次 head（ref 判定与
- * 值长度共用），命中带值节点即返 fetched=1（*raw/*rl 就位）。语义与
- * resolve_path + art_search + read_value 逐字等价：未命中/无值 → 返回该节点、fetched=0，
- * 交调用方走 extindex/dir 兜底。 */
 static art_hdr_t *resolve_fetch(kvspace_t *kv, const char *path, char *out, int osz,
                                 uint8_t **raw, int32_t *rl, int *fetched) {
     *fetched = 0;
-    strncpy(out, path, osz - 1);
-    out[osz - 1] = '\0';
+    size_t plen = strlen(path);
+    if (plen >= (size_t)osz)
+        plen = (size_t)osz - 1;
+    memcpy(out, path, plen);
+    out[plen] = '\0';
     for (int depth = 0; depth < 16; depth++) {
         art_hdr_t *h =
-            art_search(kv, kv->hdr->art_root, (const uint8_t *)out, (int)strlen(out));
+            art_search(kv, kv->hdr->art_root, (const uint8_t *)out, (int)plen);
         if (!h || !h->has_value)
             return h;
         uint8_t *s = kv->sbo_data + h->box_offset;
@@ -1373,8 +1406,9 @@ static art_hdr_t *resolve_fetch(kvspace_t *kv, const char *path, char *out, int 
                 *fetched = 1;
                 return h;
             }
-            memcpy(out, wire.body, (size_t)wire.content_len);
-            out[wire.content_len] = 0;
+            plen = (size_t)wire.content_len;
+            memcpy(out, wire.body, plen);
+            out[plen] = 0;
             continue;
         }
         return NULL;
@@ -1402,6 +1436,31 @@ static int dir_ext_path(kvspace_t *kv, const char *dir, char *out, int osz) {
     return 1;
 }
 
+static art_hdr_t *ext_target_search(kvspace_t *kv, const char *kbuf) {
+    const char *slash = strrchr(kbuf, '/');
+    if (!slash || slash <= kbuf || !slash[1])
+        return NULL;
+    size_t pl = (size_t)(slash - kbuf) + 1;
+    const char *name = slash + 1;
+    char parent[1024], extpath[1024], target[1024];
+    if (pl >= sizeof parent)
+        return NULL;
+    memcpy(parent, kbuf, pl);
+    parent[pl] = 0;
+    if (!dir_ext_path(kv, parent, extpath, sizeof extpath))
+        return NULL;
+    size_t el = strlen(extpath), nl = strlen(name);
+    int sep = (el > 0 && extpath[el - 1] != '/') ? 1 : 0;
+    if (el + (size_t)sep + nl >= sizeof target)
+        return NULL;
+    memcpy(target, extpath, el);
+    if (sep)
+        target[el] = '/';
+    memcpy(target + el + sep, name, nl + 1);
+    return art_search(kv, kv->hdr->art_root, (const uint8_t *)target,
+                      (int)(el + (size_t)sep + nl));
+}
+
 /* ============ CRUD ============ */
 uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
                        int32_t *ol) {
@@ -1420,34 +1479,19 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
     if (resolve)
         h = resolve_fetch(kv, key, kbuf, sizeof(kbuf), &raw, &rl, &fetched);
     else {
-        strncpy(kbuf, key, sizeof(kbuf) - 1);
-        kbuf[sizeof(kbuf) - 1] = '\0';
-        h = art_search(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
-                       (int)strlen(kbuf));
+        size_t kl = strlen(key);
+        if (kl >= sizeof(kbuf))
+            kl = sizeof(kbuf) - 1;
+        memcpy(kbuf, key, kl);
+        kbuf[kl] = '\0';
+        h = art_search(kv, kv->hdr->art_root, (const uint8_t *)kbuf, (int)kl);
     }
     if (!h || !h->has_value) {
-        /* extindex fallback：父目录是 extindex → 读 extpath + name */
-        char *parent = NULL, *name = NULL;
-        psplit(kbuf, &parent, &name);
-        char extpath[1024];
-        if (dir_ext_path(kv, parent, extpath, sizeof extpath)) {
-            char *target = pjoin(extpath, name);
-            art_hdr_t *eh = art_search(kv, kv->hdr->art_root, (const uint8_t *)target,
-                                       (int)strlen(target));
-            free(target);
-            if (eh && eh->has_value) {
-                uint8_t *raw;
-                int32_t rl;
-                if (read_value(kv, eh->box_offset, &raw, &rl) == 0) {
-                    *ol = rl;
-                    free(parent);
-                    free(name);
-                    return raw;
-                }
-            }
+        art_hdr_t *eh = ext_target_search(kv, kbuf);
+        if (eh && eh->has_value && read_value(kv, eh->box_offset, &raw, &rl) == 0) {
+            *ol = rl;
+            return raw;
         }
-        free(parent);
-        free(name);
         return NULL;
     }
     if (!fetched && read_value(kv, h->box_offset, &raw, &rl) < 0)
@@ -1717,6 +1761,21 @@ static int shm_set_raw(kvspace_t *kv, const char *key, const uint8_t *val,
 #define META_KEY_MAX (16 + 2 * 1024)
 
 static int sync_metadata(kvspace_t *kv, const char *key, uint8_t ro, uint32_t vid) {
+    if (!ro && !vid) {
+        static const char hex[] = "0123456789abcdef";
+        char pfx[24] = "/.kvspace-meta/";
+        int plen = 15;
+        for (int i = 0; i < 4 && key[i]; i++) {
+            uint8_t c = (uint8_t)key[i];
+            pfx[plen++] = hex[c >> 4];
+            pfx[plen++] = hex[c & 0x0f];
+        }
+        int bpos = 0;
+        char pbuf[32];
+        if (art_cover(kv, kv->hdr->art_root, (const uint8_t *)pfx,
+                      plen, pbuf, (int)sizeof pbuf, &bpos) < 0)
+            return 0;
+    }
     char meta[META_KEY_MAX];
     if (kvspaceMetaKeyInto(key, meta, sizeof meta) != 0)
         return -1;
@@ -1801,22 +1860,9 @@ static int shm_set_validated(kvspace_t *kv, const char *key,
                                    (const uint8_t *)kbuf, (int)strlen(kbuf));
     /* Existing local values already shadow the extension. */
     if (!local || !local->has_value) {
-        char *pp = NULL, *nn = NULL;
-        psplit(kbuf, &pp, &nn);
-        char extpath[1024];
-        if (pp && nn && dir_ext_path(kv, pp, extpath, sizeof extpath)) {
-            char *tgt = pjoin(extpath, nn);
-            art_hdr_t *eh = art_search(kv, kv->hdr->art_root,
-                                       (const uint8_t *)tgt, (int)strlen(tgt));
-            free(tgt);
-            if (eh && eh->has_value && !frame_operand_ptr(kbuf, wire)) {
-                free(pp);
-                free(nn);
-                return -1;
-            }
-        }
-        free(pp);
-        free(nn);
+        art_hdr_t *eh = ext_target_search(kv, kbuf);
+        if (eh && eh->has_value && !frame_operand_ptr(kbuf, wire))
+            return -1;
     }
 
     /* status 固定档：形状固定（SLACK/headlen=64/[n]char/utf8）、内容 ≤16。
@@ -1911,15 +1957,17 @@ int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
     if (resolve)
         h = resolve_fetch(kv, key, kbuf, sizeof(kbuf), &raw, &rl, &fetched);
     else {
-        strncpy(kbuf, key, sizeof(kbuf) - 1);
-        kbuf[sizeof(kbuf) - 1] = '\0';
-        h = art_search(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
-                       (int)strlen(kbuf));
+        size_t kl = strlen(key);
+        if (kl >= sizeof(kbuf))
+            kl = sizeof(kbuf) - 1;
+        memcpy(kbuf, key, kl);
+        kbuf[kl] = '\0';
+        h = art_search(kv, kv->hdr->art_root, (const uint8_t *)kbuf, (int)kl);
     }
     if (!h || !h->has_value)
         return -1;
     if ((!fetched && read_value(kv, h->box_offset, &raw, &rl) < 0) || rl <= 0)
-        return -1; /* None 或读失败 → 强制走 NewPlace */
+        return -1;
     kvspaceXh wire;
     if (kvspaceXhDecode(raw, (uint64_t)rl, &wire) == 0) {
         if (wire.content_len != (uint64_t)body_len)
@@ -1999,14 +2047,95 @@ int kvspaceShmDel(kvspace_t *kv, const char *key) {
     if (kv_sync(kv) != 0)
         return -1;
     char kbuf[1024];
-    strncpy(kbuf, key, sizeof(kbuf) - 1);
-    kbuf[sizeof(kbuf) - 1] = '\0'; /* 删键本身，不穿透 link——显式解引用由 runtime 掌控 */
+    size_t kl = strlen(key);
+    if (kl >= sizeof(kbuf))
+        kl = sizeof(kbuf) - 1;
+    memcpy(kbuf, key, kl);
+    kbuf[kl] = '\0';
     if (sync_metadata(kv, kbuf, 0, 0) != 0)
         return -1;
     bool d = false;
     kv->hdr->art_root = art_del(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
-                                (int)strlen(kbuf), 0, &d);
+                                (int)kl, 0, &d);
     return d ? 0 : -1;
+}
+
+static void art_deltree_walk(kvspace_t *kv, int32_t nid, char *buf, int bpos,
+                             int bcap, bool has_meta) {
+    if (nid < 0)
+        return;
+    art_hdr_t *h = art_hdr(kv, nid);
+    if (!h || h->prefix_len > bcap - bpos - 1)
+        return;
+    for (int i = 0; i < h->prefix_len; i++)
+        buf[bpos++] = h->prefix[i];
+    buf[bpos] = 0;
+    if (h->has_value) {
+        h->has_value = 0;
+        kv_sbo_free(kv, h->box_offset);
+        h->box_offset = 0;
+        if (has_meta)
+            sync_metadata(kv, buf, 0, 0);
+    }
+    switch (h->type) {
+    case ART_N4: {
+        art_n4_t *x = (art_n4_t *)h;
+        for (int i = 0; i < (int)h->count; i++) {
+            if (bpos + 1 >= bcap)
+                return;
+            buf[bpos] = x->keys[i];
+            art_deltree_walk(kv, x->children[i], buf, bpos + 1, bcap, has_meta);
+        }
+        break;
+    }
+    case ART_N16: {
+        art_n16_t *x = (art_n16_t *)h;
+        for (int i = 0; i < (int)h->count; i++) {
+            if (bpos + 1 >= bcap)
+                return;
+            buf[bpos] = x->keys[i];
+            art_deltree_walk(kv, x->children[i], buf, bpos + 1, bcap, has_meta);
+        }
+        break;
+    }
+    case ART_N48: {
+        art_n48_t *x = (art_n48_t *)h;
+        for (int i = 0; i < 256; i++) {
+            if (x->index[i] == 255)
+                continue;
+            if (bpos + 1 >= bcap)
+                return;
+            buf[bpos] = (uint8_t)i;
+            art_deltree_walk(kv, x->children[x->index[i]], buf, bpos + 1, bcap,
+                             has_meta);
+        }
+        break;
+    }
+    case ART_N256: {
+        art_n256_t *x = (art_n256_t *)h;
+        for (int i = 0; i < 256; i++) {
+            if (x->children[i] < 0)
+                continue;
+            if (bpos + 1 >= bcap)
+                return;
+            buf[bpos] = (uint8_t)i;
+            art_deltree_walk(kv, x->children[i], buf, bpos + 1, bcap, has_meta);
+        }
+        break;
+    }
+    }
+}
+
+static void art_deltree_pfx(kvspace_t *kv, const char *pfx, int plen,
+                            bool has_meta) {
+    char buf[4096];
+    int bpos = 0;
+    if (kv->hdr->art_root < 0 || plen >= (int)sizeof buf)
+        return;
+    int32_t nid = art_cover(kv, kv->hdr->art_root, (const uint8_t *)pfx, plen,
+                            buf, (int)sizeof buf, &bpos);
+    if (nid >= 0)
+        art_deltree_walk(kv, nid, buf, bpos, (int)sizeof buf, has_meta);
 }
 
 int kvspaceShmDeltree(kvspace_t *kv, const char *prefix) {
@@ -2014,9 +2143,12 @@ int kvspaceShmDeltree(kvspace_t *kv, const char *prefix) {
         return -1;
     if (kv_sync(kv) != 0)
         return -1;
+    size_t pl = strlen(prefix);
+    if (pl >= 1020)
+        return -1;
     // if prefix itself is a link, only delete the link
-    art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)prefix,
-                              (int)strlen(prefix));
+    art_hdr_t *h =
+        art_search(kv, kv->hdr->art_root, (const uint8_t *)prefix, (int)pl);
     if (h && h->has_value) {
         uint8_t *raw;
         int32_t rl;
@@ -2028,49 +2160,38 @@ int kvspaceShmDeltree(kvspace_t *kv, const char *prefix) {
             return kvspaceShmDel(kv, prefix);
         }
     }
-    char *e = edir(prefix); // ensure trailing / for listing children
-    char **ns;
-    int32_t nc;
-    kvspaceShmList(kv, e, false, 1, &ns, &nc);
-    for (int i = 0; i < nc; i++) {
-        char *c = pjoin(e, ns[i]);
-        kvspaceShmDeltree(kv, c);
-        free(c);
+    int mbpos = 0;
+    char mpbuf[32];
+    static const char mpfx[] = "/.kvspace-meta/";
+    bool has_meta =
+        art_cover(kv, kv->hdr->art_root, (const uint8_t *)mpfx,
+                  (int)(sizeof mpfx - 1), mpbuf, (int)sizeof mpbuf, &mbpos) >= 0;
+    if (pl == 1 && prefix[0] == '/') {
+        char buf[4096];
+        art_deltree_walk(kv, kv->hdr->art_root, buf, 0, (int)sizeof buf, false);
+        return 0;
     }
-    for (int i = 0; i < nc; i++)
-        free(ns[i]);
-    free(ns);
+    char e[1028];
+    size_t el = pl;
+    while (el > 0 && prefix[el - 1] == '/')
+        el--;
+    memcpy(e, prefix, el);
+    e[el] = '/';
+    e[el + 1] = 0;
+    art_deltree_pfx(kv, e, (int)(el + 1), has_meta);
 
-    /* 成员目录 marker（prefix·，U+00B7）：成员 key =
-       prefix·<name>，直接拼接后递归删除。 slash 版 e=prefix/ 覆盖不到 ·
-       成员（json 的 stringkeymap 落盘形态）。 */
-    size_t pl = strlen(prefix);
-    char *m = malloc(pl + 3);
-    memcpy(m, prefix, pl);
-    m[pl] = (char)0xC2;
-    m[pl + 1] = (char)0xB7;
-    m[pl + 2] = 0;
-    char **ms;
-    int32_t mc;
-    kvspaceShmList(kv, m, false, 1, &ms, &mc);
-    for (int i = 0; i < mc; i++) {
-        size_t ml = strlen(m), nl = strlen(ms[i]);
-        char *c = malloc(ml + nl + 1);
-        memcpy(c, m, ml);
-        memcpy(c + ml, ms[i], nl + 1);
-        kvspaceShmDeltree(kv, c);
-        free(c);
+    e[el] = (char)0xC2;
+    e[el + 1] = (char)0xB7;
+    e[el + 2] = 0;
+    art_deltree_pfx(kv, e, (int)(el + 2), has_meta);
+
+    if (h && h->has_value) {
+        h->has_value = 0;
+        kv_sbo_free(kv, h->box_offset);
+        h->box_offset = 0;
+        if (has_meta)
+            sync_metadata(kv, prefix, 0, 0);
     }
-    for (int i = 0; i < mc; i++)
-        free(ms[i]);
-    free(ms);
-    kvspaceShmDel(kv, m);
-    free(m);
-
-    kvspaceShmDel(kv, prefix);
-    if (strcmp(e, prefix) != 0)
-        kvspaceShmDel(kv, e);
-    free(e);
     return 0;
 }
 
@@ -2365,15 +2486,23 @@ int kvspaceShmExtindex(kvspace_t *kv, const char *p, const char *ep) {
     if (!source || source_len <= 0 ||
         kvspaceXhDecode(source, (uint64_t)source_len, &source_head) != 0)
         return -1;
-    char *type = strndup((const char *)source_head.langtype, source_head.langtype_len);
-    if (!type)
-        return -1;
+    char tbuf[256];
+    char *type = tbuf;
+    if (source_head.langtype_len >= sizeof tbuf) {
+        type = strndup((const char *)source_head.langtype, source_head.langtype_len);
+        if (!type)
+            return -1;
+    } else {
+        memcpy(tbuf, source_head.langtype, source_head.langtype_len);
+        tbuf[source_head.langtype_len] = 0;
+    }
     uint8_t *v = NULL;
     uint64_t vl = 0;
     int r = kvspaceXhNewExt(type, ep, strlen(ep), &v, &vl);
     if (r == 0)
         r = kvspaceShmSetValue(kv, p, v, (int32_t)vl, 0, 0);
-    free(type);
+    if (type != tbuf)
+        free(type);
     free(v);
     return r;
 }

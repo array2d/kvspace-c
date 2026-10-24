@@ -25,18 +25,26 @@ static int headlen_of(uint8_t pow, uint32_t *headlen) {
 }
 
 static int scalar_width(const uint8_t *s, uint32_t n) {
+    if (n == 5 && memcmp(s, "int64", 5) == 0)
+        return 8;
+    if (n == 7 && memcmp(s, "float64", 7) == 0)
+        return 8;
+    if (n == 4 && memcmp(s, "bool", 4) == 0)
+        return 1;
+    if (n == 5 && (memcmp(s, "int32", 5) == 0 || memcmp(s, "uint8", 5) == 0))
+        return s[0] == 'i' ? 4 : 1;
     static const struct {
         const char *name;
+        uint8_t n;
         uint8_t w;
     } tab[] = {
-        {"bool", 1},    {"int8", 1},     {"int16", 2},    {"int32", 4},
-        {"int64", 8},   {"uint8", 1},    {"uint16", 2},   {"uint32", 4},
-        {"uint64", 8},  {"float8/e4m3", 1}, {"float8/e5m2", 1},
-        {"float16", 2}, {"bfloat16", 2}, {"float32", 4},  {"float64", 8},
+        {"int8", 4, 1},         {"int16", 5, 2},        {"uint16", 6, 2},
+        {"uint32", 6, 4},       {"uint64", 6, 8},       {"float8/e4m3", 11, 1},
+        {"float8/e5m2", 11, 1}, {"float16", 7, 2},      {"bfloat16", 8, 2},
+        {"float32", 7, 4},
     };
     for (size_t i = 0; i < sizeof tab / sizeof tab[0]; i++) {
-        size_t L = strlen(tab[i].name);
-        if (L == n && memcmp(s, tab[i].name, n) == 0)
+        if (tab[i].n == n && memcmp(s, tab[i].name, n) == 0)
             return tab[i].w;
     }
     return -1;
@@ -100,6 +108,25 @@ static int slack_count(size_t k, const uint8_t *data, uint64_t len, uint64_t *co
         }
         *count = len / width;
         return 0;
+    }
+    uint8_t acc = 0;
+    uint64_t idx = 0;
+    while (idx + 8 <= len) {
+        uint64_t w;
+        memcpy(&w, data + idx, 8);
+        if (w & 0x8080808080808080ULL) {
+            acc = 0x80;
+            break;
+        }
+        idx += 8;
+    }
+    if (!acc) {
+        for (; idx < len; idx++)
+            acc |= data[idx];
+        if ((acc & 0x80) == 0) {
+            *count = len;
+            return 0;
+        }
     }
     *count = 0;
     for (uint64_t i = 0; i < len; (*count)++) {
@@ -493,9 +520,8 @@ static int xh_header(const uint8_t *data, uint64_t len, kvspaceXh *out) {
     uint64_t b = get_u64(data + 10);
     const uint8_t *lt = data + KVSPACE_XH_PREFIX;
     uint32_t region = headlen - KVSPACE_XH_PREFIX;
-    uint32_t ltlen = 0;
-    while (ltlen < region && lt[ltlen] != 0)
-        ltlen++;
+    const uint8_t *nul = memchr(lt, 0, region);
+    uint32_t ltlen = nul ? (uint32_t)(nul - lt) : region;
     uint64_t content = 0;
     uint64_t cap = 0;
     if (kind == KVSPACE_XH_FIXED_SMALL) {
