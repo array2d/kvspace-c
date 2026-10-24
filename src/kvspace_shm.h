@@ -23,6 +23,15 @@ typedef struct {
     uint32_t depth;
 } kvspaceRef_t;
 
+/* 与 kvspace/include/kvspace/kvspace.h 的 kvspaceSlotView_t 逐字段一致。 */
+typedef struct {
+    uint8_t *head;
+    uint32_t headlen;
+    uint8_t *body;
+    uint64_t body_cap;
+    uint64_t cap;
+} kvspaceSlotView_t;
+
 /* ================================================================
  * 生命周期
  * ================================================================ */
@@ -45,6 +54,9 @@ int kvspaceShmMetaGetAt(kvspace_t *kv, const char *key, uint8_t *ro, uint32_t *v
 int kvspaceShmResolveRef(kvspace_t *kv, const char *key, kvspaceRef_t *ref);
 uint8_t *kvspaceShmGetByRef(kvspace_t *kv, kvspaceRef_t *ref,
                             const char *key_fallback, int32_t *out_len);
+/* shm slot view：返回映射内 head/body 与整 box 物理容量。0=成功，-1=不可视槽。 */
+int kvspaceShmSlotView(kvspace_t *kv, const kvspaceRef_t *ref,
+                       const char *key_fallback, kvspaceSlotView_t *out);
 int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
                            const char *key_fallback, uint32_t offset,
                            const uint8_t *buf, uint32_t buf_len);
