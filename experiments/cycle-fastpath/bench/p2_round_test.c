@@ -20,6 +20,7 @@
  *   a6   leader 在 drain 中 kill -9：下一轮接管，只漏一个 box，不 double free
  *   a25  reserve 后 alloc / art_ins 失败 → cancel，旧值不变、无残留
  *   a27  leader 槽被回收后（旧 claim 消失）仍能接管
+ *   r10  单写者 8B 同尺寸写 + view 读：只见 old/new（x86 原子性；arm64 需另跑）
  *   churn <store> <ms>  持续制造垃圾的 helper（R4 用），结束时打印轮次统计
  */
 #define _GNU_SOURCE
@@ -479,6 +480,50 @@ static int m_a27(const char *store) {
     return 0;
 }
 
+/* R10：A 快路径同尺寸 8B 写 + view 读（单写者 + 读者）：读只见 old/new。 */
+static int m_r10(const char *store) {
+    kvspace_t *kv = kvspaceShmOpen(store, STORE_SZ);
+    if (!kv) FAIL("open");
+    uint32_t la = 0, lb = 0;
+    uint8_t *va = mkval(8, &la), *vb = mkval(8, &lb);
+    put(kv, "/k", va, la);
+    int ready[2], stop[2], bad[2];
+    if (pipe(ready) || pipe(stop) || pipe(bad)) FAIL("pipe");
+    pid_t p = fork();
+    if (p == 0) {
+        close(ready[0]); close(stop[1]); close(bad[0]);
+        kvspace_t *c = kvspaceShmOpen(store, STORE_SZ);
+        if (!c) _exit(2);
+        quiesce_off(c);
+        kvspaceViewToken_t t = {0};
+        if (kvspaceShmViewResolve(c, "/k", &t) != 0) _exit(3);
+        wr(ready[1], 'r');
+        char go = 0;
+        while (read(stop[0], &go, 1) != 1) {
+            if (kvspaceShmViewCheck(c, &t) != 0 &&
+                kvspaceShmViewRefresh(c, &t, "/k") != 0)
+                continue;
+            if (memcmp(t.body, va + t.headlen, 8) != 0 &&
+                memcmp(t.body, vb + t.headlen, 8) != 0) {
+                wr(bad[1], 'B');
+                _exit(4);
+            }
+        }
+        _exit(0);
+    }
+    close(ready[1]); close(stop[0]); close(bad[1]);
+    rd(ready[0]);
+    for (int i = 0; i < 2000000; i++)
+        put(kv, "/k", (i & 1) ? vb : va, la);
+    wr(stop[1], 's');
+    int st = 0;
+    waitpid(p, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) FAIL("reader saw torn value (st=%d)", st);
+    kvspaceShmClose(kv);
+    puts("PASS r10");
+    return 0;
+}
+
 /* T3：活 owner 在跑时，另一个进程的 Sweep 必须立即返回 -1（不等待）。 */
 static int m_t3(const char *store) {
     kvspace_t *kv = kvspaceShmOpen(store, STORE_SZ);
@@ -590,6 +635,7 @@ int main(int argc, char **argv) {
     if (!strcmp(m, "t4")) return m_t4(st);
     if (!strcmp(m, "t3")) return m_t3(st);
     if (!strcmp(m, "a25")) return m_a25(st);
+    if (!strcmp(m, "r10")) return m_r10(st);
     if (!strcmp(m, "churn"))
         return m_churn(st, argc > 3 ? atoi(argv[3]) : 3000);
     if (!strcmp(m, "a27")) return m_a27(st);

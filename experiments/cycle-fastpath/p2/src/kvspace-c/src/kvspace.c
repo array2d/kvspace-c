@@ -2322,7 +2322,7 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
 
     if (created) {
         memset(kv->hdr, 0, sizeof(*kv->hdr));
-        kv->hdr->format_version = 2;
+        kv->hdr->format_version = 3;
         kv->hdr->garb_cap = GARB_CAP;
         kv->hdr->art_slab_size = art_slab;
         kv->hdr->sbo_head_size = sbo_head;
@@ -2331,11 +2331,21 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
         if (blocks_init(kv->art_meta, art_slab, ART_NODE_MAX_SZ) != 0 ||
             sbo_init(kv->sbo_meta, sbo_head, data_size) != 0)
             goto fail;
+        /* blocks_init 按容量选 2/4/8 字节块头。4 字节头 + 8 对齐的块大小使
+         * 节点地址交替落在 8k+4，art_hdr_t.val（偏移 16）跨 64B 行：x86
+         * locked CAS 变成 split lock（实测 ~7k tick/次，del p95 26k）。
+         * 节点地址必须 8 字节对齐（原子字不可跨行），故强制 8 字节头。 */
+        kv->art_meta->sizeof_block_head = 8;
+        if ((kv->art_meta->sizeof_block_head +
+             kv->art_meta->block_size) % 8 != 0)
+            goto fail;
         /* magic last: half-initialized file fails reopen */
         memcpy(kv->hdr->magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1);
     }
     if (!created &&
-        (kv->hdr->format_version != 2 || kv->hdr->garb_cap != GARB_CAP)) {
+        (kv->hdr->format_version != 3 ||
+         kv->art_meta->sizeof_block_head != 8 ||
+         kv->hdr->garb_cap != GARB_CAP)) {
         fprintf(stderr, "kvspace: unsupported store format (version=%u, "
                         "garb_cap=%llu); rebuild the shm store\n",
                 kv->hdr->format_version, (unsigned long long)kv->hdr->garb_cap);
