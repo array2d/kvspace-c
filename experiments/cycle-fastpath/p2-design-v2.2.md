@@ -361,10 +361,12 @@ for (i = head; ; i++) {
                        }
                        return;                   // 活着的预留者在飞（含 SIGSTOP）：本轮到此为止
     case GE_COMMITTED: if (!((int32_t)(r - ent.epoch) > 0)) return;
+                       uint64_t cap = sbo_allocated_size(ent.off); // 必须在 free 之前
                        store(hdr->garb_freeing, ent.off);   // 崩溃标记
                        store(ent.meta, GE_EMPTY);           // 先消费，再 free
                        advance(i);
-                       kv_sbo_free(ent.off); garb_bytes -= cap_of(ent.off);
+                       kv_sbo_free(ent.off);
+                       fetch_sub(garb_bytes, cap);          // 用 free 前的容量
                        continue;
     }
 }
@@ -377,7 +379,8 @@ for (i = head; ; i++) {
 - head 每推进一条就写回 hdr（崩溃后下一个 leader 从精确位置继续）。
 - **先消费再 free**：leader 崩在两者之间只漏一个 box，绝不 double free。
 - **`garb_bytes` 加减点**（唯一口径）：commit 时 `+= sbo_allocated_size(off)`；
-  drain 释放时 `-= sbo_allocated_size(off)`；reserve / cancel / EMPTY 推进 **不变**。
+  drain 释放时 **先取 `cap = sbo_allocated_size(off)`、free 之后再 `-= cap`**
+  （free 后分配器元数据可能变，顺序反了会记错）；reserve / cancel / EMPTY 推进 **不变**。
   因此 `garb_bytes` 恒等于“已提交但未回收的物理垃圾字节”，不含在飞预留。
 - 不要求一轮清空；`RESERVED` 或 `epoch >= r` 处停止，其余留给下一轮。
 - 一轮里若有条目被“停止点”挡住，本轮仍算成功（已释放的部分有效）。
@@ -455,16 +458,22 @@ for (;;) {
 
 ### 2.5 选举 / 接管
 
-`barrier_state` 单字 CAS + `barrier_pid/starttime` owner 戳，复制 `p2_reg_claim`
-三态法（FREE → CLAIMING → OWNED）：
+`barrier_state` 是**单字 CAS 选举字**，编码与环条目相同：`state:2 | claim_id:30`
+（FREE=0 / OWNED=1）。owner 身份就是 claim_id，不需要额外戳，也没有 CLAIMING
+过渡态——避免“写戳被后来者覆盖”和“死在过渡态”两种卡死：
 
 ```
 elect():
-  CAS(FREE, CLAIMING) 成功 → 写戳 → OWNED                     /* 当选 */
-  state==OWNED && !alive(pid,starttime) → CAS(OWNED, CLAIMING) → 写自己的戳   /* 死者接管 */
-  state==CLAIMING && pid==0 → CAS(CLAIMING, FREE)              /* 认领者死在写戳前 */
-  否则 return false                                            /* 活着的 owner：跳过 */
+  cur = load(barrier_state)
+  cur == FREE                     → CAS(FREE → OWNED|mine) 成功即当选
+  cur == OWNED && GE_CLAIM(cur) == mine       → false（本进程已有 leader 线程）
+  cur == OWNED && claim_alive(GE_CLAIM(cur))  → false（活 owner：跳过，不等待）
+  cur == OWNED && !claim_alive(...)            → CAS(OWNED|old → OWNED|mine)（死者接管）
+  其它                            → false（非法状态，不猜）
 ```
+
+`claim_alive` = 扫 64 槽：存在 `state==MINE && claim_id==claim` 且 pid+starttime 存活。
+`barrier_pid/barrier_starttime` 只作诊断字段（当选时写入），不参与裁决。
 
 ### 2.6 store_id 与崩溃审计
 
@@ -557,7 +566,7 @@ typedef struct {
     uint32_t format_version;      /* = 2 */
     uint32_t recovery_epoch;      /* 屏障轮次（模比较） */
     uint32_t ack_seq;             /* 跨进程 futex 字 */
-    uint32_t barrier_state;       /* FREE/CLAIMING/OWNED */
+    uint32_t barrier_state;       /* state:2 | claim_id:30（FREE=0/OWNED=1） */
     uint64_t barrier_pid, barrier_starttime;
     uint64_t garb_cap, garb_head, garb_tail, garb_bytes;
     uint64_t garb_freeing;
@@ -571,7 +580,7 @@ typedef struct {
     uint32_t pid, state;
     uint64_t starttime;
     uint64_t recovery_ack;
-    uint32_t quiesced;            /* Q2 声明，release/acquire */
+    uint32_t quiesced;            /* Q2 声明，release/acquire；claim 时置 1 */
     uint32_t claim_id;            /* open 时领取（1..(1<<30)-1），reserve 条目引用 */
 } p2_slot_t;
 ```
@@ -609,9 +618,10 @@ hdr 变长 ⇒ `ART_OFF` 变、新增 `<path>.garb`、节点首部布局变 ⇒ 
 
 | 项 | 规定 |
 |---|---|
+| 初始值 | **open/claim 时 `quiesced=1`**（新进程还没有任何 token，天然静默）；runtime 开始使用 view 时必须显式 `ViewQuiesce(h,0)`，纯持有/空转进程保持 1，不会阻塞轮次 |
 | 参数 | `on` 只接受 0/1，其它 → -1（不猜） |
 | on=1 | 前置：调用线程已作废本进程**全部** view token（runtime 责任）。后端 `slot->quiesced=1`（release）→ `ack_seq++`（release）→ `futex_wake` → 0 |
-| on=0 | `slot->quiesced=0`（release）→ 0；此后 runtime 必须重新解析，旧 token 一律无效 |
+| on=0 | `slot->quiesced=0`（release）→ 0；此后 runtime 必须重新解析，旧 token 一律无效。runtime 启动（首次使用 view 前）必须调一次 |
 | 幂等 | 重复 on=1 / on=0 均返回 0；on=1 时不得有 in-flight token 使用 |
 | 可见性 | leader 用 acquire 读 `quiesced`；release/acquire 配对保证“最后一次 body 读”先于 free（§1.7 边 1-2） |
 | 机械校验 | backend 维护进程内镜像 `kv->quiesced`；`quiesced` 期间任何 View\*（除 Ack/Quiesce）返回 **-1**，不静默回退 |
@@ -645,7 +655,8 @@ hdr 变长 ⇒ `ART_OFF` 变、新增 `<path>.garb`、节点首部布局变 ⇒ 
 | 每 **64 条指令**（`kvcpu.c` 主循环，handler 返回后） | Q1：`view_epoch` 变了 → 作废读 view → `ViewAck` |
 | 进入阻塞/长调用前（`kvspaceWatch`、sleep、把控制权交扩展） | 作废全部读 view → `ViewQuiesce(h,1)`；返回后 `Quiesce(h,0)` 并重新解析 |
 | 帧/进程销毁前 | 作废全部读 view（下一次 Q1 自然 ack） |
-| 纯持有进程（open 后不跑 op） | open 返回后立即 `Quiesce(h,1)`，直到 close |
+| 纯持有进程（open 后不跑 op） | 保持 claim 时的 `quiesced=1`，直到 close |
+| runtime 首次使用 view 前 | 必须 `Quiesce(h,0)`（open 默认 1），否则任何 View\* 硬错误 |
 
 **runtime-c 必须括号化的阻塞点**（漏一个 = 该进程只能靠 200ms 超时放弃）：
 
@@ -705,6 +716,8 @@ hdr 变长 ⇒ `ART_OFF` 变、新增 `<path>.garb`、节点首部布局变 ⇒ 
 | **A19** | **reserve 后变更失败**：测试钩子让 `kv_sbo_alloc` / `art_ins` 失败 | 旧值逐字节不变；该条 `meta.state==EMPTY`（无 COMMITTED），`off` 未被当作状态使用；`tail` 前进但 `garb_bytes` 不变；后续一轮能越过；allocator 无新 box 泄漏；`reserved == committed + cancelled` |
 | **A20** | **drain 不跨未决条**：测试钩子 `P2_TEST_HOLD_RESERVE_MS` 把某写者卡在 reserve 与 commit 之间，其它写者在其后追加 | 卡住期间的轮次不得免费卡住条之后的任何条目（即使 `epoch < r`）；卡住条 commit 前 head 不越过；commit 后下一轮按序释放且每个 box 只 free 一次；`off=0` 的合法 box 不被误判为 EMPTY（构造 offset 0 的 box） |
 | **A21** | **原子访问静态检查**：全仓 grep `has_value` / `box_offset` 直接位域访问 = 0 处，全部经 `art_val_*`；resolve 在并发写压力下不产生 (gen, box) 失配通过 Check（debug 断言 + 强压） | 检查脚本 0 命中；压力下无 token 读到已退役 box |
+| **A22** | **新进程中途 open**（claim 后 `quiesced=1`，未跑任何 op） | 不阻塞正在进行的轮次；runtime 就绪调 `ViewQuiesce(0)` 后正常解析/使用；纯持有进程保持 1，轮次永不因它超时 |
+| **A23** | **leader 自己进程**：维护线程当选，但同进程解释器既未 ack 也未声明静默 | 本轮超时且零 free；解释器 Q1 ack 或 Q2 声明后，下一轮成功回收 |
 
 ### B. 性能（**≥17 核**；隔离 `$ORIGIN` bin；10 轮 repeat=3，只跑 shm）
 

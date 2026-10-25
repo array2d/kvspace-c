@@ -19,6 +19,8 @@ extern int kvspaceShmViewResolve(kvspace_t *, const char *, kvspaceViewToken_t *
 extern int kvspaceShmViewCheck(kvspace_t *, const kvspaceViewToken_t *);
 extern int kvspaceShmViewRelease(kvspace_t *, kvspaceViewToken_t *);
 extern int kvspaceShmViewSweep(kvspace_t *);
+extern int kvspaceShmViewQuiesce(kvspace_t *, int);
+extern int kvspaceShmViewAck(kvspace_t *, uint32_t *);
 
 #define STORE_SZ (8ull * 64 * 64 * 64 * 64)
 static double now_s(void) {
@@ -39,6 +41,7 @@ static uint8_t *mk(uint32_t n, uint32_t *out_len) {
 static int m_boxsizes(const char *store) {
     kvspace_t *kv = kvspaceShmOpen(store, STORE_SZ);
     if (!kv) return 2;
+    if (kvspaceShmViewQuiesce(kv, 0) != 0) return 2;   /* 用 view 前必须退出默认静默 */
     uint32_t sizes[] = {1, 8, 16, 24, 32, 48, 64, 128, 512};
     printf("value_bytes,wire_len,box_cap,body_cap\n");
     for (size_t i = 0; i < sizeof sizes / sizeof *sizes; i++) {
@@ -100,6 +103,7 @@ static int m_barrier(const char *store, int helpers, int reps) {
         if (p == 0) {
             kvspace_t *k2 = kvspaceShmOpen(store, STORE_SZ);
             if (!k2) _exit(2);
+            if (kvspaceShmViewQuiesce(k2, 0) != 0) _exit(2);
             uint32_t vl = 0;
             uint8_t *v = mk(8, &vl);
             char key[64];
@@ -108,8 +112,10 @@ static int m_barrier(const char *store, int helpers, int reps) {
             kvspaceViewToken_t t = {0};
             if (kvspaceShmViewResolve(k2, key, &t) != 0) _exit(2);
             int delay = helper_delay_us();
+            uint32_t ep = 0;
             for (;;) {
-                (void)kvspaceShmViewCheck(k2, &t);        /* ack 在 Check 入口 */
+                (void)kvspaceShmViewAck(k2, &ep);         /* Q1：op 边界 ack */
+                (void)kvspaceShmViewCheck(k2, &t);
                 if (delay > 0) usleep((useconds_t)delay);
             }
         }
