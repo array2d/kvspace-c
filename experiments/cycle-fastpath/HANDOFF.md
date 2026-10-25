@@ -193,10 +193,20 @@ bj-build：`taskset` 绑核 + `rdtscp`（`lfence;rdtscp;lfence`），依赖加�
 
 ## 8. 建议的下一步（接手方）
 
-1. 读 `p2-reclaim-model.md` §1.6（模型）与 §1.5（存档，仅供参考）。
-2. 按 §1.6 实现静默屏障：去 pin → 垃圾表（8B 偏移分段，7.5MiB/64MiB）→ 墓碑走 ART DFS →
-   后台维护线程 + `barrier_busy` CAS 选举 → runtime ack 契约。
-3. 删掉 `ring + flusher`，`art_del` 统一为墓碑。
-4. 跑 `bench/p2_threads_test.c`、`bench/p2_registry_test.c`（slots/orphan/sigstop）+ 新增
-   TSan/ASan/多进程；再回 bj-build 复测四项。
+> **2026-10-25 方案更新（Linux 接手）：当前实现口径是 `p2-design-v2.2.md`，不是本节旧稿。**
+> 旧稿的“墓碑走 ART DFS + 8B 偏移 / 7.5MiB 表”已被**统一 16B 条目环**取代：DFS 只能
+> 看到“现在是墓碑”，拿不到退役时刻；第 r 轮在 ack 之后才扫到的墓碑会被 free，而指向
+> 它的 token 可能是 ack **之后**创建的（反例见 v2.2 §1.2）。环条目
+> `{off, epoch, meta = state:2 | claim:30}` 天然带退役时刻（commit 时读 epoch），
+> 表 2^21 条 = 32MiB VA，阈值仍 **64MiB / 最小 box 72B ≈ 932k 条**；屏障频率与开销
+> 结论不变（writestat：all-writes resize 2.4% ↔ step1 x86 2.403% → 64MiB 约每 8s 一次）。
+
+1. 读 `p2-design-v2.2.md`（当前方案，含 Q1/Q2 ack 权威与 hdr v5）与
+   `p2-reclaim-model.md` §1.6（仅存档）。
+2. 按 v2.2 实现：删 pin → hdr v5 + `art_val_*` 原子字 → `.garb` reserve/commit/cancel
+   （表满在写路径硬错误、且失败在键值变更之前）→ Q1/Q2 ack → 屏障轮 + futex + 维护线程
+   → runtime 接入。**不要实现墓碑 ART DFS，也不要退役链。**
+3. 删除 `ring + flusher`；所有 box 退役（换尺寸 / 删除 / 节点移除）统一进环。
+4. 并发/崩溃测试：slots/orphan/SIGSTOP/屏障中崩溃/close-reopen/表满 + TSan/ASan；
+   **arm64（Mac mini）跑 A13/A19/A20/A21 是发布前置**，x86 通过只算阶段性。
 5. 补 durable ENOTSUP 桩与 runtime 接入方案，冻结 patch。
