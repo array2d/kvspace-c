@@ -155,6 +155,10 @@ int kvspaceShmViewQuiesce(kvspace_t *kv, int on);
 uint64_t kvspaceShmViewGarbBytes(kvspace_t *kv);
 void kvspaceShmViewRoundStats(kvspace_t *kv, uint64_t *ok, uint64_t *aborted,
                               uint64_t *leaks);
+/* 对齐/格式验收（仅测试构建）：返回 -1=通过，>=0=首个坏块 id，-2=块头宽度
+ * 不是 8；SetFormatVersion 用于构造"旧 store 必须拒绝"的用例。 */
+int64_t kvspaceShmArtAlignCheck(kvspace_t *kv);
+void kvspaceShmTestSetFormatVersion(kvspace_t *kv, uint32_t v);
 #endif
 int kvspaceShmViewSweep(kvspace_t *kv);
 int kvspaceShmViewFlushTomb(kvspace_t *kv);
