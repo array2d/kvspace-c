@@ -1,0 +1,4 @@
+processes=684 same=363933 realloc=82402 fresh=2983868 retired_bytes=4968776
+overwrite: same=81.5% resize=18.5%
+all writes: resize=2.4% fresh=87.0%
+suite: PASS 227 / FAIL 1 (见 tutorial-suite.log 末尾)

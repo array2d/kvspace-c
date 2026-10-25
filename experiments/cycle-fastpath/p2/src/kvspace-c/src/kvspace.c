@@ -222,6 +222,7 @@ static void region_close(shm_region_t *r) {
 
 /* ── P2: 旁路 gen 表（node id → {struct_gen, value_gen}）──────────── */
 static void kv_sbo_free(kvspace_t *kv, uint64_t off);
+static void p2_setstats_dump(void);
 static art_hdr_t *art_hdr(kvspace_t *kv, int32_t id);
 static int32_t art_child(kvspace_t *kv, void *n, uint8_t b);
 static int pfx_shared(const uint8_t *a, int al, const uint8_t *b, int bl);

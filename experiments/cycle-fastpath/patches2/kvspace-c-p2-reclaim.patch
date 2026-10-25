@@ -64,7 +64,7 @@ index db1fb31..9ea310e 100644
 +    return kvspaceShmViewRefresh((kvspace_t *)h, tok, key);
 +}
 diff --git a/src/kvspace.c b/src/kvspace.c
-index 908f88e..3fc8470 100644
+index 908f88e..c63e39a 100644
 --- a/src/kvspace.c
 +++ b/src/kvspace.c
 @@ -13,6 +13,7 @@
@@ -147,13 +147,14 @@ index 908f88e..3fc8470 100644
  static void region_close(shm_region_t *r) {
      if (r->base)
          munmap(r->base, r->reserve);
-@@ -187,6 +219,686 @@ static void region_close(shm_region_t *r) {
+@@ -187,6 +219,687 @@ static void region_close(shm_region_t *r) {
  }
  
  /* Pick up growth done by another process (mid-op growth: kvspace#11). */
 +
 +/* ── P2: 旁路 gen 表（node id → {struct_gen, value_gen}）──────────── */
 +static void kv_sbo_free(kvspace_t *kv, uint64_t off);
++static void p2_setstats_dump(void);
 +static art_hdr_t *art_hdr(kvspace_t *kv, int32_t id);
 +static int32_t art_child(kvspace_t *kv, void *n, uint8_t b);
 +static int pfx_shared(const uint8_t *a, int al, const uint8_t *b, int bl);
@@ -834,7 +835,7 @@ index 908f88e..3fc8470 100644
  static int kv_sync(kvspace_t *kv) {
      if (region_map(&kv->r_art, ART_OFF + (size_t)kv->hdr->art_slab_size) != 0)
          return -1;
-@@ -342,6 +1054,64 @@ static void kv_sbo_free(kvspace_t *kv, uint64_t off) {
+@@ -342,6 +1055,64 @@ static void kv_sbo_free(kvspace_t *kv, uint64_t off) {
      sbo_free(kv->sbo_meta, off);
  }
  
@@ -899,7 +900,7 @@ index 908f88e..3fc8470 100644
  /* ---- helpers ---- */
  static void *art_blk(kvspace_t *kv, int32_t id) {
      if (id < 0)
-@@ -350,11 +1120,22 @@ static void *art_blk(kvspace_t *kv, int32_t id) {
+@@ -350,11 +1121,22 @@ static void *art_blk(kvspace_t *kv, int32_t id) {
  }
  static int32_t art_balloc(kvspace_t *kv) {
      int64_t id = blocks_alloc(kv->art_meta, kv->art_data);
@@ -927,7 +928,7 @@ index 908f88e..3fc8470 100644
  }
  static art_hdr_t *art_hdr(kvspace_t *kv, int32_t id) {
      return (art_hdr_t *)art_blk(kv, id);
-@@ -648,6 +1429,12 @@ static int32_t art_grow(kvspace_t *kv, void *on) {
+@@ -648,6 +1430,12 @@ static int32_t art_grow(kvspace_t *kv, void *on) {
                      x->children[j] = tc;
                  }
      }
@@ -940,7 +941,7 @@ index 908f88e..3fc8470 100644
      oh->type = ART_MOVED;
      oh->has_value = 0;
      oh->box_offset = (uint64_t)(uint32_t)nid;
-@@ -656,6 +1443,7 @@ static int32_t art_grow(kvspace_t *kv, void *on) {
+@@ -656,6 +1444,7 @@ static int32_t art_grow(kvspace_t *kv, void *on) {
  
  /* ---- add child ---- */
  static int art_add(kvspace_t *kv, void *n, uint8_t b, int32_t cid) {
@@ -948,7 +949,7 @@ index 908f88e..3fc8470 100644
      art_hdr_t *h = n;
      switch (h->type) {
      case ART_N4: {
-@@ -903,7 +1691,9 @@ static int32_t art_del(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
+@@ -903,7 +1692,9 @@ static int32_t art_del(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
          if (!h->has_value)
              return nid;
          h->has_value = 0;
@@ -959,7 +960,7 @@ index 908f88e..3fc8470 100644
          h->box_offset = 0;
          *del = true;
      } else {
-@@ -1192,17 +1982,20 @@ static bool sbo_data_size_ok(size_t n) {
+@@ -1192,17 +1983,20 @@ static bool sbo_data_size_ok(size_t n) {
  kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
      if (!path)
          return NULL;
@@ -983,7 +984,7 @@ index 908f88e..3fc8470 100644
  
      /* validate before O_EXCL create: no empty file left behind */
      bool created = false;
-@@ -1237,7 +2030,8 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
+@@ -1237,7 +2031,8 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
          (kv->r_head.fd = open(head_path, fl, 0644)) < 0 ||
          region_attach(&kv->r_head, created, sbo_head, REGION_RESERVE) != 0 ||
          (kv->r_data.fd = open(data_path, fl, 0644)) < 0 ||
@@ -993,7 +994,7 @@ index 908f88e..3fc8470 100644
          goto fail;
  
      kv->hdr = (kvspace_hdr_t *)kv->r_art.base;
-@@ -1246,8 +2040,11 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
+@@ -1246,8 +2041,11 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
      kv->sbo_meta = (sbo_meta_t *)kv->r_head.base;
      kv->sbo_data = kv->r_data.base;
  
@@ -1005,7 +1006,7 @@ index 908f88e..3fc8470 100644
          kv->hdr->art_slab_size = art_slab;
          kv->hdr->sbo_head_size = sbo_head;
          kv->hdr->sbo_data_size = data_size;
-@@ -1258,10 +2055,31 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
+@@ -1258,10 +2056,31 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
          /* magic last: half-initialized file fails reopen */
          memcpy(kv->hdr->magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1);
      }
@@ -1037,7 +1038,7 @@ index 908f88e..3fc8470 100644
      pthread_mutex_init(&kv->wlock, NULL);
      for (int i = 0; i < WATCH_TABLE_SZ; i++) {
          pthread_cond_init(&kv->watches[i].cond, NULL);
-@@ -1270,9 +2088,21 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
+@@ -1270,9 +2089,21 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
      return kv;
  
  fail:
@@ -1059,7 +1060,7 @@ index 908f88e..3fc8470 100644
      free(kv);
      if (created) {
          unlink(path);
-@@ -1284,6 +2114,8 @@ fail:
+@@ -1284,6 +2115,8 @@ fail:
  void kvspaceShmClose(kvspace_t *kv) {
      if (!kv)
          return;
@@ -1068,7 +1069,7 @@ index 908f88e..3fc8470 100644
      for (int i = 0; i < WATCH_TABLE_SZ; i++) {
          pthread_cond_destroy(&kv->watches[i].cond);
          pthread_mutex_destroy(&kv->watches[i].mtx);
-@@ -1292,7 +2124,17 @@ void kvspaceShmClose(kvspace_t *kv) {
+@@ -1292,7 +2125,17 @@ void kvspaceShmClose(kvspace_t *kv) {
      pthread_mutex_destroy(&kv->wlock);
      region_close(&kv->r_art);
      region_close(&kv->r_head);
@@ -1086,7 +1087,7 @@ index 908f88e..3fc8470 100644
      free(kv);
  }
  
-@@ -1468,8 +2310,10 @@ static int32_t ref_leaf(kvspace_t *kv, kvspaceRef_t *ref, const char *key) {
+@@ -1468,8 +2311,10 @@ static int32_t ref_leaf(kvspace_t *kv, kvspaceRef_t *ref, const char *key) {
          return -1;
      int klen = (int)strlen(key);
      int d = (int)ref->gen;
@@ -1098,7 +1099,7 @@ index 908f88e..3fc8470 100644
      art_hdr_t *h = art_hdr(kv, id);
      if (!h || h->type == ART_MOVED)
          return -1;
-@@ -1681,18 +2525,46 @@ int kvspaceShmSlotView(kvspace_t *kv, const kvspaceRef_t *ref,
+@@ -1681,18 +2526,46 @@ int kvspaceShmSlotView(kvspace_t *kv, const kvspaceRef_t *ref,
      return 0;
  }
  
@@ -1145,7 +1146,7 @@ index 908f88e..3fc8470 100644
      }
      size_t alloc_len = (size_t)val_len;
      if (is_vthread_status_key(key) && alloc_len < KVSPACE_STATUS_MIN_CAP)
-@@ -1703,6 +2575,25 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
+@@ -1703,6 +2576,25 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
      memcpy(kv->sbo_data + off, val, val_len);
      kv->hdr->art_root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)key,
                                  (int)strlen(key), 0, off);
