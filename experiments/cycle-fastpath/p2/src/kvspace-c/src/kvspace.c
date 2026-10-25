@@ -211,7 +211,8 @@ struct kvspace {
     kvspace_hdr_t *hdr;
     uint64_t store_id;   /* 进程内句柄身份（P2 token 用） */
     int p2_slot;         /* 注册表槽；-1 = 未注册 */
-    uint32_t pid;        /* open 时的 pid；fork 后不相等 → 句柄硬失效 */
+    uint32_t pid;        /* open 时的 pid（冷路径判 fork） */
+    uint32_t fork_gen;   /* fork 世代：子进程里全局 +1 → 热路径守卫 */
     uint32_t quiesced;   /* Q2 进程内镜像；claim 时 = 1 */
     pthread_t maint_thread;
     uint32_t maint_seq;  /* 进程内私有 futex 字 */
@@ -407,14 +408,16 @@ static int garb_reserve(kvspace_t *kv, uint64_t *idx) {
     }
 }
 
-static void garb_commit(kvspace_t *kv, uint64_t idx, uint64_t off) {
+/* bytes 由退役点在“不拿分配器锁”的前提下给出（ViewDel 用 token 缓存的 cap，
+ * realloc 用已算出的 cap）；sbo_allocated_size 会取 sbo plock，不能进热路径。 */
+static void garb_commit(kvspace_t *kv, uint64_t idx, uint64_t off,
+                        uint64_t bytes_retired) {
     garb_ent_t *e = &kv->garb[idx & (GARB_CAP - 1)];
     uint32_t claim = GE_CLAIM(__atomic_load_n(&e->meta, __ATOMIC_ACQUIRE));
     e->off = off;
     e->epoch = __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE);
     __atomic_store_n(&e->meta, GE_MAKE(GE_COMMITTED, claim), __ATOMIC_RELEASE);
-    uint64_t bytes = __atomic_add_fetch(&kv->hdr->garb_bytes,
-                                        sbo_allocated_size(kv->sbo_meta, off),
+    uint64_t bytes = __atomic_add_fetch(&kv->hdr->garb_bytes, bytes_retired,
                                         __ATOMIC_ACQ_REL);
     if (bytes >= p2_garb_threshold())
         (void)p2_maint_start(kv);    /* 失败已置 reclaim_unavailable */
@@ -642,8 +645,20 @@ static int32_t art_child(kvspace_t *kv, void *n, uint8_t b);
 static int pfx_shared(const uint8_t *a, int al, const uint8_t *b, int bl);
 
 /* ── P2: 版本化 view token ─────────────────────────────────────── */
-#define P2_VIEW_GUARD(kv)                                                     \
-    ((kv)->pid != (uint32_t)getpid() || (kv)->quiesced)
+/* fork 检测不能每 op 调 getpid()（本机 glibc 不缓存，一次 ~150ns）。
+ * 用 pthread_atfork 的子进程钩子把全局世代 +1；热路径只比两个 u32。 */
+static uint32_t g_fork_gen;
+static pthread_once_t g_atfork_once = PTHREAD_ONCE_INIT;
+static void p2_atfork_child(void) {
+    __atomic_add_fetch(&g_fork_gen, 1u, __ATOMIC_ACQ_REL);
+}
+static void p2_atfork_install(void) {
+    (void)pthread_atfork(NULL, NULL, p2_atfork_child);
+}
+
+#define P2_FORK_GUARD(kv)                                                     \
+    ((kv)->fork_gen != __atomic_load_n(&g_fork_gen, __ATOMIC_ACQUIRE))
+#define P2_VIEW_GUARD(kv) ((kv)->quiesced || P2_FORK_GUARD(kv))
 
 int kvspaceShmViewFromRef(kvspace_t *kv, const kvspaceRef_t *ref,
                            const char *key_fallback, kvspaceViewToken_t *tok) {
@@ -826,7 +841,7 @@ int kvspaceShmViewDel(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key) {
         return 1;
     }
     __atomic_add_fetch(&g->value_gen, 2u, __ATOMIC_ACQ_REL); /* 静止态保持偶数 */
-    garb_commit(kv, gidx, AV_OFF(hv));
+    garb_commit(kv, gidx, AV_OFF(hv), tok->cap);
     (void)key;
     return 0;
 }
@@ -1137,7 +1152,7 @@ static void p2_maint_stop(kvspace_t *kv) {
 
 /* Q1：op 边界 ack。0 = 已 ack；1 = epoch 变了（先作废 token 再来）；-1 = 非法。 */
 int kvspaceShmViewAck(kvspace_t *kv, uint32_t *epoch) {
-    if (!kv || !epoch || kv->p2_slot < 0 || kv->pid != (uint32_t)getpid())
+    if (!kv || !epoch || kv->p2_slot < 0 || P2_FORK_GUARD(kv))
         return -1;
     uint32_t cur = __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE);
     if (*epoch != cur) {
@@ -1151,8 +1166,7 @@ int kvspaceShmViewAck(kvspace_t *kv, uint32_t *epoch) {
 /* Q2：显式静默声明。on 只接受 0/1；幂等；状态变化唤醒 leader。
  * 前置：调用线程已作废本进程全部 view token。声明期间 View* 一律 -1。 */
 int kvspaceShmViewQuiesce(kvspace_t *kv, int on) {
-    if (!kv || (on != 0 && on != 1) || kv->p2_slot < 0 ||
-        kv->pid != (uint32_t)getpid())
+    if (!kv || (on != 0 && on != 1) || kv->p2_slot < 0 || P2_FORK_GUARD(kv))
         return -1;
     p2_slot_t *s = &kv->hdr->slots[kv->p2_slot];
     if (__atomic_load_n(&s->quiesced, __ATOMIC_ACQUIRE) != (uint32_t)on) {
@@ -1939,7 +1953,8 @@ static int32_t art_del(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
         }
         gen_bump_value(kv, art_id_of(kv, h)); /* P2: 值删 */
         gen_bump_struct(kv, art_id_of(kv, h)); /* P2: 槽消失，view 失效 */
-        garb_commit(kv, gidx, AV_OFF(hv));
+        garb_commit(kv, gidx, AV_OFF(hv),
+                    sbo_allocated_size(kv->sbo_meta, AV_OFF(hv)));
         *del = true;
     } else {
         int32_t cid = art_child(kv, h, key[d]);
@@ -2347,6 +2362,8 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
     if (kv->p2_slot < 0)
         goto fail;
     kv->pid = (uint32_t)getpid();
+    (void)pthread_once(&g_atfork_once, p2_atfork_install);
+    kv->fork_gen = __atomic_load_n(&g_fork_gen, __ATOMIC_ACQUIRE);
     kv->quiesced = 1;               /* claim 时 slot->quiesced=1，二者一致 */
     if (__atomic_load_n(&kv->hdr->garb_bytes, __ATOMIC_ACQUIRE) >=
             p2_garb_threshold() &&
@@ -2887,8 +2904,9 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
     uint64_t ohv = old ? art_val_load(old) : 0;
     bool retiring = old && AV_HAS(ohv);
     uint64_t gidx = 0;
+    uint64_t cap = 0;
     if (retiring) {
-        uint64_t cap = sbo_allocated_size(kv->sbo_meta, AV_OFF(ohv));
+        cap = sbo_allocated_size(kv->sbo_meta, AV_OFF(ohv));
         if ((uint64_t)val_len <= cap) {
             /* 同尺寸就地写：指针不变，value_gen 奇偶保护（一次查表） */
             kv_gens_t *g = gens_at(kv, art_id_of(kv, old));
@@ -2955,7 +2973,7 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
         }
     }
     if (retiring)
-        garb_commit(kv, gidx, AV_OFF(ohv));
+        garb_commit(kv, gidx, AV_OFF(ohv), cap);
     return 0;
 }
 

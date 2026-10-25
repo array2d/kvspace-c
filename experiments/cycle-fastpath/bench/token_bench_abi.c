@@ -30,6 +30,7 @@ int main(int argc,char**argv){
  if(kvspaceNewChar(raw,8,&val,&vl)!=0)DIE("encode");
  char dsn[512];snprintf(dsn,sizeof dsn,"shm://%s",store);
  void*h=kvspaceConnect(dsn);if(!h)DIE("connect");
+ { int q=kvspaceViewQuiesce(h,0); if(q!=0 && q!=-2) DIE("quiesce off"); }
  char err[256];
  if(kvspaceSetValue(h,key,val,vl,0,0,err,sizeof err)!=0)DIE("setup");
  kvspaceRef_t ref;if(kvspaceResolveRef(h,key,&ref)!=0)DIE("resolve ref");
