@@ -7,6 +7,8 @@
 #   ABI50_ROUNDS=10 bench/run_50c_abi.sh
 #   baseline = 实验分支 pre-step1 树（默认 4a8c7fb，p2 原型，含 View* 但无 Ack/Quiesce），
 #   因为纯 v0.3.16 tag 没有 View ABI、跑不了本 bench。
+# 发布回归列（不参与 50c 判定）：ABI50_V0316=1 时用已安装 v0.3.16 公共 ABI
+# （kvspaceGet/SetValue/Del，无 View*）单跑 pget/pset/pdel，输出独立表。
 # 可选：ABI50_CPU=2 绑核；ABI50_BASE=<预构建 baseline 后端目录>；KVB/KVF 复用构建产物。
 #
 # 输出：$WORK/50c-abi.csv + 目标对齐表 + （双臂时）baseline/final 对比表。
@@ -59,6 +61,21 @@ if [ "$ROUNDS" -gt 1 ] || [ -n "${ABI50_BASE:-}" ]; then
     fi
 fi
 
+# ── 发布回归臂（v0.3.16 公共 ABI，无 View*）────────────────────────────
+V0316=${ABI50_V0316:-0}
+V0316_LIB=${ABI50_V0316_LIB:-/usr/lib/kvspace}
+PLAIN_BIN="$WORK/token_bench_plain"
+if [ "$V0316" = 1 ]; then
+    # 前端在系统库路径（本机 /lib/libkvspace.so.1），后端在 V0316_LIB。
+    if ! ldconfig -p 2>/dev/null | grep -q "libkvspace\.so\.1"; then
+        echo "v0.3.16 frontend (libkvspace.so.1) not installed"; exit 1
+    fi
+    PL=()
+    [ -f "$V0316_LIB/libkvspace.so.1" ] && PL=(-L"$V0316_LIB" -Wl,-rpath,"$V0316_LIB")
+    cc -O2 -DABI_PLAIN_ONLY -o "$PLAIN_BIN" "$HERE/bench/token_bench_abi.c" \
+       "${PL[@]}" -lkvspace -ldl || exit 1
+fi
+
 PIN=""
 if command -v taskset >/dev/null && [ -n "${ABI50_CPU:-}" ]; then PIN="taskset -c $ABI50_CPU"; fi
 NOSLD=""
@@ -96,6 +113,21 @@ suite() {
     done
 }
 
+# v0.3.16 发布回归：pget / pset / pdel（mean cycles，非 50c 口径）
+suite_plain() {
+    local out=$1 round=$2 op tag run st
+    mkdir -p "$out"
+    for spec in "pget|pget" "pset|pset" "pdel|pdel"; do
+        IFS='|' read -r op tag <<< "$spec"
+        for run in $(seq 0 $((RUNS-1))); do
+            st="$WORK/stores/$round-$tag-$run"; rm -rf "$st"; mkdir -p "$st"
+            env TOK_STORE="$st/db" TOK_PREFIX="$PFX" KVSPACE_BACKEND_PATH="$V0316_LIB" \
+                $NOSLD $PIN "$PLAIN_BIN" "$op" "$R" "$BATCHES" "$OPS" "$CAL" \
+                >> "$out/$tag.csv" 2>/dev/null || { echo "$tag: bench failed"; return 1; }
+        done
+    done
+}
+
 rm -rf "$WORK/raw"; mkdir -p "$WORK/raw"
 if [ -z "$BASE_KVB" ]; then
     for r in $(seq 1 "$ROUNDS"); do suite "$KVB" "$WORK/raw/final" "$r" || exit 1; done
@@ -103,13 +135,17 @@ else
     for r in $(seq 1 "$ROUNDS"); do
         suite "$BASE_KVB" "$WORK/raw/base" "$r" || exit 1
         suite "$KVB"      "$WORK/raw/final" "$r" || exit 1
+        if [ "$V0316" = 1 ]; then
+            suite_plain "$WORK/raw/v0316" "$r" || exit 1
+        fi
         echo "round $r done"
     done
 fi
 
-python3 - "$WORK/raw" "$BASE_KVB" <<'PY'
+python3 - "$WORK/raw" "$BASE_KVB" "$V0316" <<'PY'
 import sys, os, glob, statistics, collections
 raw, has_base = sys.argv[1], sys.argv[2] != ''
+has_v316 = sys.argv[3] == '1'
 def p95(v):
     v = sorted(v); return v[min(len(v)-1, int(len(v)*0.95))]
 def load(arm):
@@ -126,7 +162,8 @@ def load(arm):
             else:
                 cyl = float(p[9]); vals[tag].append((cyl, cyl))
     return vals
-names = {'getR':'Get realistic','getS':'Get short','setR':'Set-over realistic',
+names = {'pget':'[v0.3.16] Get (plain)','pset':'[v0.3.16] Set-over (plain)',
+         'pdel':'[v0.3.16] Del (plain)','getR':'Get realistic','getS':'Get short','setR':'Set-over realistic',
          'setS':'Set-over short','rfR':'ResolveFrom realistic','rfS':'ResolveFrom short',
          'frR':'FromRef realistic','delR':'Del realistic','delS':'Del short',
          'deltok64':'Del tokens K=64','deltok4096':'Del tokens K=4096'}
@@ -137,6 +174,7 @@ targets = {'Get realistic':(50,60),'Get short':(50,60),'Set-over realistic':(50,
            'Del tokens K=4096':(120,150)}
 order = ['getR','getS','setR','setS','rfR','rfS','frR','delR','delS','deltok64','deltok4096']
 final = load('final')
+v316 = load('v0316') if has_v316 else {}
 base = load('base') if has_base else {}
 hdr = f"{'metric':<24}{'n':>4}{'p50':>9}{'p95':>9}{'target':>12}  verdict"
 if base:
@@ -159,6 +197,15 @@ for tag in order:
         b95 = p95([x[1] for x in base[tag]])
         line += f"{b50:>10.1f}{b95:>10.1f}{(p50/b50-1)*100:>8.2f}%"
     print(line)
+if has_v316 and v316:
+    print("\n发布回归（v0.3.16 已安装公共 ABI，plain Get/SetValue/Del，mean cycles；"
+          "口径不同，不参与 50c 判定）")
+    print(f"{'metric':<24}{'n':>4}{'mean':>9}{'p50':>9}")
+    for tag in ('pget', 'pset', 'pdel'):
+        if tag not in v316: continue
+        vals = sorted(x[0] for x in v316[tag])
+        print(f"{names[tag]:<24}{len(vals):>4}"
+              f"{statistics.mean(vals):>9.1f}{statistics.median(vals):>9.1f}")
 PY
 cat "$WORK/raw"/*/*.csv > "$WORK/50c-abi.csv" 2>/dev/null
 echo "csv: $WORK/50c-abi.csv"

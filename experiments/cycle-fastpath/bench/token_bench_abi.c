@@ -43,9 +43,30 @@ int main(int argc,char**argv){
  if(kvspaceNewChar(raw,8,&val,&vl)!=0)DIE("encode");
  char dsn[512];snprintf(dsn,sizeof dsn,"shm://%s",store);
  void*h=kvspaceConnect(dsn);if(!h)DIE("connect");
- { int q=kvspaceViewQuiesce(h,0); if(q!=0 && q!=-2) DIE("quiesce off"); }
  char err[256];
  if(kvspaceSetValue(h,key,val,vl,0,0,err,sizeof err)!=0)DIE("setup");
+#ifdef ABI_PLAIN_ONLY
+ /* 发布回归臂（v0.3.16 公共 ABI，无 View*）：pget / pset / pdel。
+  * 口径与 50c 目标不同（Get 含拷贝、Del 只计 kvspaceDel），仅作发布对照。 */
+ for(int b=0;b<batches;b++){
+  double ca=calib();uint64_t t0=ticks(),sum=0;
+  if(strcmp(op,"pget")==0){for(uint64_t i=0;i<ops;i++){uint8_t*o=NULL;uint32_t gl=0;
+      if(kvspaceGet(h,key,1,&o,&gl)!=0)DIE("pget");sum+=gl;}}
+  else if(strcmp(op,"pset")==0){for(uint64_t i=0;i<ops;i++){
+      if(kvspaceSetValue(h,key,val,vl,0,0,err,sizeof err)!=0)DIE("pset");}}
+  else if(strcmp(op,"pdel")==0){for(uint64_t i=0;i<ops;i++){
+      if(kvspaceSetValue(h,key,val,vl,0,0,err,sizeof err)!=0)DIE("rebuild");
+      uint64_t a=ticks();int rc=kvspaceDel(h,&key,1,err,sizeof err);uint64_t c=ticks();
+      if(rc!=0)DIE("pdel");sum+=c-a;}}
+  else DIE("unknown plain op");
+  uint64_t t1=ticks();double cb=calib();uint64_t dt=t1-t0;double drift=(cb-ca)/((cb+ca)*0.5)*100.0;g_sink+=sum;
+  double tpo=(strcmp(op,"pdel")==0)?(double)sum/(double)ops:(double)dt/(double)ops;
+  printf("%s,%d,%d,%" PRIu64 ",%" PRIu64 ",%.3f,%.6f,%.6f,%.3f,%.3f,%" PRIu64 "\n",
+         op,0,b,ops,dt,tpo,ca,cb,drift,tpo*(ca+cb)*0.5,(uint64_t)g_sink);
+  fflush(stdout);}
+ kvspaceClose(h);return 0;
+#else
+ { int q=kvspaceViewQuiesce(h,0); if(q!=0 && q!=-2) DIE("quiesce off"); }
  kvspaceRef_t ref;if(kvspaceResolveRef(h,key,&ref)!=0)DIE("resolve ref");
  kvspaceRef_t pref={0};
  const char*ppfx=getenv("TOK_PREFIX");
@@ -103,4 +124,6 @@ int main(int argc,char**argv){
   double tpo=(strcmp(op,"del")==0)?(double)sum/(double)ops:(double)dt/(double)ops;
   printf("%s,%d,%d,%" PRIu64 ",%" PRIu64 ",%.3f,%.6f,%.6f,%.3f,%.3f,%" PRIu64 "\n",op,0,b,ops,dt,tpo,ca,cb,drift,tpo*(ca+cb)*0.5,(uint64_t)g_sink);
   fflush(stdout);}
- kvspaceClose(h);return 0;}
+ kvspaceClose(h);return 0;
+#endif
+}

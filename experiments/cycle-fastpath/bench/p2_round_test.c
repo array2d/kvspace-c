@@ -21,6 +21,8 @@
  *   a25  reserve 后 alloc / art_ins 失败 → cancel，旧值不变、无残留
  *   a27  leader 槽被回收后（旧 claim 消失）仍能接管
  *   r10  单写者 8B 同尺寸写 + view 读：只见 old/new（x86 原子性；arm64 需另跑）
+ *   align  ART 节点 8 字节对齐、val 不跨 64B 行（split lock 的结构判据）
+ *   oldstore 旧 format_version 的 store 必须 open 硬失败（不迁移）
  *   churn <store> <ms>  持续制造垃圾的 helper（R4 用），结束时打印轮次统计
  */
 #define _GNU_SOURCE
@@ -38,6 +40,8 @@
 extern int kvspaceNewChar(const uint8_t *, uint32_t, uint8_t **, uint32_t *);
 extern int kvspaceShmViewAck(kvspace_t *, uint32_t *);
 extern int kvspaceShmViewQuiesce(kvspace_t *, int);
+extern int64_t kvspaceShmArtAlignCheck(kvspace_t *);
+extern void kvspaceShmTestSetFormatVersion(kvspace_t *, uint32_t);
 extern int kvspaceShmViewResolve(kvspace_t *, const char *, kvspaceViewToken_t *);
 extern int kvspaceShmViewCheck(kvspace_t *, const kvspaceViewToken_t *);
 extern int kvspaceShmViewWrite(kvspace_t *, kvspaceViewToken_t *,
@@ -480,6 +484,42 @@ static int m_a27(const char *store) {
     return 0;
 }
 
+/* ALIGN：ART 块数据 8 字节对齐且 val 不跨 64B 行（否则 x86 locked 原子
+ * 退化为 split lock；非对齐原子还可能撕裂）。 */
+static int m_align(const char *store) {
+    kvspace_t *kv = kvspaceShmOpen(store, STORE_SZ);
+    if (!kv) FAIL("open");
+    uint32_t l = 0;
+    uint8_t *v = mkval(8, &l);
+    char key[64];
+    for (int i = 0; i < 64; i++) {          /* 不同长度的键 → 不同节点尺寸 */
+        snprintf(key, sizeof key, "/a/%0*d", 1 + i % 7, i);
+        put(kv, key, v, l);
+    }
+    int64_t bad = kvspaceShmArtAlignCheck(kv);
+    if (bad == -2) FAIL("block head/stride not 8-aligned");
+    if (bad >= 0) FAIL("art block %lld not 8-aligned / val straddles line",
+                       (long long)bad);
+    kvspaceShmClose(kv);
+    puts("PASS align");
+    return 0;
+}
+
+/* OLDSTORE：format_version 不是 4 的 store 必须 open 返回 NULL（报重建）。 */
+static int m_oldstore(const char *store) {
+    kvspace_t *kv = kvspaceShmOpen(store, STORE_SZ);
+    if (!kv) FAIL("create");
+    kvspaceShmTestSetFormatVersion(kv, 2);
+    kvspaceShmClose(kv);
+    kvspace_t *old = kvspaceShmOpen(store, STORE_SZ);
+    if (old) {
+        kvspaceShmClose(old);
+        FAIL("old format_version 2 store was accepted");
+    }
+    puts("PASS oldstore");
+    return 0;
+}
+
 /* R10：A 快路径同尺寸 8B 写 + view 读（单写者 + 读者）：读只见 old/new。 */
 static int m_r10(const char *store) {
     kvspace_t *kv = kvspaceShmOpen(store, STORE_SZ);
@@ -636,6 +676,8 @@ int main(int argc, char **argv) {
     if (!strcmp(m, "t3")) return m_t3(st);
     if (!strcmp(m, "a25")) return m_a25(st);
     if (!strcmp(m, "r10")) return m_r10(st);
+    if (!strcmp(m, "align")) return m_align(st);
+    if (!strcmp(m, "oldstore")) return m_oldstore(st);
     if (!strcmp(m, "churn"))
         return m_churn(st, argc > 3 ? atoi(argv[3]) : 3000);
     if (!strcmp(m, "a27")) return m_a27(st);
