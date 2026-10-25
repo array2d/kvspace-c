@@ -592,6 +592,10 @@ int kvspaceXhDecode(const uint8_t *data, uint64_t len, kvspaceXh *out) {
     return -1;
 }
 
+int kvspaceXhHeadView(const uint8_t *data, uint64_t len, kvspaceXh *out) {
+    return xh_header(data, len, out);
+}
+
 int kvspaceXhView(const uint8_t *data, uint64_t len, kvspaceXh *out) {
     if (xh_header(data, len, out) != 0)
         return -1;

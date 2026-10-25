@@ -287,6 +287,9 @@ static void t_punch(const char *dir) {
   CHECK(used - base >= (off_t)BIG_RAW - 65536, "phys after write %ld -> %ld",
         (long)base, (long)used);
   CHECK(kvspaceShmDel(kv, "/v") == 0, "del /v");
+  /* 删除只把 box 退役进垃圾环；释放发生在屏障轮（Sweep 同步跑一轮）。
+   * 本进程 claim 后默认 quiesced=1，不需要额外 ack。 */
+  CHECK(kvspaceShmViewSweep(kv) >= 0, "sweep after del");
   off_t freed = fphys(data);
   CHECK(freed <= base + 65536, "phys after del %ld (base %ld)", (long)freed,
         (long)base);
