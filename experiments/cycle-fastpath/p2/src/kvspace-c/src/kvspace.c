@@ -146,7 +146,7 @@ typedef struct {
     /* v3: 旁路 gen 表（节点 id 索引，8B/节点）。 */
     uint64_t gens_size;
     uint64_t gen_epoch;        /* 节点分配 epoch（原子递增） */
-    uint32_t format_version;   /* = 4（art val 原子字 + 垃圾环 + 单写者降级） */
+    uint32_t format_version;   /* = KVSPACE_FORMAT_VERSION */
     uint32_t recovery_epoch;   /* 屏障轮次（u32，模比较） */
     uint32_t ack_seq;          /* 跨进程 futex 字（第 3 步） */
     uint32_t barrier_state;
@@ -2341,7 +2341,7 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
 
     if (created) {
         memset(kv->hdr, 0, sizeof(*kv->hdr));
-        kv->hdr->format_version = 4;
+        kv->hdr->format_version = KVSPACE_FORMAT_VERSION;
         kv->hdr->garb_cap = GARB_CAP;
         kv->hdr->art_slab_size = art_slab;
         kv->hdr->sbo_head_size = sbo_head;
@@ -2362,7 +2362,7 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
         memcpy(kv->hdr->magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1);
     }
     if (!created &&
-        (kv->hdr->format_version != 4 ||
+        (kv->hdr->format_version != KVSPACE_FORMAT_VERSION ||
          kv->art_meta->sizeof_block_head != 8 ||
          kv->hdr->garb_cap != GARB_CAP)) {
         fprintf(stderr, "kvspace: unsupported store format (version=%u, "
