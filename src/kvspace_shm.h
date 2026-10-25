@@ -15,6 +15,10 @@
 
 typedef struct kvspace kvspace_t;
 
+/* shm store 格式版本：4 = ART val 原子字 + 垃圾环 + 单写者降级 + 8B 节点对齐。
+ * 不兼容旧版本：open 硬失败并提示重建（不迁移）。 */
+#define KVSPACE_FORMAT_VERSION 4
+
 /* 对齐 kvspace/include/kvspace/kvspace.h：叶子 + 目录祖先。 */
 typedef struct {
     uint32_t block_id;
@@ -124,5 +128,39 @@ int kvspaceShmNotify(kvspace_t *kv, const char *key, const uint8_t *val,
 // 阻塞等待通知，timeout_ms 毫秒。返回 malloc XValue，超时返回 NULL.
 uint8_t *kvspaceShmWatch(kvspace_t *kv, const char *key, int32_t timeout_ms,
                          int32_t *out_len);
+
+#ifndef KVSPACE_VIEW_TOKEN_DEFINED
+#define KVSPACE_VIEW_TOKEN_DEFINED
+typedef struct {
+    uint8_t *head; uint8_t *body; uint32_t headlen; uint32_t value_len;
+    uint64_t cap; uint64_t body_cap;
+    uint32_t struct_gen; uint32_t value_gen;
+    uint64_t store_id; uint32_t node_id; uint32_t _pad;
+} kvspaceViewToken_t;
+#endif
+int kvspaceShmResolvePrefix(kvspace_t *kv, const char *path, kvspaceRef_t *ref);
+int kvspaceShmViewResolve(kvspace_t *kv, const char *key, kvspaceViewToken_t *tok);
+int kvspaceShmViewFromRef(kvspace_t *kv, const kvspaceRef_t *ref,
+                          const char *key_fallback, kvspaceViewToken_t *tok);
+int kvspaceShmViewResolveFrom(kvspace_t *kv, const kvspaceRef_t *parent,
+                              const char *rel, kvspaceViewToken_t *tok);
+int kvspaceShmViewCheck(kvspace_t *kv, const kvspaceViewToken_t *tok);
+int kvspaceShmViewWrite(kvspace_t *kv, kvspaceViewToken_t *tok,
+                        const uint8_t *data, uint32_t len);
+int kvspaceShmViewDel(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key);
+int kvspaceShmViewRefresh(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key);
+int kvspaceShmViewAck(kvspace_t *kv, uint32_t *epoch);
+int kvspaceShmViewQuiesce(kvspace_t *kv, int on);
+#ifdef P2_TEST_HOOKS
+uint64_t kvspaceShmViewGarbBytes(kvspace_t *kv);
+void kvspaceShmViewRoundStats(kvspace_t *kv, uint64_t *ok, uint64_t *aborted,
+                              uint64_t *leaks);
+/* 对齐/格式验收（仅测试构建）：返回 -1=通过，>=0=首个坏块 id，-2=块头宽度
+ * 不是 8；SetFormatVersion 用于构造"旧 store 必须拒绝"的用例。 */
+int64_t kvspaceShmArtAlignCheck(kvspace_t *kv);
+void kvspaceShmTestSetFormatVersion(kvspace_t *kv, uint32_t v);
+#endif
+int kvspaceShmViewSweep(kvspace_t *kv);
+int kvspaceShmViewFlushTomb(kvspace_t *kv);
 
 #endif

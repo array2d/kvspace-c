@@ -518,3 +518,45 @@ int kvspaceWatch(void *h, const char *key, const uint8_t *target,
         usleep(1000);
     }
 }
+
+
+/* ── P2 token ABI wrappers（durable 后端后续给 ENOTSUP）──────────── */
+int kvspaceViewResolvePrefix(void *h, const char *path, kvspaceRef_t *ref) {
+    return kvspaceShmResolvePrefix((kvspace_t *)h, path, ref) == 0 ? 0 : 1;
+}
+
+int kvspaceViewAck(void *h, uint32_t *epoch) {
+    return kvspaceShmViewAck((kvspace_t *)h, epoch);
+}
+
+int kvspaceViewQuiesce(void *h, int on) {
+    return kvspaceShmViewQuiesce((kvspace_t *)h, on);
+}
+
+int kvspaceViewSweep(void *h) {
+    return kvspaceShmViewSweep((kvspace_t *)h);
+}
+
+int kvspaceViewResolve(void *h, const char *key, kvspaceViewToken_t *tok) {
+    return kvspaceShmViewResolve((kvspace_t *)h, key, tok) == 0 ? 0 : 1;
+}
+int kvspaceViewFromRef(void *h, const kvspaceRef_t *ref, const char *k,
+                       kvspaceViewToken_t *tok) {
+    return kvspaceShmViewFromRef((kvspace_t *)h, ref, k, tok) == 0 ? 0 : 1;
+}
+int kvspaceViewResolveFrom(void *h, const kvspaceRef_t *parent, const char *rel,
+                           kvspaceViewToken_t *tok) {
+    return kvspaceShmViewResolveFrom((kvspace_t *)h, parent, rel, tok) == 0 ? 0 : 1;
+}
+int kvspaceViewCheck(void *h, const kvspaceViewToken_t *tok) {
+    return kvspaceShmViewCheck((kvspace_t *)h, tok);
+}
+int kvspaceViewWrite(void *h, kvspaceViewToken_t *tok, const uint8_t *d, uint32_t n) {
+    return kvspaceShmViewWrite((kvspace_t *)h, tok, d, n);
+}
+int kvspaceViewDel(void *h, kvspaceViewToken_t *tok, const char *key) {
+    return kvspaceShmViewDel((kvspace_t *)h, tok, key);
+}
+int kvspaceViewRefresh(void *h, kvspaceViewToken_t *tok, const char *key) {
+    return kvspaceShmViewRefresh((kvspace_t *)h, tok, key);
+}
