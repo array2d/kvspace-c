@@ -1,0 +1,12 @@
+[package]
+name = "kvspace-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "kvspace CLI（走 libkvspace dispatch 前端 C ABI，后端由 DSN 运行时选择）"
+
+[[bin]]
+name = "kvspace"
+path = "kvspace.rs"
+
+[dependencies]

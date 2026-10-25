@@ -1,0 +1,13 @@
+/build/
+target/
+*.so
+*.so.*
+__pycache__/
+*.pyc
+
+# durable 测试产物
+kvtest*
+.omc/
+
+# CodeGraph 索引（本地知识图，不入库）
+.codegraph/

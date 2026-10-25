@@ -1,0 +1,107 @@
+diff -ruN '--exclude=.git' /tmp/cycle-audit/src/kvspace-c/src/kvspace.c clean/kvspace-c/src/kvspace.c
+--- /tmp/cycle-audit/src/kvspace-c/src/kvspace.c	2026-10-24 17:54:02.073595690 +0800
++++ clean/kvspace-c/src/kvspace.c	2026-10-24 21:57:41.483509287 +0800
+@@ -1299,9 +1299,9 @@
+ /* ---- link resolve helpers ---- */
+ static int read_tlv(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
+     uint8_t *s = kv->sbo_data + off;
+-    size_t sz = sbo_allocated_size(kv->sbo_meta, off);
++    size_t sz = kv->hdr->sbo_data_size - off; /* P1: 免 shard 锁 */
+     kvspaceXh wire;
+-    if (kvspaceXhView(s, sz, &wire) == 0) {
++    if (kvspaceXhHeadView(s, sz, &wire) == 0 && wire.total <= sz) {
+         if (wire.total > INT32_MAX)
+             return -1;
+         *out = s;
+@@ -1319,8 +1319,8 @@
+  * 到 target（本身又是一个完整叶子键）再查，最多追 16 跳。叶子不存在→非链，原样返回（调用
+  * 方另做 extindex/dir 兜底）。取代旧的「逐前缀 1~3 次 art_search + 追加 rest」全下降探测。 */
+ static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
+-    strncpy(out, path, osz - 1);
+-    out[osz - 1] = '\0';
++    if (strlen(path) >= (size_t)osz) return;
++    memcpy(out, path, strlen(path) + 1);
+     for (int depth = 0; depth < 16; depth++) {
+         art_hdr_t *h =
+             art_search(kv, kv->hdr->art_root, (const uint8_t *)out, (int)strlen(out));
+@@ -1351,17 +1351,17 @@
+ static art_hdr_t *resolve_fetch(kvspace_t *kv, const char *path, char *out, int osz,
+                                 uint8_t **raw, int32_t *rl, int *fetched) {
+     *fetched = 0;
+-    strncpy(out, path, osz - 1);
+-    out[osz - 1] = '\0';
++    if (strlen(path) >= (size_t)osz) return NULL;
++    memcpy(out, path, strlen(path) + 1);
+     for (int depth = 0; depth < 16; depth++) {
+         art_hdr_t *h =
+             art_search(kv, kv->hdr->art_root, (const uint8_t *)out, (int)strlen(out));
+         if (!h || !h->has_value)
+             return h;
+         uint8_t *s = kv->sbo_data + h->box_offset;
+-        size_t sz = sbo_allocated_size(kv->sbo_meta, h->box_offset);
++        size_t sz = kv->hdr->sbo_data_size - h->box_offset; /* P1 */
+         kvspaceXh wire;
+-        if (kvspaceXhView(s, sz, &wire) == 0) {
++        if (kvspaceXhHeadView(s, sz, &wire) == 0 && wire.total <= sz) {
+             if (wire.total > INT32_MAX)
+                 return NULL;
+             if (wire.kind != (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG) ||
+@@ -1420,8 +1420,8 @@
+     if (resolve)
+         h = resolve_fetch(kv, key, kbuf, sizeof(kbuf), &raw, &rl, &fetched);
+     else {
+-        strncpy(kbuf, key, sizeof(kbuf) - 1);
+-        kbuf[sizeof(kbuf) - 1] = '\0';
++        if (strlen(key) >= sizeof kbuf) return NULL;
++        memcpy(kbuf, key, strlen(key) + 1);
+         h = art_search(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
+                        (int)strlen(kbuf));
+     }
+@@ -1767,8 +1767,8 @@
+     if (resolve)
+         h = resolve_fetch(kv, key, kbuf, sizeof(kbuf), &raw, &rl, &fetched);
+     else {
+-        strncpy(kbuf, key, sizeof(kbuf) - 1);
+-        kbuf[sizeof(kbuf) - 1] = '\0';
++        if (strlen(key) >= sizeof kbuf) return -1;
++        memcpy(kbuf, key, strlen(key) + 1);
+         h = art_search(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
+                        (int)strlen(kbuf));
+     }
+@@ -1855,8 +1855,8 @@
+     if (kv_sync(kv) != 0)
+         return -1;
+     char kbuf[1024];
+-    strncpy(kbuf, key, sizeof(kbuf) - 1);
+-    kbuf[sizeof(kbuf) - 1] = '\0'; /* 删键本身，不穿透 link——显式解引用由 runtime 掌控 */
++    if (strlen(key) >= sizeof kbuf) return -1;
++    memcpy(kbuf, key, strlen(key) + 1); /* 删键本身，不穿透 link——显式解引用由 runtime 掌控 */
+     if (sync_metadata(kv, kbuf, 0, 0) != 0)
+         return -1;
+     bool d = false;
+diff -ruN '--exclude=.git' /tmp/cycle-audit/src/kvspace-c/src/xvalue_head.c clean/kvspace-c/src/xvalue_head.c
+--- /tmp/cycle-audit/src/kvspace-c/src/xvalue_head.c	2026-10-24 17:54:02.073595690 +0800
++++ clean/kvspace-c/src/xvalue_head.c	2026-10-24 21:57:41.483509287 +0800
+@@ -592,6 +592,10 @@
+     return -1;
+ }
+ 
++int kvspaceXhHeadView(const uint8_t *data, uint64_t len, kvspaceXh *out) {
++    return xh_header(data, len, out);
++}
++
+ int kvspaceXhView(const uint8_t *data, uint64_t len, kvspaceXh *out) {
+     if (xh_header(data, len, out) != 0)
+         return -1;
+diff -ruN '--exclude=.git' /tmp/cycle-audit/src/kvspace-c/src/xvalue_head.h clean/kvspace-c/src/xvalue_head.h
+--- /tmp/cycle-audit/src/kvspace-c/src/xvalue_head.h	2026-10-24 17:54:02.073595690 +0800
++++ clean/kvspace-c/src/xvalue_head.h	2026-10-24 21:57:41.479509245 +0800
+@@ -44,6 +44,8 @@
+ int kvspaceXhDecode(const uint8_t *data, uint64_t len, kvspaceXh *out);
+ /* Borrow the head; validate payloads that need semantic checks. */
+ int kvspaceXhView(const uint8_t *data, uint64_t len, kvspaceXh *out);
++/* P1：只解析头部，不做 body 全量校验（写入路径已校验）。 */
++int kvspaceXhHeadView(const uint8_t *data, uint64_t len, kvspaceXh *out);
+ 
+ int kvspaceXhNewNone(uint8_t **out, uint64_t *out_len);
+ int kvspaceXhNewScalar(const char *langtype, const uint8_t *raw, uint32_t raw_len,

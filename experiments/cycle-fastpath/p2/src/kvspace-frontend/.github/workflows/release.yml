@@ -1,0 +1,37 @@
+name: release-abi
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 构建
+        run: cmake -B build && cmake --build build
+      - name: 构建 CLI（cli/ 独立 Cargo 项目，走 dispatch 前端 C ABI）
+        run: |
+          # CLI 用 #[link(name = "kvspace")] 链本仓刚构建的前端 → 把 build/ 交给链接器
+          RUSTFLAGS="-L native=$PWD/build" cargo build --release --manifest-path cli/Cargo.toml
+      - name: 打包 ABI 产物
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME}"
+          d="kvspace-abi-$v-linux-x86_64"
+          mkdir -p "$d/include" "$d/lib" "$d/bin"
+          # 头：递归整目录（保持层级）
+          cp -R include/. "$d/include/"
+          # 库：扫构建目录的所有 .so*/.dylib（-P 保符号链接）
+          find build -maxdepth 3 \( -name 'lib*.so*' -o -name 'lib*.dylib' \) -exec cp -P {} "$d/lib/" \;
+          # 可执行：本仓 CLI（cli/ 是独立 Cargo 项目）
+          cp cli/target/release/kvspace "$d/bin/"
+          printf '{"abi":"%s"}\n' "$v" > "$d/abi-manifest.json"
+          tar czf "$d.tar.gz" "$d"
+          tar tzf "$d.tar.gz"
+          sha256sum "$d.tar.gz" > SHA256SUMS
+      - name: 发布 release
+        run: gh release create "${GITHUB_REF_NAME}" kvspace-abi-*.tar.gz SHA256SUMS --generate-notes

@@ -1,0 +1,6 @@
+# op=get_byref_prefix key=/vthread/1/[1]/a klen=16 resolve{leaf=1 parent=1 depth=16} slotview=0 vh=64 body_cap=8
+op,run,batch,ops,ticks,ticks_per_op,cal_before,cal_after,drift_pct,core_cycles_per_op,checksum
+# op=get_byref_prefix key=/vthread/1/[1]/a klen=16 resolve{leaf=1 parent=1 depth=16} slotview=0 vh=64 body_cap=8
+op,run,batch,ops,ticks,ticks_per_op,cal_before,cal_after,drift_pct,core_cycles_per_op,checksum
+# op=get_byref_prefix key=/vthread/1/[1]/a klen=16 resolve{leaf=1 parent=1 depth=16} slotview=0 vh=64 body_cap=8
+op,run,batch,ops,ticks,ticks_per_op,cal_before,cal_after,drift_pct,core_cycles_per_op,checksum

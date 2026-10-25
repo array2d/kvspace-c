@@ -1,0 +1,11 @@
+[package]
+name = "kvspace-c"
+version = "0.1.0"
+edition = "2021"
+description = "Rust FFI bindings for libkvspace-c.so"
+links = "kvspace-c"
+build = "build.rs"
+
+[dependencies]
+
+[build-dependencies]

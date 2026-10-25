@@ -1,0 +1,33 @@
+--- /tmp/ffi.rs.orig	2026-10-24 23:24:54.717261967 +0800
++++ src/ffi.rs	2026-10-24 23:24:54.717261967 +0800
+@@ -1148,3 +1148,30 @@
+ ) -> c_int {
+     -2
+ }
++
++/* ── P2 token ABI：durable 后端暂不支持（ENOTSUP）────────────────── */
++#[no_mangle]
++pub extern "C" fn kvspaceViewResolve(_h: *mut c_void, _key: *const c_char,
++                                     _tok: *mut c_void) -> c_int { -2 }
++#[no_mangle]
++pub extern "C" fn kvspaceViewFromRef(_h: *mut c_void, _ref: *const c_void,
++                                     _key: *const c_char, _tok: *mut c_void) -> c_int { -2 }
++#[no_mangle]
++pub extern "C" fn kvspaceViewResolveFrom(_h: *mut c_void, _parent: *const c_void,
++                                         _rel: *const c_char, _tok: *mut c_void) -> c_int { -2 }
++#[no_mangle]
++pub extern "C" fn kvspaceViewResolvePrefix(_h: *mut c_void, _path: *const c_char,
++                                           _ref: *mut c_void) -> c_int { -2 }
++#[no_mangle]
++pub extern "C" fn kvspaceViewCheck(_h: *mut c_void, _tok: *const c_void) -> c_int { -2 }
++#[no_mangle]
++pub extern "C" fn kvspaceViewWrite(_h: *mut c_void, _tok: *mut c_void,
++                                   _d: *const u8, _n: u32) -> c_int { -2 }
++#[no_mangle]
++pub extern "C" fn kvspaceViewDel(_h: *mut c_void, _tok: *mut c_void,
++                                 _key: *const c_char) -> c_int { -2 }
++#[no_mangle]
++pub extern "C" fn kvspaceViewRefresh(_h: *mut c_void, _tok: *mut c_void,
++                                     _key: *const c_char) -> c_int { -2 }
++#[no_mangle]
++pub extern "C" fn kvspaceViewSweep(_h: *mut c_void) -> c_int { -2 }

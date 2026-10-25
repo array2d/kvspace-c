@@ -1,0 +1,43 @@
+name: release-abi
+on:
+  push:
+    tags: ['v*']
+  # 手动重跑（tag 已存在但 release 缺失时用；tag 删+重建同 sha 不会重新触发）
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要发布的 tag（须已存在，如 v0.2.18）
+        required: true
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ inputs.tag || github.ref }}" }
+      - name: 下载 ABI 依赖
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        run: ./ci/deps.sh
+      - name: 构建
+        run: make
+      - name: 打包 ABI 产物
+        run: |
+          set -euo pipefail
+          v="${RELEASE_TAG:-${GITHUB_REF_NAME}}"
+          d="kvspace-c-abi-$v-linux-x86_64"
+          mkdir -p "$d/include" "$d/lib"
+          # 头：本仓无公共头（内部头在 src/），权威 ABI 头在 kvspace 仓 → 递归整目录
+          git clone --depth 1 https://github.com/array2d/kvspace.git /tmp/kvspace-hdr
+          cp -R /tmp/kvspace-hdr/include/. "$d/include/"
+          # 库：扫构建目录的所有 .so*/.dylib（-P 保符号链接）
+          find build -maxdepth 3 \( -name 'lib*.so*' -o -name 'lib*.dylib' \) -exec cp -P {} "$d/lib/" \;
+          # 本仓无可执行产物（纯库），故不带 bin/
+          printf '{"abi":"%s"}\n' "$v" > "$d/abi-manifest.json"
+          tar czf "$d.tar.gz" "$d"
+          sha256sum "$d.tar.gz" > SHA256SUMS
+      - name: 发布 release
+        run: gh release create "${RELEASE_TAG:-${GITHUB_REF_NAME}}" kvspace-c-abi-*.tar.gz SHA256SUMS --generate-notes

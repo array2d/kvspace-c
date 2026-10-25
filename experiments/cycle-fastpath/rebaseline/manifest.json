@@ -1,0 +1,19 @@
+{
+  "generated_at": "2026-10-24",
+  "host": {"cpu": "AMD EPYC 7K62", "vcpu": 2, "kernel": "5.15.0-113-generic"},
+  "toolchain": {"gcc": "11.2.0", "cflags": "-O2 -g -falign-functions=64 -falign-loops=64"},
+  "isolation": {"cpu_pin": "taskset -c 0", "aslr": "setarch x86_64 -R", "threads": 1},
+  "clock": {"source": "lfence;rdtscp", "calibration": "5 x 8-unrolled add chain, min ticks"},
+  "deps": {
+    "kvspace-c": {"head": "486e67e", "tag": "v0.3.16"},
+    "kvspace": {"head": "cc88806", "tag": "v0.3.16"},
+    "blockmalloc": {"head": "43f57a6", "tag": "v0.1.5"},
+    "slotsboxmalloc": {"head": "b871d48", "tag": "v0.1.7"}
+  },
+  "artifacts_sha256_prefix16": {
+    "libkvspace-c.so.1.0.0": "38b6e7a28d92daf3",
+    "libkvspace.so.1.0.0": "104522283cd9d4d6"
+  },
+  "configs": {"key_realistic": "/vthread/123456/[12]/t0", "key_short": "/vthread/1/[1]/a",
+              "value_bytes": 8, "batches": 30, "ops_per_batch": 20000, "runs": 3}
+}

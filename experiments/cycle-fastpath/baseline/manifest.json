@@ -1,0 +1,40 @@
+{
+  "generated_at": "2026-10-24T21:55:47+08:00",
+  "host": {
+    "cpu": "AMD EPYC 7K62 48-Core Processor",
+    "vcpu": 2,
+    "kernel": "5.15.0-113-generic"
+  },
+  "toolchain": {
+    "gcc": "gcc (Ubuntu 11.2.0-19ubuntu1) 11.2.0",
+    "cflags": "-O2 -g -falign-functions=64 -falign-loops=64"
+  },
+  "isolation": {
+    "cpu_pin": "taskset -c 0",
+    "aslr": "setarch x86_64 -R",
+    "threads": 1
+  },
+  "clock": {
+    "source": "lfence;rdtscp",
+    "calibration": "5 x 8-unrolled add chain, min ticks"
+  },
+  "key_tiers": {
+    "short": "/vthread/1/[1]/a",
+    "realistic": "/vthread/123456/[12]/t0",
+    "design36": "/vthread/<36-char vid>/[3]/t0"
+  },
+  "value_bytes": 8,
+  "batches": 30,
+  "ops_per_batch": 20000,
+  "runs": 3,
+  "commits": {
+    "kvspace-c": "305cc1b9a7ee8c62bcd535752ad770afcf49c545",
+    "kvspace": "84e3a7af9ef4724ce7b86ff43a6e725ba458dc8c"
+  },
+  "hashes": {
+    "bin/fastpath_abi": "3c07ac95a7a98f0f53392fabb2a5c8b7aec4e89bc5ef7aa1b88c798e3647728b",
+    "bin/fastpath_probe": "b51cf6e2e0b473c0f793c2b6fa0ac581a5712fe3941786f6ed0955b38533599a",
+    "probe/prefix/lib/kvspace/libkvspace-c.so.1.0.0": "458fc18fd08d35db8ce48db5df3e9bbb9024d79da1f17ca17c03f101b1e467fc",
+    "/tmp/cycle-audit/prefix/lib/kvspace/libkvspace-c.so.1.0.0": "6100b5ce035dbb64098cdbd898b5841f9ff6afb3d136e8cca0c114e9403671b4"
+  }
+}

@@ -1,0 +1,1233 @@
+diff --git a/rust/build.rs b/rust/build.rs
+deleted file mode 100644
+index aa3bd5c..0000000
+--- a/rust/build.rs
++++ /dev/null
+@@ -1,13 +0,0 @@
+-fn main() {
+-    println!("cargo:rustc-link-lib=kvspace-c");
+-    // 库在仓库根的 build/（非 rust/build/）。
+-    println!(
+-        "cargo:rustc-link-search={}/../build",
+-        env!("CARGO_MANIFEST_DIR")
+-    );
+-    // 运行期按 @rpath 定位 dylib。
+-    println!(
+-        "cargo:rustc-link-arg=-Wl,-rpath,{}/../build",
+-        env!("CARGO_MANIFEST_DIR")
+-    );
+-}
+diff --git a/src/durable_abi.c b/src/durable_abi.c
+index db1fb31..9ea310e 100644
+--- a/src/durable_abi.c
++++ b/src/durable_abi.c
+@@ -518,3 +518,41 @@ int kvspaceWatch(void *h, const char *key, const uint8_t *target,
+         usleep(1000);
+     }
+ }
++
++
++/* ── P2 token ABI wrappers（durable 后端后续给 ENOTSUP）──────────── */
++int kvspaceViewResolvePrefix(void *h, const char *path, kvspaceRef_t *ref) {
++    return kvspaceShmResolvePrefix((kvspace_t *)h, path, ref) == 0 ? 0 : 1;
++}
++
++int kvspaceViewRelease(void *h, kvspaceViewToken_t *tok) {
++    return kvspaceShmViewRelease((kvspace_t *)h, tok);
++}
++
++int kvspaceViewSweep(void *h) {
++    return kvspaceShmViewSweep((kvspace_t *)h);
++}
++
++int kvspaceViewResolve(void *h, const char *key, kvspaceViewToken_t *tok) {
++    return kvspaceShmViewResolve((kvspace_t *)h, key, tok) == 0 ? 0 : 1;
++}
++int kvspaceViewFromRef(void *h, const kvspaceRef_t *ref, const char *k,
++                       kvspaceViewToken_t *tok) {
++    return kvspaceShmViewFromRef((kvspace_t *)h, ref, k, tok) == 0 ? 0 : 1;
++}
++int kvspaceViewResolveFrom(void *h, const kvspaceRef_t *parent, const char *rel,
++                           kvspaceViewToken_t *tok) {
++    return kvspaceShmViewResolveFrom((kvspace_t *)h, parent, rel, tok) == 0 ? 0 : 1;
++}
++int kvspaceViewCheck(void *h, const kvspaceViewToken_t *tok) {
++    return kvspaceShmViewCheck((kvspace_t *)h, tok);
++}
++int kvspaceViewWrite(void *h, kvspaceViewToken_t *tok, const uint8_t *d, uint32_t n) {
++    return kvspaceShmViewWrite((kvspace_t *)h, tok, d, n);
++}
++int kvspaceViewDel(void *h, kvspaceViewToken_t *tok, const char *key) {
++    return kvspaceShmViewDel((kvspace_t *)h, tok, key);
++}
++int kvspaceViewRefresh(void *h, kvspaceViewToken_t *tok, const char *key) {
++    return kvspaceShmViewRefresh((kvspace_t *)h, tok, key);
++}
+diff --git a/src/kvspace.c b/src/kvspace.c
+index 908f88e..3fc8470 100644
+--- a/src/kvspace.c
++++ b/src/kvspace.c
+@@ -13,6 +13,7 @@
+ #include "kvspace_shm.h"
+ #include "xvalue_head.h"
+ #include "xvalue_meta.h"
++#include <errno.h>
+ #include <fcntl.h>
+ #include <limits.h>
+ #include <pthread.h>
+@@ -24,7 +25,7 @@
+ #include <time.h>
+ #include <unistd.h>
+ 
+-#define KVS_MAGIC "kvspace-c.v2"
++#define KVS_MAGIC "kvspace-c.v4"
+ #define ART_PREFIX_MAX 10
+ #define ART_NODE_MAX_SZ 2112
+ #define ART_SLAB_INIT (256UL * 1024 * 1024)
+@@ -85,6 +86,17 @@ static int art_node_sz(int t) {
+                           : sizeof(art_n256_t);
+ }
+ 
++/* 进程注册表槽：pid + starttime 双重判活（pid 复用），recovery_ack = 已确认的代。 */
++#define P2_SLOT_N 64
++/* CLAIMING：已 CAS 占位、pid/starttime 尚未写完；扫描者视为存活，避免认领竞态误回收。 */
++enum { P2_SLOT_FREE = 0, P2_SLOT_MINE = 1, P2_SLOT_RECOVERING = 2, P2_SLOT_CLAIMING = 3 };
++typedef struct {
++    uint32_t pid;
++    uint32_t state;
++    uint64_t starttime;
++    uint64_t recovery_ack;
++} p2_slot_t;
++
+ /* <path>           [kvspace_hdr_t][blocks_meta_t][ART slab ...]
+  * <path>.sbo.head  [sbo meta ...]
+  * <path>.sbo.data  [sbo data ...] */
+@@ -92,6 +104,12 @@ typedef struct {
+     char magic[12];
+     uint64_t art_slab_size, sbo_head_size, sbo_data_size;
+     int32_t art_root;
++    /* v3: 旁路 gen 表（节点 id 索引，8B/节点）。 */
++    uint64_t gens_size;
++    uint64_t gen_epoch;      /* 节点分配 epoch（原子递增） */
++    uint32_t format_version; /* 1 = v3 with gens */
++    uint32_t recovery_epoch; /* 恢复屏障代（死 pin 作废） */
++    p2_slot_t slots[P2_SLOT_N]; /* v4: 进程注册表 */
+ } kvspace_hdr_t;
+ 
+ #define ART_OFF (sizeof(kvspace_hdr_t) + sizeof(blocks_meta_t))
+@@ -139,9 +157,21 @@ typedef struct {
+     bool ready;
+ } watch_t;
+ 
++#define P2_TOMB_MAX 256
++
+ struct kvspace {
+-    shm_region_t r_art, r_head, r_data;
++    shm_region_t r_art, r_head, r_data, r_gen;
+     kvspace_hdr_t *hdr;
++    uint64_t store_id;   /* 进程内句柄身份（P2 token 用） */
++    int p2_slot;         /* 注册表槽；-1 = 未注册 */
++    uint32_t p2_epoch;   /* 本进程已 ack 的 recovery_epoch */
++    uint64_t *tomb_ring;          /* P2: 有界 ring（256 × 8B） */
++    uint32_t tomb_head, tomb_tail;
++    uint64_t tomb_backpressure;
++    pthread_t tomb_thread;
++    pthread_mutex_t tomb_mu;
++    pthread_cond_t tomb_cv;
++    int tomb_stop;
+     blocks_meta_t *art_meta;
+     uint8_t *art_data;
+     sbo_meta_t *sbo_meta;
+@@ -179,6 +209,8 @@ static int region_attach(shm_region_t *r, bool create, size_t size,
+     return region_map(r, size);
+ }
+ 
++static void region_close(shm_region_t *r); /* fwd */
++
+ static void region_close(shm_region_t *r) {
+     if (r->base)
+         munmap(r->base, r->reserve);
+@@ -187,6 +219,686 @@ static void region_close(shm_region_t *r) {
+ }
+ 
+ /* Pick up growth done by another process (mid-op growth: kvspace#11). */
++
++/* ── P2: 旁路 gen 表（node id → {struct_gen, value_gen}）──────────── */
++static void kv_sbo_free(kvspace_t *kv, uint64_t off);
++static art_hdr_t *art_hdr(kvspace_t *kv, int32_t id);
++static int32_t art_child(kvspace_t *kv, void *n, uint8_t b);
++static int pfx_shared(const uint8_t *a, int al, const uint8_t *b, int bl);
++static int32_t art_walk(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
++                        int d, int32_t *par, int *pard);
++static int32_t art_follow(kvspace_t *kv, int32_t id);
++static int32_t ref_leaf(kvspace_t *kv, kvspaceRef_t *ref, const char *key);
++
++/* 每节点 16B：packed64 + value_gen。
++ * packed = { gen:32 | flags:2 | dead:1 | pending:1 | ref:28 } */
++typedef struct {
++    uint64_t packed;
++    uint32_t value_gen;
++    uint32_t _pad;
++} kv_gens_t;
++
++#define P2_REF_MASK 0xFFFFFFFull
++#define P2_PEND     (1ull << 28)
++#define P2_DEAD     (1ull << 29)
++#define P2_FLAGS    (3ull << 30)
++#define PK_GEN(w)   ((uint32_t)((w) >> 32))
++#define PK_REF(w)   ((uint32_t)((w) & P2_REF_MASK))
++#define PK_MK(gen, ref, extra) ((((uint64_t)(gen)) << 32) | ((uint64_t)(ref) & P2_REF_MASK) | (extra))
++
++static uint64_t gen_cap(const kvspace_t *kv) {
++    blocks_meta_t *m = kv->art_meta;
++    uint64_t head = (uint64_t)m->sizeof_block_head;
++    return m->total_size / (head + m->block_size);
++}
++
++static int32_t art_id_of(kvspace_t *kv, const void *p) {
++    if (!p || !kv->art_data)
++        return -1;
++    return (int32_t)blockid_bydataoffset(kv->art_meta,
++                                         (uint64_t)((const uint8_t *)p - kv->art_data));
++}
++
++static kv_gens_t *gens_at(kvspace_t *kv, int32_t id) {
++    if (id < 0 || !kv->r_gen.base)
++        return NULL;
++    uint64_t n = gen_cap(kv);
++    if ((uint64_t)id >= n)
++        return NULL;
++    return (kv_gens_t *)kv->r_gen.base + id;
++}
++
++static void gen_bump_struct(kvspace_t *kv, int32_t id) {
++    kv_gens_t *g = gens_at(kv, id);
++    if (!g)
++        return;
++    for (;;) {
++        uint64_t w = __atomic_load_n(&g->packed, __ATOMIC_ACQUIRE);
++        uint64_t nw = PK_MK(PK_GEN(w) + 1, PK_REF(w), w & (P2_PEND | P2_DEAD | P2_FLAGS));
++        if (__atomic_compare_exchange_n(&g->packed, &w, nw, false,
++                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
++            return;
++    }
++}
++
++static void gen_bump_value(kvspace_t *kv, int32_t id) {
++    kv_gens_t *g = gens_at(kv, id);
++    if (g)
++        __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
++}
++
++static int64_t gen_alloc_epoch(kvspace_t *kv) {
++    return (int64_t)__atomic_add_fetch(&kv->hdr->gen_epoch, 1ull, __ATOMIC_ACQ_REL);
++}
++
++/* 精确 key 的节点 id（即使 has_value==0 也返回；用于墓碑复活时清 DEAD）。 */
++static int32_t p2_node_at(kvspace_t *kv, const char *key) {
++    int klen = (int)strlen(key);
++    int d = 0;
++    int32_t nid = kv->hdr->art_root;
++    while (nid >= 0) {
++        art_hdr_t *h = art_hdr(kv, nid);
++        if (!h || h->type == ART_MOVED) {
++            if (getenv("P2_DEBUG")) { fprintf(stderr, "DBG node_at FAIL key=%s nid=%d type=%d d=%d/%d\n", key, nid, h ? (int)h->type : -1, d, klen); }
++            return -1;
++        }
++        if (h->prefix_len) {
++            int s = pfx_shared(h->prefix, h->prefix_len,
++                               (const uint8_t *)key + d, klen - d);
++            if (s != h->prefix_len && d + s != klen) {
++                if (getenv("P2_DEBUG")) { fprintf(stderr, "DBG node_at PFX key=%s nid=%d d=%d s=%d plen=%d klen=%d\n", key, nid, d, s, (int)h->prefix_len, klen); }
++                return -1;
++            }
++            d += s;
++        }
++        /* 键可能正好结束在 prefix_len==0 的分支节点上（如 k1 落在根 N4 的子叶），
++         * 此时 d==klen，必须在此返回；否则会越界读 key[klen]。 */
++        if (d == klen)
++            return nid;
++        nid = art_child(kv, h, (uint8_t)key[d]);
++        d++;
++    }
++    if (getenv("P2_DEBUG")) { fprintf(stderr, "DBG node_at EOF key=%s d=%d/%d\n", key, d, klen); }
++    return -1;
++}
++
++/* pin：校验 gen + 拒绝 DEAD / (PENDING && ref==0)，与 ref++ 同一 CAS。 */
++static int p2_pin(kvspace_t *kv, int32_t id, uint32_t gen) {
++    kv_gens_t *g = gens_at(kv, id);
++    if (!g)
++        return -1;
++    for (;;) {
++        uint64_t w = __atomic_load_n(&g->packed, __ATOMIC_ACQUIRE);
++        if (PK_GEN(w) != gen || (w & P2_DEAD) ||
++            ((w & P2_PEND) && PK_REF(w) == 0)) {
++            if (getenv("P2_DEBUG")) { fprintf(stderr, "DBG pin-fail id=%d want=%u got=%u w=0x%llx", id, gen, PK_GEN(w), (unsigned long long)w); fputc(10, stderr); }
++            return 1;
++        }
++        uint64_t nw = w + 1;
++        if (PK_REF(nw) == 0)
++            return 1;
++        if (__atomic_compare_exchange_n(&g->packed, &w, nw, false,
++                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
++            return 0;
++    }
++}
++
++/* unpin：ref--；PENDING 下最后一个 unpin 负责 free（DEAD 的 0→1 是唯一赢家）。 */
++static void p2_unpin(kvspace_t *kv, int32_t id, uint64_t off) {
++    kv_gens_t *g = gens_at(kv, id);
++    if (!g)
++        return;
++    for (;;) {
++        uint64_t w = __atomic_load_n(&g->packed, __ATOMIC_ACQUIRE);
++        if (PK_REF(w) == 0)
++            return;
++        uint64_t nw = w - 1;
++        if (!__atomic_compare_exchange_n(&g->packed, &w, nw, false,
++                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
++            continue;
++        if ((nw & P2_PEND) && PK_REF(nw) == 0 && !(nw & P2_DEAD)) {
++            uint64_t dw = nw;
++            if (__atomic_compare_exchange_n(&g->packed, &dw, dw | P2_DEAD, false,
++                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++                if (off)
++                    kv_sbo_free(kv, off);
++            }
++        }
++        return;
++    }
++}
++
++/* ── P2: 进程注册表 + 恢复屏障 ────────────────────────────────── */
++/* /proc/<pid>/stat 第 22 字段 starttime（pid 复用判据）。macOS 无 /proc。
++ * 返回 0=读到；1=进程不存在（ENOENT，判死）；2=不可判定（保守视为存活）。 */
++static int p2_proc_starttime(uint32_t pid, uint64_t *out) {
++#if defined(__linux__)
++    char p[64];
++    if (snprintf(p, sizeof p, "/proc/%u/stat", pid) >= (int)sizeof p)
++        return 2;
++    FILE *f = fopen(p, "r");
++    if (!f)
++        return errno == ENOENT ? 1 : 2;
++    char buf[1024];
++    size_t n = fread(buf, 1, sizeof buf - 1, f);
++    fclose(f);
++    if (!n)
++        return 2;
++    buf[n] = 0;
++    char *rp = strrchr(buf, ')');   /* comm 可含空格，字段从最后一个 ')' 起数 */
++    if (!rp)
++        return 2;
++    char *s = rp + 1;
++    int field = 3;                  /* ')' 之后第一个字段是 stat 第 3 字段 */
++    while (*s) {
++        while (*s == ' ')
++            s++;
++        if (!*s)
++            break;
++        if (field == 22) {
++            *out = strtoull(s, NULL, 10);
++            return 0;
++        }
++        while (*s && *s != ' ')
++            s++;
++        field++;
++    }
++    return 2;
++#else
++    (void)pid;
++    (void)out;
++    return 2;                       /* 平台无 liveness：永不判死 */
++#endif
++}
++
++static bool p2_slot_alive(const p2_slot_t *s) {
++    uint64_t st = 0;
++    uint32_t state = __atomic_load_n(&s->state, __ATOMIC_ACQUIRE);
++    if (state == P2_SLOT_FREE)
++        return false;
++    if (state == P2_SLOT_CLAIMING)
++        return true;
++    int rc = p2_proc_starttime(s->pid, &st);
++    if (rc == 1)
++        return false;               /* ENOENT：进程已死 */
++    if (rc != 0)
++        return true;                /* 不可判定 → 保守视为存活 */
++    return st == s->starttime;
++}
++
++/* open：先回收死槽，再 CAS 认领；仍满才失败（反复崩溃不耗光槽）。 */
++static int p2_reg_claim(kvspace_t *kv) {
++    uint64_t st = 0;
++    if (p2_proc_starttime((uint32_t)getpid(), &st) != 0)
++        st = 0;
++    uint32_t me = (uint32_t)getpid();
++    for (int i = 0; i < P2_SLOT_N; i++) {
++        p2_slot_t *s = &kv->hdr->slots[i];
++        uint32_t v = __atomic_load_n(&s->state, __ATOMIC_ACQUIRE);
++        if (v == P2_SLOT_CLAIMING && s->pid == 0) {
++            /* 认领者死在 CAS 与写 pid 之间：pid 仍为 0，可回收 */
++            __atomic_compare_exchange_n(&s->state, &v, P2_SLOT_FREE, false,
++                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++            continue;
++        }
++        if (v == P2_SLOT_RECOVERING) {
++            /* 上一轮屏障超时遗留：死者回收，活者回到 MINE 重新等待，避免槽永久卡死。 */
++            uint32_t to = p2_slot_alive(s) ? P2_SLOT_MINE : P2_SLOT_FREE;
++            __atomic_compare_exchange_n(&s->state, &v, to, false,
++                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++            continue;
++        }
++        if (v != P2_SLOT_FREE && !p2_slot_alive(s))
++            __atomic_compare_exchange_n(&s->state, &v, P2_SLOT_FREE, false,
++                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++    }
++    if (getenv("P2_DEBUG")) {
++        int nf = 0, nm = 0;
++        for (int i = 0; i < P2_SLOT_N; i++) {
++            uint32_t v = __atomic_load_n(&kv->hdr->slots[i].state, __ATOMIC_ACQUIRE);
++            if (v == P2_SLOT_FREE) nf++;
++            else if (v == P2_SLOT_MINE) nm++;
++        }
++        fprintf(stderr, "DBG claim pid=%u start=%llu free=%d mine=%d\n", me,
++                (unsigned long long)st, nf, nm);
++    }
++    for (int i = 0; i < P2_SLOT_N; i++) {
++        p2_slot_t *s = &kv->hdr->slots[i];
++        uint32_t expect = P2_SLOT_FREE;
++        if (!__atomic_compare_exchange_n(&s->state, &expect, P2_SLOT_CLAIMING, false,
++                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
++            continue;
++        s->pid = me;
++        s->starttime = st;
++        __atomic_store_n(&s->recovery_ack,
++                         __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE),
++                         __ATOMIC_ACQ_REL);
++        __atomic_store_n(&s->state, P2_SLOT_MINE, __ATOMIC_RELEASE);
++        return i;
++    }
++    return -2;                      /* 占满：调用方拒绝 open，不静默扩容 */
++}
++
++static void p2_reg_release(kvspace_t *kv) {
++    if (kv->p2_slot < 0)
++        return;
++    p2_slot_t *s = &kv->hdr->slots[kv->p2_slot];
++    uint32_t expect = P2_SLOT_MINE;
++    __atomic_compare_exchange_n(&s->state, &expect, P2_SLOT_FREE, false,
++                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++    kv->p2_slot = -1;
++}
++
++/* 每次 kvspaceView* 入口：屏障代变化 → 记本地代并 ack（token 由 _pad 校验失效）。 */
++static void p2_reg_ack(kvspace_t *kv) {
++    uint32_t ep = __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE);
++    if (kv->p2_epoch == ep)
++        return;
++    kv->p2_epoch = ep;
++    if (kv->p2_slot >= 0)
++        __atomic_store_n(&kv->hdr->slots[kv->p2_slot].recovery_ack, ep,
++                         __ATOMIC_RELEASE);
++}
++
++/* 表随 ART slab 增长（容量按当前 block 配置重算）。 */
++#define GEN_RESERVE (64ULL << 20)   /* 64MiB VA 预留：8M 节点 */
++static int gens_grow(kvspace_t *kv) {
++    uint64_t want = gen_cap(kv) * sizeof(kv_gens_t);
++    if (want <= kv->r_gen.mapped)
++        return 0;
++    if (want > GEN_RESERVE)
++        return -1;
++    if (!kv->r_gen.base) {
++        void *p = mmap(NULL, GEN_RESERVE, PROT_NONE,
++                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++        if (p == MAP_FAILED)
++            return -1;
++        kv->r_gen.base = p;
++        kv->r_gen.reserve = GEN_RESERVE;
++    }
++    if (ftruncate(kv->r_gen.fd, (off_t)want) != 0)
++        return -1;
++    if (region_map(&kv->r_gen, (size_t)want) != 0)
++        return -1;
++    kv->hdr->gens_size = want;
++    return 0;
++}
++
++
++/* ── P2: tombstone 延迟释放（粗粒度 epoch：队满或显式 flush 时统一 free）── */
++static void kv_sbo_free_deferred(kvspace_t *kv, uint64_t off);
++static void p2_flush_tomb(kvspace_t *kv);
++
++
++int kvspaceShmSlotView(kvspace_t *kv, const kvspaceRef_t *ref,
++                       const char *key_fallback, kvspaceSlotView_t *out);
++static int32_t art_id_of(kvspace_t *kv, const void *p);
++static art_hdr_t *art_hdr(kvspace_t *kv, int32_t id);
++static int32_t art_follow(kvspace_t *kv, int32_t id);
++static int32_t ref_leaf(kvspace_t *kv, kvspaceRef_t *ref, const char *key);
++static int32_t art_walk(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
++                        int d, int32_t *par, int *pard);
++static int32_t art_child(kvspace_t *kv, void *n, uint8_t b);
++static int pfx_shared(const uint8_t *a, int al, const uint8_t *b, int bl);
++
++/* ── P2: 版本化 view token ─────────────────────────────────────── */
++int kvspaceShmViewFromRef(kvspace_t *kv, const kvspaceRef_t *ref,
++                           const char *key_fallback, kvspaceViewToken_t *tok) {
++    (void)key_fallback;
++    if (!kv || !ref || !tok || ref->gen != 0)
++        return -1;
++    p2_reg_ack(kv);
++    int32_t id = art_follow(kv, (int32_t)ref->block_id);
++    art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
++    if (!h || !h->has_value)
++        return -1;
++    uint64_t cap = sbo_allocated_size(kv->sbo_meta, h->box_offset);
++    if (cap < 1)
++        return -1;
++    uint8_t *raw = kv->sbo_data + h->box_offset;
++    kvspaceXh w;
++    if (kvspaceXhHeadView(raw, cap, &w) != 0 || w.total > cap ||
++        w.kind == KVSPACE_XH_EXT || (w.kind & KVSPACE_XH_PTR_FLAG))
++        return -1;
++    kv_gens_t *g = gens_at(kv, id);
++    if (!g)
++        return -1;
++    uint64_t pw = __atomic_load_n(&g->packed, __ATOMIC_ACQUIRE);
++    uint32_t gen = PK_GEN(pw);
++    int pr = p2_pin(kv, id, gen);
++    if (pr != 0)
++        return pr == 1 ? 1 : -1;      /* 1 = STALE */
++    tok->head = raw;
++    tok->body = raw + w.headlen;
++    tok->headlen = w.headlen;
++    tok->value_len = (uint32_t)w.content_len;
++    tok->cap = cap;
++    tok->body_cap = cap - w.headlen;
++    tok->struct_gen = gen;
++    tok->value_gen = __atomic_load_n(&g->value_gen, __ATOMIC_ACQUIRE);
++    tok->store_id = kv->store_id;
++    tok->node_id = (uint32_t)id;
++    tok->_pad = __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE);
++    return 0;
++}
++
++int kvspaceShmViewResolve(kvspace_t *kv, const char *key, kvspaceViewToken_t *tok) {
++    kvspaceRef_t ref;
++    if (!kv || !key || !tok || kvspaceShmResolveRef(kv, key, &ref) != 0)
++        return -1;
++    return kvspaceShmViewFromRef(kv, &ref, key, tok);
++}
++
++/* 前缀解析：path 的最后一个字节落在哪个节点；depth = 该节点压缩前缀被 path 覆盖的字节数
++ * （可能 < prefix_len，即边界落在前缀内部）。用于 short 键（整键就是一个节点的前缀）。 */
++int kvspaceShmResolvePrefix(kvspace_t *kv, const char *path, kvspaceRef_t *ref) {
++    if (!kv || !path || !ref)
++        return -1;
++    memset(ref, 0, sizeof(*ref));
++    int klen = (int)strlen(path);
++    int d = 0;
++    int32_t nid = kv->hdr->art_root;
++    while (nid >= 0) {
++        art_hdr_t *h = art_hdr(kv, nid);
++        if (!h || h->type == ART_MOVED)
++            return -1;
++        if (h->prefix_len) {
++            int s = pfx_shared(h->prefix, h->prefix_len,
++                               (const uint8_t *)path + d, klen - d);
++            if (s != h->prefix_len && d + s != klen)
++                return -1;
++            d += s;
++            if (d == klen) {
++                ref->block_id = (uint32_t)nid;
++                ref->depth = (uint32_t)s;   /* 该节点前缀里被 path 覆盖的字节数 */
++                return 0;
++            }
++        }
++        nid = art_child(kv, h, (uint8_t)path[d]);
++        d++;
++    }
++    return -1;
++}
++
++/* 前缀形态：parent_ref 的 block_id/depth 指向目录节点；只走 rel。 */
++int kvspaceShmViewResolveFrom(kvspace_t *kv, const kvspaceRef_t *parent,
++                              const char *rel, kvspaceViewToken_t *tok) {
++    if (!kv || !parent || !rel || !tok)
++        return -1;
++    int32_t pid = art_follow(kv, (int32_t)parent->block_id);
++    art_hdr_t *ph = pid >= 0 ? art_hdr(kv, pid) : NULL;
++    if (!ph)
++        return -1;
++    /* 边界落在节点压缩前缀内部时，先把该节点前缀的剩余字节与 rel 对掉。 */
++    const uint8_t *p = (const uint8_t *)rel;
++    int rem = (int)strlen(rel);
++    int32_t covered = (int32_t)parent->depth;
++    while (covered < (int32_t)ph->prefix_len && rem > 0) {
++        if (p[0] != ph->prefix[covered])
++            return -1;
++        p++; rem--; covered++;
++    }
++    int32_t id;
++    if (rem == 0) {
++        id = pid;                        /* 空 rel = 前缀自身 */
++    } else {
++        int32_t cid = art_child(kv, ph, p[0]);
++        id = art_walk(kv, cid, p, rem, 1, NULL, NULL);
++    }
++    if (id < 0)
++        return -1;
++    kvspaceRef_t leaf = {0};
++    leaf.block_id = (uint32_t)id;
++    leaf.gen = 0;
++    return kvspaceShmViewFromRef(kv, &leaf, rel, tok);
++}
++
++int kvspaceShmViewCheck(kvspace_t *kv, const kvspaceViewToken_t *tok) {
++    if (!kv || !tok)
++        return -1;
++    p2_reg_ack(kv);
++    if (tok->store_id != kv->store_id)
++        return 1;
++    if (tok->_pad != __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE))
++        return 1;
++    kv_gens_t *g = gens_at(kv, (int32_t)tok->node_id);
++    if (!g)
++        return 1;
++    uint64_t pw = __atomic_load_n(&g->packed, __ATOMIC_ACQUIRE);
++    if (PK_GEN(pw) != tok->struct_gen || (pw & P2_DEAD))
++        return 1;
++    return 0;
++}
++
++/* 释放 token 的 pin（runtime 在帧销毁 / STALE / evict 时调用）。 */
++int kvspaceShmViewRelease(kvspace_t *kv, kvspaceViewToken_t *tok) {
++    if (!kv || !tok)
++        return -1;
++    if (tok->store_id != kv->store_id)
++        return 1;
++    uint64_t off = 0;
++    if (tok->head && kv->sbo_data && tok->head >= kv->sbo_data)
++        off = (uint64_t)(tok->head - kv->sbo_data);
++    p2_unpin(kv, (int32_t)tok->node_id, off);
++    tok->store_id = 0;
++    return 0;
++}
++
++/* 热路径写：同尺寸就地写（8B inline 情形）。0=成功；1=需要回落（尺寸/版本不符）。 */
++int kvspaceShmViewWrite(kvspace_t *kv, kvspaceViewToken_t *tok,
++                        const uint8_t *data, uint32_t len) {
++    if (kvspaceShmViewCheck(kv, tok) != 0)
++        return 1;
++    if (len > tok->body_cap)
++        return 1;
++    kv_gens_t *g = gens_at(kv, (int32_t)tok->node_id);
++    if (!g)
++        return 1;
++    __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL); /* 奇：写中 */
++    memcpy(tok->body, data, len);
++    __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL); /* 偶：写完 */
++    tok->value_len = len;
++    return 0;
++}
++
++/* 热路径删：tombstone + value_gen++（box 释放走延迟队列）。 */
++int kvspaceShmViewDel(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key) {
++    if (kvspaceShmViewCheck(kv, tok) != 0)
++        return 1;
++    kv_gens_t *g = gens_at(kv, (int32_t)tok->node_id);
++    art_hdr_t *h = art_hdr(kv, (int32_t)tok->node_id);
++    if (!g || !h || !h->has_value)
++        return 1;
++    /* 叶子级逻辑墓碑：键立刻不存在；不收 slot、不 bump struct_gen、不入 ring。
++     * 读者靠 value_gen 检测删除；回收交给后台 sweep。 */
++    h->has_value = 0;
++    g->value_gen++;                 /* 单写者：release fence 见下 */
++    __atomic_thread_fence(__ATOMIC_RELEASE);
++    (void)key;
++    return 0;
++}
++
++/* 恢复屏障：检测死 owner → 推进 recovery_epoch → 等存活进程 ack → 回收死槽。
++ * 返回 1 = 屏障完成（无死进程或全部存活进程已 ack）；0 = 超时（不回收，记审计）。 */
++static int p2_barrier(kvspace_t *kv) {
++#if !defined(__linux__)
++    return 1;                        /* 无 /proc：不判死，不做墓碑回收 */
++#else
++    /* 先修复上一轮超时遗留的 RECOVERING：活者回 MINE 重新等待，死者回 FREE。 */
++    for (int i = 0; i < P2_SLOT_N; i++) {
++        p2_slot_t *s = &kv->hdr->slots[i];
++        uint32_t v = __atomic_load_n(&s->state, __ATOMIC_ACQUIRE);
++        if (v == P2_SLOT_RECOVERING) {
++            uint32_t to = p2_slot_alive(s) ? P2_SLOT_MINE : P2_SLOT_FREE;
++            __atomic_compare_exchange_n(&s->state, &v, to, false,
++                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++        }
++    }
++    /* 单趟扫：收集死槽下标（/proc 读是主要成本，避免两趟）。 */
++    uint8_t dead_idx[P2_SLOT_N];
++    int dead = 0;
++    for (int i = 0; i < P2_SLOT_N; i++) {
++        p2_slot_t *s = &kv->hdr->slots[i];
++        if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) == P2_SLOT_MINE &&
++            !p2_slot_alive(s))
++            dead_idx[dead++] = (uint8_t)i;
++    }
++    if (!dead)
++        return 1;
++    uint32_t ns = __atomic_add_fetch(&kv->hdr->recovery_epoch, 1u, __ATOMIC_ACQ_REL);
++    for (int k = 0; k < dead; k++) {
++        p2_slot_t *s = &kv->hdr->slots[dead_idx[k]];
++        uint32_t v = P2_SLOT_MINE;
++        __atomic_compare_exchange_n(&s->state, &v, P2_SLOT_RECOVERING, false,
++                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++    }
++    p2_reg_ack(kv);                 /* sweeper 自己也确认新代 */
++    int ms = getenv("P2_BARRIER_MS") ? atoi(getenv("P2_BARRIER_MS")) : 200;
++    bool done = false;
++    /* 先短自旋（sched_yield），再退到 50µs 轮询：正常 ack 在微秒级，避免 1ms 量化。 */
++    long rounds = (long)ms * 20;
++    for (long t = 0; t < rounds; t++) {
++        done = true;
++        for (int i = 0; i < P2_SLOT_N; i++) {
++            p2_slot_t *s = &kv->hdr->slots[i];
++            if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != P2_SLOT_MINE)
++                continue;
++            if (__atomic_load_n(&s->recovery_ack, __ATOMIC_ACQUIRE) != ns) {
++                done = false;
++                break;
++            }
++        }
++        if (done)
++            break;
++        if (t < 4096)
++            sched_yield();
++        else
++            usleep(50);
++    }
++    if (!done) {
++        fprintf(stderr,
++                "kvspace: recovery barrier timeout (epoch %u, waited %dms); "
++                "dead pins not reclaimed\n", ns, ms);
++        if (getenv("P2_DEBUG")) {
++            for (int i = 0; i < P2_SLOT_N; i++) {
++                p2_slot_t *s = &kv->hdr->slots[i];
++                uint32_t st = __atomic_load_n(&s->state, __ATOMIC_ACQUIRE);
++                if (st == P2_SLOT_MINE)
++                    fprintf(stderr, "DBG slot %d pid=%u ack=%llu want=%u\n", i,
++                            s->pid, (unsigned long long)s->recovery_ack, ns);
++            }
++        }
++        return 0;
++    }
++    for (int i = 0; i < P2_SLOT_N; i++) {
++        p2_slot_t *s = &kv->hdr->slots[i];
++        uint32_t v = P2_SLOT_RECOVERING;
++        __atomic_compare_exchange_n(&s->state, &v, P2_SLOT_FREE, false,
++                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++    }
++    return 1;
++#endif
++}
++
++/* 后台 sweep：DFS 扫描墓碑叶（has_value==0 且 box 未回收），释放 box 并 bump struct_gen。
++ * 调用方保证不与并发写同 key；返回释放数。 */
++static int p2_sweep_node(kvspace_t *kv, int32_t nid) {
++#if !defined(__linux__)
++    /* macOS：无可证的独占锁，不做墓碑回收（box 延迟到 close）。 */
++    (void)kv;
++    (void)nid;
++    return 0;
++#else
++    art_hdr_t *h = art_hdr(kv, nid);
++    if (!h || h->type == ART_MOVED)
++        return 0;
++    int freed = 0;
++    if (!h->has_value && h->box_offset) {
++        uint64_t off = h->box_offset;
++        gen_bump_struct(kv, nid);          /* 先 release 抬 gen：旧 token 全部 STALE */
++        kv_gens_t *g = gens_at(kv, nid);
++        int here = 0;
++        if (g) {
++            for (;;) {
++                uint64_t w = __atomic_load_n(&g->packed, __ATOMIC_ACQUIRE);
++                if (w & P2_DEAD)
++                    break;
++                if (PK_REF(w) > 0) {
++                    if (__atomic_compare_exchange_n(&g->packed, &w, w | P2_PEND,
++                                                    false, __ATOMIC_ACQ_REL,
++                                                    __ATOMIC_ACQUIRE))
++                        break;
++                } else {
++                    if (__atomic_compare_exchange_n(&g->packed, &w, w | P2_DEAD,
++                                                    false, __ATOMIC_ACQ_REL,
++                                                    __ATOMIC_ACQUIRE)) {
++                        kv_sbo_free(kv, off);
++                        here = 1;
++                    }
++                    break;
++                }
++            }
++        } else {
++            kv_sbo_free(kv, off);
++            here = 1;
++        }
++        h->box_offset = 0;
++        freed += here;
++    }
++    switch (h->type) {
++    case ART_N4: {
++        art_n4_t *x = (art_n4_t *)h;
++        for (int i = 0; i < (int)h->count; i++)
++            freed += p2_sweep_node(kv, x->children[i]);
++        break;
++    }
++    case ART_N16: {
++        art_n16_t *x = (art_n16_t *)h;
++        for (int i = 0; i < (int)h->count; i++)
++            freed += p2_sweep_node(kv, x->children[i]);
++        break;
++    }
++    case ART_N48: {
++        art_n48_t *x = (art_n48_t *)h;
++        for (int i = 0; i < 256; i++)
++            if (x->index[i] != 255)
++                freed += p2_sweep_node(kv, x->children[x->index[i]]);
++        break;
++    }
++    case ART_N256: {
++        art_n256_t *x = (art_n256_t *)h;
++        for (int i = 0; i < 256; i++)
++            freed += p2_sweep_node(kv, x->children[i]);
++        break;
++    }
++    }
++    return freed;
++#endif
++}
++
++int kvspaceShmViewSweep(kvspace_t *kv) {
++    if (!kv || kv->hdr->art_root < 0)
++        return 0;
++    p2_reg_ack(kv);
++    p2_barrier(kv);                 /* 死 owner 的代推进 + 槽回收 */
++    return p2_sweep_node(kv, kv->hdr->art_root);
++}
++
++int kvspaceShmViewFlushTomb(kvspace_t *kv) {
++    if (!kv)
++        return -1;
++    p2_flush_tomb(kv);
++    return 0;
++}
++
++int kvspaceShmViewRefresh(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key) {
++    kvspaceViewToken_t t;
++    if (kvspaceShmViewResolve(kv, key, &t) != 0)
++        return -1;
++    *tok = t;
++    return 0;
++}
++
+ static int kv_sync(kvspace_t *kv) {
+     if (region_map(&kv->r_art, ART_OFF + (size_t)kv->hdr->art_slab_size) != 0)
+         return -1;
+@@ -342,6 +1054,64 @@ static void kv_sbo_free(kvspace_t *kv, uint64_t off) {
+     sbo_free(kv->sbo_meta, off);
+ }
+ 
++/* P2: tombstone —— 有界 ring（L1 内）+ 后台 flush 线程。
++ * 前台只做：ring[tail & MASK] = off; tail++（release）; 唤醒后台。
++ * 队列满时前台等待（backpressure），绝不在调用线程里 sbo_free。 */
++#define P2_RING 256
++static void *p2_flusher(void *arg);
++
++static void kv_sbo_free_deferred(kvspace_t *kv, uint64_t off) {
++    if (off == 0 || (int64_t)off < 0)
++        return;
++    for (;;) {
++        uint32_t t = __atomic_load_n(&kv->tomb_tail, __ATOMIC_RELAXED);
++        uint32_t h = __atomic_load_n(&kv->tomb_head, __ATOMIC_ACQUIRE);
++        if (t - h < P2_RING) {
++            kv->tomb_ring[t & (P2_RING - 1)] = off;
++            __atomic_store_n(&kv->tomb_tail, t + 1, __ATOMIC_RELEASE);
++            break;
++        }
++        /* 满：唤醒后台并等待空位（backpressure） */
++        __atomic_add_fetch(&kv->tomb_backpressure, 1ull, __ATOMIC_RELAXED);
++        pthread_mutex_lock(&kv->tomb_mu);
++        pthread_cond_signal(&kv->tomb_cv);
++        pthread_mutex_unlock(&kv->tomb_mu);
++        sched_yield();
++    }
++    pthread_mutex_lock(&kv->tomb_mu);
++    pthread_cond_signal(&kv->tomb_cv);
++    pthread_mutex_unlock(&kv->tomb_mu);
++}
++
++static void p2_flush_tomb(kvspace_t *kv) {
++    for (;;) {
++        uint32_t h = __atomic_load_n(&kv->tomb_head, __ATOMIC_ACQUIRE);
++        uint32_t t = __atomic_load_n(&kv->tomb_tail, __ATOMIC_ACQUIRE);
++        if (h == t)
++            break;
++        uint64_t off = kv->tomb_ring[h & (P2_RING - 1)];
++        __atomic_store_n(&kv->tomb_head, h + 1, __ATOMIC_RELEASE);
++        kv_sbo_free(kv, off);
++    }
++}
++
++static void *p2_flusher(void *arg) {
++    kvspace_t *kv = arg;
++    for (;;) {
++        pthread_mutex_lock(&kv->tomb_mu);
++        while (!kv->tomb_stop &&
++               __atomic_load_n(&kv->tomb_head, __ATOMIC_ACQUIRE) ==
++                   __atomic_load_n(&kv->tomb_tail, __ATOMIC_ACQUIRE))
++            pthread_cond_wait(&kv->tomb_cv, &kv->tomb_mu);
++        int stop = kv->tomb_stop;
++        pthread_mutex_unlock(&kv->tomb_mu);
++        p2_flush_tomb(kv);
++        if (stop)
++            break;
++    }
++    return NULL;
++}
++
+ /* ---- helpers ---- */
+ static void *art_blk(kvspace_t *kv, int32_t id) {
+     if (id < 0)
+@@ -350,11 +1120,22 @@ static void *art_blk(kvspace_t *kv, int32_t id) {
+ }
+ static int32_t art_balloc(kvspace_t *kv) {
+     int64_t id = blocks_alloc(kv->art_meta, kv->art_data);
+-    if (id >= 0)
+-        return (int32_t)id;
+-    if (art_slab_grow(kv) != 0)
+-        return -1;
+-    return (int32_t)blocks_alloc(kv->art_meta, kv->art_data);
++    if (id < 0) {
++        if (art_slab_grow(kv) != 0 || gens_grow(kv) != 0)
++            return -1;
++        id = blocks_alloc(kv->art_meta, kv->art_data);
++    }
++    if (id >= 0) {
++        kv_gens_t *g = gens_at(kv, (int32_t)id);
++        if (g) {
++            /* 新 id 的 gen 取全局 epoch，保证被复用的 id 不会误命中旧 token。 */
++            __atomic_store_n(&g->packed,
++                             PK_MK((uint32_t)gen_alloc_epoch(kv), 0, 0),
++                             __ATOMIC_RELEASE);
++            __atomic_store_n(&g->value_gen, 0u, __ATOMIC_RELEASE);
++        }
++    }
++    return (int32_t)id;
+ }
+ static art_hdr_t *art_hdr(kvspace_t *kv, int32_t id) {
+     return (art_hdr_t *)art_blk(kv, id);
+@@ -648,6 +1429,12 @@ static int32_t art_grow(kvspace_t *kv, void *on) {
+                     x->children[j] = tc;
+                 }
+     }
++    {   /* P2: 搬迁 —— 新节点 struct_gen = 旧 +1；旧节点也动一次 */
++        int32_t oid = art_id_of(kv, oh);
++        (void)gens_at;
++        gen_bump_struct(kv, nid);   /* 新节点 gen 先抬一代 */
++        gen_bump_struct(kv, oid);   /* 旧节点也失效 */
++    }
+     oh->type = ART_MOVED;
+     oh->has_value = 0;
+     oh->box_offset = (uint64_t)(uint32_t)nid;
+@@ -656,6 +1443,7 @@ static int32_t art_grow(kvspace_t *kv, void *on) {
+ 
+ /* ---- add child ---- */
+ static int art_add(kvspace_t *kv, void *n, uint8_t b, int32_t cid) {
++    gen_bump_struct(kv, art_id_of(kv, n)); /* P2: 子集变化 */
+     art_hdr_t *h = n;
+     switch (h->type) {
+     case ART_N4: {
+@@ -903,7 +1691,9 @@ static int32_t art_del(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
+         if (!h->has_value)
+             return nid;
+         h->has_value = 0;
+-        kv_sbo_free(kv, h->box_offset);
++        gen_bump_value(kv, art_id_of(kv, h)); /* P2: 值删 */
++        gen_bump_struct(kv, art_id_of(kv, h)); /* P2: 槽消失，view 失效 */
++        kv_sbo_free_deferred(kv, h->box_offset);
+         h->box_offset = 0;
+         *del = true;
+     } else {
+@@ -1192,17 +1982,20 @@ static bool sbo_data_size_ok(size_t n) {
+ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
+     if (!path)
+         return NULL;
+-    char head_path[PATH_MAX], data_path[PATH_MAX];
++    char head_path[PATH_MAX], data_path[PATH_MAX], gen_path[PATH_MAX];
+     if (snprintf(head_path, sizeof head_path, "%s.sbo.head", path) >=
+             (int)sizeof head_path ||
+         snprintf(data_path, sizeof data_path, "%s.sbo.data", path) >=
+-            (int)sizeof data_path)
++            (int)sizeof data_path ||
++        snprintf(gen_path, sizeof gen_path, "%s.gen", path) >=
++            (int)sizeof gen_path)
+         return NULL;
+ 
+     kvspace_t *kv = calloc(1, sizeof(*kv));
+     if (!kv)
+         return NULL;
+-    kv->r_art.fd = kv->r_head.fd = kv->r_data.fd = -1;
++    kv->p2_slot = -1;
++    kv->r_art.fd = kv->r_head.fd = kv->r_data.fd = kv->r_gen.fd = -1;
+ 
+     /* validate before O_EXCL create: no empty file left behind */
+     bool created = false;
+@@ -1237,7 +2030,8 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
+         (kv->r_head.fd = open(head_path, fl, 0644)) < 0 ||
+         region_attach(&kv->r_head, created, sbo_head, REGION_RESERVE) != 0 ||
+         (kv->r_data.fd = open(data_path, fl, 0644)) < 0 ||
+-        region_attach(&kv->r_data, created, data_size, DATA_RESERVE) != 0)
++        region_attach(&kv->r_data, created, data_size, DATA_RESERVE) != 0 ||
++        (kv->r_gen.fd = open(gen_path, fl, 0644)) < 0)
+         goto fail;
+ 
+     kv->hdr = (kvspace_hdr_t *)kv->r_art.base;
+@@ -1246,8 +2040,11 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
+     kv->sbo_meta = (sbo_meta_t *)kv->r_head.base;
+     kv->sbo_data = kv->r_data.base;
+ 
++    kv->store_id = ((uint64_t)getpid() << 32) ^ (uint64_t)(uintptr_t)kv;
++
+     if (created) {
+         memset(kv->hdr, 0, sizeof(*kv->hdr));
++        kv->hdr->format_version = 1;
+         kv->hdr->art_slab_size = art_slab;
+         kv->hdr->sbo_head_size = sbo_head;
+         kv->hdr->sbo_data_size = data_size;
+@@ -1258,10 +2055,31 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
+         /* magic last: half-initialized file fails reopen */
+         memcpy(kv->hdr->magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1);
+     }
++    if (gens_grow(kv) != 0)   /* P2: gen 表在 blocks_init 之后 */
++        goto fail;
++
+     /* growth code assumes the single-root pool layout (SBO_HEAD_FIXED) */
+     if (kv->sbo_meta->root_slots != 1)
+         goto fail;
+ 
++    /* P2: 注册表认领。占满（N=64）拒绝 open，错误明确，不静默扩容。 */
++    kv->p2_slot = p2_reg_claim(kv);
++    if (kv->p2_slot == -2) {
++        fprintf(stderr, "kvspace: too many processes, N=%d\n", P2_SLOT_N);
++        goto fail;
++    }
++    if (kv->p2_slot < 0)
++        goto fail;
++    kv->p2_epoch = __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE);
++
++    kv->tomb_ring = calloc(P2_RING, sizeof(uint64_t));
++    if (!kv->tomb_ring)
++        goto fail;
++    pthread_mutex_init(&kv->tomb_mu, NULL);
++    pthread_cond_init(&kv->tomb_cv, NULL);
++    if (pthread_create(&kv->tomb_thread, NULL, p2_flusher, kv) != 0)
++        goto fail;
++
+     pthread_mutex_init(&kv->wlock, NULL);
+     for (int i = 0; i < WATCH_TABLE_SZ; i++) {
+         pthread_cond_init(&kv->watches[i].cond, NULL);
+@@ -1270,9 +2088,21 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
+     return kv;
+ 
+ fail:
++    if (kv->p2_slot >= 0 && kv->hdr)
++        p2_reg_release(kv);
+     region_close(&kv->r_art);
+     region_close(&kv->r_head);
++    if (kv->tomb_ring) {
++        pthread_mutex_lock(&kv->tomb_mu);
++        kv->tomb_stop = 1;
++        pthread_cond_signal(&kv->tomb_cv);
++        pthread_mutex_unlock(&kv->tomb_mu);
++        pthread_join(kv->tomb_thread, NULL);
++        p2_flush_tomb(kv);
++        free(kv->tomb_ring);
++    }
+     region_close(&kv->r_data);
++    region_close(&kv->r_gen);
+     free(kv);
+     if (created) {
+         unlink(path);
+@@ -1284,6 +2114,8 @@ fail:
+ void kvspaceShmClose(kvspace_t *kv) {
+     if (!kv)
+         return;
++    p2_setstats_dump();
++    p2_reg_release(kv);
+     for (int i = 0; i < WATCH_TABLE_SZ; i++) {
+         pthread_cond_destroy(&kv->watches[i].cond);
+         pthread_mutex_destroy(&kv->watches[i].mtx);
+@@ -1292,7 +2124,17 @@ void kvspaceShmClose(kvspace_t *kv) {
+     pthread_mutex_destroy(&kv->wlock);
+     region_close(&kv->r_art);
+     region_close(&kv->r_head);
++    if (kv->tomb_ring) {
++        pthread_mutex_lock(&kv->tomb_mu);
++        kv->tomb_stop = 1;
++        pthread_cond_signal(&kv->tomb_cv);
++        pthread_mutex_unlock(&kv->tomb_mu);
++        pthread_join(kv->tomb_thread, NULL);
++        p2_flush_tomb(kv);
++        free(kv->tomb_ring);
++    }
+     region_close(&kv->r_data);
++    region_close(&kv->r_gen);
+     free(kv);
+ }
+ 
+@@ -1468,8 +2310,10 @@ static int32_t ref_leaf(kvspace_t *kv, kvspaceRef_t *ref, const char *key) {
+         return -1;
+     int klen = (int)strlen(key);
+     int d = (int)ref->gen;
+-    if (d < 0 || d >= klen)
++    if (d < 0 || d > klen)   /* P2: d == klen 表示前缀节点就是全部路径 */
+         return -1;
++    if (d == klen)
++        return art_follow(kv, (int32_t)ref->block_id);
+     art_hdr_t *h = art_hdr(kv, id);
+     if (!h || h->type == ART_MOVED)
+         return -1;
+@@ -1681,18 +2525,46 @@ int kvspaceShmSlotView(kvspace_t *kv, const kvspaceRef_t *ref,
+     return 0;
+ }
+ 
++/* 临时探针（P2_SETSTATS=<file>）：统计写入形态，用于静默屏障可行性评估。 */
++static struct { uint64_t same, realloc_, fresh, retired_bytes; } g_setstats;
++static void p2_setstats_dump(void) {
++    const char *f = getenv("P2_SETSTATS");
++    if (!f || !f[0])
++        return;
++    FILE *fp = fopen(f, "a");
++    if (!fp)
++        return;
++    fprintf(fp, "pid=%d same=%llu realloc=%llu fresh=%llu retired_bytes=%llu\n",
++            (int)getpid(), (unsigned long long)g_setstats.same,
++            (unsigned long long)g_setstats.realloc_,
++            (unsigned long long)g_setstats.fresh,
++            (unsigned long long)g_setstats.retired_bytes);
++    fclose(fp);
++}
++
+ /* 原始落盘（不处理容器/member 语义，供内部调用，避免递归）。 */
+ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
+                          int32_t val_len, art_hdr_t *old) {
++    {
++        static bool reg;
++        if (!reg) { reg = true; atexit(p2_setstats_dump); }
++    }
+     if (old && old->has_value) {
+         /* 同尺寸原地覆写：新值 ≤ 旧 box 容量时直接 memcpy，跳过 free+alloc，
+            不改共享 buddy 树。容量读自共享 mmap，零进程内状态。 */
+         uint64_t cap = sbo_allocated_size(kv->sbo_meta, old->box_offset);
+         if ((uint64_t)val_len <= cap) {
++            /* P2: 同尺寸就地写 —— 只 bump value_gen，指针不变 */
+             memcpy(kv->sbo_data + old->box_offset, val, (size_t)val_len);
++            gen_bump_value(kv, art_id_of(kv, old));
++            g_setstats.same++;
+             return 0;
+         }
++        g_setstats.realloc_++;
++        g_setstats.retired_bytes += cap;
+         kv_sbo_free(kv, old->box_offset);
++    } else {
++        g_setstats.fresh++;
+     }
+     size_t alloc_len = (size_t)val_len;
+     if (is_vthread_status_key(key) && alloc_len < KVSPACE_STATUS_MIN_CAP)
+@@ -1703,6 +2575,25 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
+     memcpy(kv->sbo_data + off, val, val_len);
+     kv->hdr->art_root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)key,
+                                 (int)strlen(key), 0, off);
++    /* P2: 换 box / 墓碑复活——清 pending/dead 并抬 gen（旧 token 失效）。 */
++    {
++        int32_t nid = p2_node_at(kv, key);
++        kv_gens_t *g = gens_at(kv, nid);
++        if (getenv("P2_DEBUG")) { fprintf(stderr, "DBG reset-lookup key=%s nid=%d g=%p root=%d\n", key, nid, (void *)g, kv->hdr->art_root); }
++        if (g) {
++            /* CAS 循环：与并发 sweep/pin 抢同一个字，不能 load+store 覆盖 gen。 */
++            for (;;) {
++                uint64_t w = __atomic_load_n(&g->packed, __ATOMIC_ACQUIRE);
++                if (getenv("P2_DEBUG")) { fprintf(stderr, "DBG reset nid=%d oldgen=%u oldw=0x%llx", nid, PK_GEN(w), (unsigned long long)w); fputc(10, stderr); }
++                uint64_t nw = PK_MK(PK_GEN(w) + 1, 0, 0);
++                if (__atomic_compare_exchange_n(&g->packed, &w, nw, false,
++                                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++                    __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
++                    break;
++                }
++            }
++        }
++    }
+     return 0;
+ }
+ 
+diff --git a/src/kvspace_shm.h b/src/kvspace_shm.h
+index 5b4ef23..d997b23 100644
+--- a/src/kvspace_shm.h
++++ b/src/kvspace_shm.h
+@@ -125,4 +125,28 @@ int kvspaceShmNotify(kvspace_t *kv, const char *key, const uint8_t *val,
+ uint8_t *kvspaceShmWatch(kvspace_t *kv, const char *key, int32_t timeout_ms,
+                          int32_t *out_len);
+ 
++#ifndef KVSPACE_VIEW_TOKEN_DEFINED
++#define KVSPACE_VIEW_TOKEN_DEFINED
++typedef struct {
++    uint8_t *head; uint8_t *body; uint32_t headlen; uint32_t value_len;
++    uint64_t cap; uint64_t body_cap;
++    uint32_t struct_gen; uint32_t value_gen;
++    uint64_t store_id; uint32_t node_id; uint32_t _pad;
++} kvspaceViewToken_t;
++#endif
++int kvspaceShmResolvePrefix(kvspace_t *kv, const char *path, kvspaceRef_t *ref);
++int kvspaceShmViewResolve(kvspace_t *kv, const char *key, kvspaceViewToken_t *tok);
++int kvspaceShmViewFromRef(kvspace_t *kv, const kvspaceRef_t *ref,
++                          const char *key_fallback, kvspaceViewToken_t *tok);
++int kvspaceShmViewResolveFrom(kvspace_t *kv, const kvspaceRef_t *parent,
++                              const char *rel, kvspaceViewToken_t *tok);
++int kvspaceShmViewCheck(kvspace_t *kv, const kvspaceViewToken_t *tok);
++int kvspaceShmViewWrite(kvspace_t *kv, kvspaceViewToken_t *tok,
++                        const uint8_t *data, uint32_t len);
++int kvspaceShmViewDel(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key);
++int kvspaceShmViewRefresh(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key);
++int kvspaceShmViewRelease(kvspace_t *kv, kvspaceViewToken_t *tok);
++int kvspaceShmViewSweep(kvspace_t *kv);
++int kvspaceShmViewFlushTomb(kvspace_t *kv);
++
+ #endif
+diff --git a/src/xvalue_head.c b/src/xvalue_head.c
+index bfce6fb..8668b3b 100644
+--- a/src/xvalue_head.c
++++ b/src/xvalue_head.c
+@@ -592,6 +592,10 @@ int kvspaceXhDecode(const uint8_t *data, uint64_t len, kvspaceXh *out) {
+     return -1;
+ }
+ 
++int kvspaceXhHeadView(const uint8_t *data, uint64_t len, kvspaceXh *out) {
++    return xh_header(data, len, out);
++}
++
+ int kvspaceXhView(const uint8_t *data, uint64_t len, kvspaceXh *out) {
+     if (xh_header(data, len, out) != 0)
+         return -1;
+diff --git a/src/xvalue_head.h b/src/xvalue_head.h
+index dd2792f..546b84e 100644
+--- a/src/xvalue_head.h
++++ b/src/xvalue_head.h
+@@ -44,6 +44,7 @@ typedef struct kvspaceXh {
+ int kvspaceXhDecode(const uint8_t *data, uint64_t len, kvspaceXh *out);
+ /* Borrow the head; validate payloads that need semantic checks. */
+ int kvspaceXhView(const uint8_t *data, uint64_t len, kvspaceXh *out);
++int kvspaceXhHeadView(const uint8_t *data, uint64_t len, kvspaceXh *out);
+ 
+ int kvspaceXhNewNone(uint8_t **out, uint64_t *out_len);
+ int kvspaceXhNewScalar(const char *langtype, const uint8_t *raw, uint32_t raw_len,
