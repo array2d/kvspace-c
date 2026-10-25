@@ -231,21 +231,11 @@ static int32_t art_walk(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen
 static int32_t art_follow(kvspace_t *kv, int32_t id);
 static int32_t ref_leaf(kvspace_t *kv, kvspaceRef_t *ref, const char *key);
 
-/* 每节点 16B：packed64 + value_gen。
- * packed = { gen:32 | flags:2 | dead:1 | pending:1 | ref:28 } */
+/* 每节点 8B：{struct_gen, value_gen}（v2.2 删 pin 后不再有 refcount 位）。 */
 typedef struct {
-    uint64_t packed;
+    uint32_t struct_gen;
     uint32_t value_gen;
-    uint32_t _pad;
 } kv_gens_t;
-
-#define P2_REF_MASK 0xFFFFFFFull
-#define P2_PEND     (1ull << 28)
-#define P2_DEAD     (1ull << 29)
-#define P2_FLAGS    (3ull << 30)
-#define PK_GEN(w)   ((uint32_t)((w) >> 32))
-#define PK_REF(w)   ((uint32_t)((w) & P2_REF_MASK))
-#define PK_MK(gen, ref, extra) ((((uint64_t)(gen)) << 32) | ((uint64_t)(ref) & P2_REF_MASK) | (extra))
 
 static uint64_t gen_cap(const kvspace_t *kv) {
     blocks_meta_t *m = kv->art_meta;
@@ -271,21 +261,15 @@ static kv_gens_t *gens_at(kvspace_t *kv, int32_t id) {
 
 static void gen_bump_struct(kvspace_t *kv, int32_t id) {
     kv_gens_t *g = gens_at(kv, id);
-    if (!g)
-        return;
-    for (;;) {
-        uint64_t w = __atomic_load_n(&g->packed, __ATOMIC_ACQUIRE);
-        uint64_t nw = PK_MK(PK_GEN(w) + 1, PK_REF(w), w & (P2_PEND | P2_DEAD | P2_FLAGS));
-        if (__atomic_compare_exchange_n(&g->packed, &w, nw, false,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-            return;
-    }
+    if (g)
+        __atomic_add_fetch(&g->struct_gen, 1u, __ATOMIC_ACQ_REL);
 }
 
+/* value_gen 静止态恒为偶数：就地写前后各 +1（奇=写中），整体替换/删除 +2。 */
 static void gen_bump_value(kvspace_t *kv, int32_t id) {
     kv_gens_t *g = gens_at(kv, id);
     if (g)
-        __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
+        __atomic_add_fetch(&g->value_gen, 2u, __ATOMIC_ACQ_REL);
 }
 
 static int64_t gen_alloc_epoch(kvspace_t *kv) {
@@ -321,52 +305,6 @@ static int32_t p2_node_at(kvspace_t *kv, const char *key) {
     }
     if (getenv("P2_DEBUG")) { fprintf(stderr, "DBG node_at EOF key=%s d=%d/%d\n", key, d, klen); }
     return -1;
-}
-
-/* pin：校验 gen + 拒绝 DEAD / (PENDING && ref==0)，与 ref++ 同一 CAS。 */
-static int p2_pin(kvspace_t *kv, int32_t id, uint32_t gen) {
-    kv_gens_t *g = gens_at(kv, id);
-    if (!g)
-        return -1;
-    for (;;) {
-        uint64_t w = __atomic_load_n(&g->packed, __ATOMIC_ACQUIRE);
-        if (PK_GEN(w) != gen || (w & P2_DEAD) ||
-            ((w & P2_PEND) && PK_REF(w) == 0)) {
-            if (getenv("P2_DEBUG")) { fprintf(stderr, "DBG pin-fail id=%d want=%u got=%u w=0x%llx", id, gen, PK_GEN(w), (unsigned long long)w); fputc(10, stderr); }
-            return 1;
-        }
-        uint64_t nw = w + 1;
-        if (PK_REF(nw) == 0)
-            return 1;
-        if (__atomic_compare_exchange_n(&g->packed, &w, nw, false,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-            return 0;
-    }
-}
-
-/* unpin：ref--；PENDING 下最后一个 unpin 负责 free（DEAD 的 0→1 是唯一赢家）。 */
-static void p2_unpin(kvspace_t *kv, int32_t id, uint64_t off) {
-    kv_gens_t *g = gens_at(kv, id);
-    if (!g)
-        return;
-    for (;;) {
-        uint64_t w = __atomic_load_n(&g->packed, __ATOMIC_ACQUIRE);
-        if (PK_REF(w) == 0)
-            return;
-        uint64_t nw = w - 1;
-        if (!__atomic_compare_exchange_n(&g->packed, &w, nw, false,
-                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-            continue;
-        if ((nw & P2_PEND) && PK_REF(nw) == 0 && !(nw & P2_DEAD)) {
-            uint64_t dw = nw;
-            if (__atomic_compare_exchange_n(&g->packed, &dw, dw | P2_DEAD, false,
-                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-                if (off)
-                    kv_sbo_free(kv, off);
-            }
-        }
-        return;
-    }
 }
 
 /* ── P2: 进程注册表 + 恢复屏障 ────────────────────────────────── */
@@ -473,7 +411,7 @@ static int p2_reg_claim(kvspace_t *kv) {
         s->starttime = st;
         __atomic_store_n(&s->recovery_ack,
                          __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE),
-                         __ATOMIC_ACQ_REL);
+                         __ATOMIC_RELEASE);
         __atomic_store_n(&s->state, P2_SLOT_MINE, __ATOMIC_RELEASE);
         return i;
     }
@@ -529,6 +467,7 @@ static int gens_grow(kvspace_t *kv) {
 /* ── P2: tombstone 延迟释放（粗粒度 epoch：队满或显式 flush 时统一 free）── */
 static void kv_sbo_free_deferred(kvspace_t *kv, uint64_t off);
 static void p2_flush_tomb(kvspace_t *kv);
+static void p2_setstats_dump(void);
 
 
 int kvspaceShmSlotView(kvspace_t *kv, const kvspaceRef_t *ref,
@@ -564,11 +503,7 @@ int kvspaceShmViewFromRef(kvspace_t *kv, const kvspaceRef_t *ref,
     kv_gens_t *g = gens_at(kv, id);
     if (!g)
         return -1;
-    uint64_t pw = __atomic_load_n(&g->packed, __ATOMIC_ACQUIRE);
-    uint32_t gen = PK_GEN(pw);
-    int pr = p2_pin(kv, id, gen);
-    if (pr != 0)
-        return pr == 1 ? 1 : -1;      /* 1 = STALE */
+    uint32_t gen = __atomic_load_n(&g->struct_gen, __ATOMIC_ACQUIRE);
     tok->head = raw;
     tok->body = raw + w.headlen;
     tok->headlen = w.headlen;
@@ -665,22 +600,22 @@ int kvspaceShmViewCheck(kvspace_t *kv, const kvspaceViewToken_t *tok) {
     kv_gens_t *g = gens_at(kv, (int32_t)tok->node_id);
     if (!g)
         return 1;
-    uint64_t pw = __atomic_load_n(&g->packed, __ATOMIC_ACQUIRE);
-    if (PK_GEN(pw) != tok->struct_gen || (pw & P2_DEAD))
+    if (__atomic_load_n(&g->struct_gen, __ATOMIC_ACQUIRE) != tok->struct_gen)
+        return 1;
+    art_hdr_t *h = art_hdr(kv, (int32_t)tok->node_id);
+    if (!h || !h->has_value)
+        return 1;
+    if (tok->head != kv->sbo_data + h->box_offset)
         return 1;
     return 0;
 }
 
-/* 释放 token 的 pin（runtime 在帧销毁 / STALE / evict 时调用）。 */
+/* v2.2 无 pin：token 是调用方持有的普通数据，Release 只做本地作废。 */
 int kvspaceShmViewRelease(kvspace_t *kv, kvspaceViewToken_t *tok) {
     if (!kv || !tok)
         return -1;
     if (tok->store_id != kv->store_id)
         return 1;
-    uint64_t off = 0;
-    if (tok->head && kv->sbo_data && tok->head >= kv->sbo_data)
-        off = (uint64_t)(tok->head - kv->sbo_data);
-    p2_unpin(kv, (int32_t)tok->node_id, off);
     tok->store_id = 0;
     return 0;
 }
@@ -713,7 +648,7 @@ int kvspaceShmViewDel(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key) {
     /* 叶子级逻辑墓碑：键立刻不存在；不收 slot、不 bump struct_gen、不入 ring。
      * 读者靠 value_gen 检测删除；回收交给后台 sweep。 */
     h->has_value = 0;
-    g->value_gen++;                 /* 单写者：release fence 见下 */
+    __atomic_add_fetch(&g->value_gen, 2u, __ATOMIC_ACQ_REL); /* 静止态保持偶数 */
     __atomic_thread_fence(__ATOMIC_RELEASE);
     (void)key;
     return 0;
@@ -817,34 +752,9 @@ static int p2_sweep_node(kvspace_t *kv, int32_t nid) {
     if (!h->has_value && h->box_offset) {
         uint64_t off = h->box_offset;
         gen_bump_struct(kv, nid);          /* 先 release 抬 gen：旧 token 全部 STALE */
-        kv_gens_t *g = gens_at(kv, nid);
-        int here = 0;
-        if (g) {
-            for (;;) {
-                uint64_t w = __atomic_load_n(&g->packed, __ATOMIC_ACQUIRE);
-                if (w & P2_DEAD)
-                    break;
-                if (PK_REF(w) > 0) {
-                    if (__atomic_compare_exchange_n(&g->packed, &w, w | P2_PEND,
-                                                    false, __ATOMIC_ACQ_REL,
-                                                    __ATOMIC_ACQUIRE))
-                        break;
-                } else {
-                    if (__atomic_compare_exchange_n(&g->packed, &w, w | P2_DEAD,
-                                                    false, __ATOMIC_ACQ_REL,
-                                                    __ATOMIC_ACQUIRE)) {
-                        kv_sbo_free(kv, off);
-                        here = 1;
-                    }
-                    break;
-                }
-            }
-        } else {
-            kv_sbo_free(kv, off);
-            here = 1;
-        }
+        kv_sbo_free(kv, off);
         h->box_offset = 0;
-        freed += here;
+        freed += 1;
     }
     switch (h->type) {
     case ART_N4: {
@@ -1130,9 +1040,8 @@ static int32_t art_balloc(kvspace_t *kv) {
         kv_gens_t *g = gens_at(kv, (int32_t)id);
         if (g) {
             /* 新 id 的 gen 取全局 epoch，保证被复用的 id 不会误命中旧 token。 */
-            __atomic_store_n(&g->packed,
-                             PK_MK((uint32_t)gen_alloc_epoch(kv), 0, 0),
-                             __ATOMIC_RELEASE);
+            __atomic_store_n(&g->struct_gen,
+                             (uint32_t)gen_alloc_epoch(kv), __ATOMIC_RELEASE);
             __atomic_store_n(&g->value_gen, 0u, __ATOMIC_RELEASE);
         }
     }
@@ -2041,7 +1950,11 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
     kv->sbo_meta = (sbo_meta_t *)kv->r_head.base;
     kv->sbo_data = kv->r_data.base;
 
-    kv->store_id = ((uint64_t)getpid() << 32) ^ (uint64_t)(uintptr_t)kv;
+    /* 每进程单调句柄序号：close 后重开即使 malloc 复用同一 kv 地址，旧 token 也失效。 */
+    {
+        static uint32_t store_seq;
+        kv->store_id = ((uint64_t)getpid() << 32) | (uint64_t)++store_seq;
+    }
 
     if (created) {
         memset(kv->hdr, 0, sizeof(*kv->hdr));
@@ -2555,9 +2468,13 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
            不改共享 buddy 树。容量读自共享 mmap，零进程内状态。 */
         uint64_t cap = sbo_allocated_size(kv->sbo_meta, old->box_offset);
         if ((uint64_t)val_len <= cap) {
-            /* P2: 同尺寸就地写 —— 只 bump value_gen，指针不变 */
+            /* P2: 同尺寸就地写 —— 指针不变，value_gen 奇偶保护（一次查表） */
+            kv_gens_t *g = gens_at(kv, art_id_of(kv, old));
+            if (g)
+                __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
             memcpy(kv->sbo_data + old->box_offset, val, (size_t)val_len);
-            gen_bump_value(kv, art_id_of(kv, old));
+            if (g)
+                __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
             g_setstats.same++;
             return 0;
         }
@@ -2582,17 +2499,8 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
         kv_gens_t *g = gens_at(kv, nid);
         if (getenv("P2_DEBUG")) { fprintf(stderr, "DBG reset-lookup key=%s nid=%d g=%p root=%d\n", key, nid, (void *)g, kv->hdr->art_root); }
         if (g) {
-            /* CAS 循环：与并发 sweep/pin 抢同一个字，不能 load+store 覆盖 gen。 */
-            for (;;) {
-                uint64_t w = __atomic_load_n(&g->packed, __ATOMIC_ACQUIRE);
-                if (getenv("P2_DEBUG")) { fprintf(stderr, "DBG reset nid=%d oldgen=%u oldw=0x%llx", nid, PK_GEN(w), (unsigned long long)w); fputc(10, stderr); }
-                uint64_t nw = PK_MK(PK_GEN(w) + 1, 0, 0);
-                if (__atomic_compare_exchange_n(&g->packed, &w, nw, false,
-                                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-                    __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
-                    break;
-                }
-            }
+            gen_bump_struct(kv, nid);      /* 换 box：旧 token 全部 STALE */
+            gen_bump_value(kv, nid);       /* +2：内容整体替换 */
         }
     }
     return 0;
