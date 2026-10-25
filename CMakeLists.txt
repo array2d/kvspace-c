@@ -15,6 +15,28 @@ add_library(kvspace-c SHARED
     src/durable_abi.c
 )
 
+# 静态库（单二进制）：后端 ABI 层改名 kvspaceC*（static_prefix.h），并加
+# static_reg.c 把符号表注册给 dispatch 前端。动态构建完全不受影响。
+# 默认关；需要 kvspace 公共头目录（含 kvspace_static.h）。
+option(KVSPACE_BUILD_STATIC "Build libkvspace-c-static.a for single-binary" OFF)
+set(KVSPACE_STATIC_INCLUDE_DIR "/usr/include" CACHE PATH
+    "kvspace public include dir (needs kvspace/kvspace_static.h)")
+if(KVSPACE_BUILD_STATIC)
+    add_library(kvspace-c-static STATIC
+        src/coord.c
+        src/xvalue_head.c
+        src/xvalue_meta.c
+        src/kvspace.c
+        src/durable_abi.c
+        src/static_reg.c
+    )
+    target_include_directories(kvspace-c-static PRIVATE ${KVSPACE_STATIC_INCLUDE_DIR})
+    target_compile_definitions(kvspace-c-static PRIVATE KVSPACE_STATIC_BUILD)
+    target_compile_options(kvspace-c-static PRIVATE
+        -include ${CMAKE_CURRENT_SOURCE_DIR}/src/static_prefix.h)
+    install(TARGETS kvspace-c-static ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}/kvspace)
+endif()
+
 # SONAME 版本：libkvspace-c.so.1（dispatch 前端按此 dlopen 后端）
 set_target_properties(kvspace-c PROPERTIES
     VERSION 1.0.0
