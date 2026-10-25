@@ -6,11 +6,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <dlfcn.h>
 #include "kvspace/kvspace.h"
 /* P2 ③: 释放 pin */
 
-static inline uint64_t ticks(void){uint32_t lo,hi;__asm__ __volatile__("lfence\n\trdtscp\n\tlfence":"=a"(lo),"=d"(hi)::"rcx");return ((uint64_t)hi<<32)|lo;}
+/* 计时器：x86 rdtscp / arm64 cntvct_el0 / 其它单调时钟。calib() 把 tick 折算成
+ * “等价核心周期”，所以三种计时器都可与 50c 目标（cycles）比较。 */
+static inline uint64_t ticks(void){
+#if defined(__x86_64__)
+ uint32_t lo,hi;__asm__ __volatile__("lfence\n\trdtscp\n\tlfence":"=a"(lo),"=d"(hi)::"rcx");
+ return ((uint64_t)hi<<32)|lo;
+#elif defined(__aarch64__)
+ uint64_t v;__asm__ __volatile__("isb\n\tmrs %0, cntvct_el0\n\tisb":"=r"(v));return v;
+#else
+ struct timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);
+ return (uint64_t)ts.tv_sec*1000000000ull+(uint64_t)ts.tv_nsec;
+#endif
+}
 static uint64_t g_cal_n=100000;
 static double calib(void){static volatile uint64_t sink;uint64_t it=g_cal_n/8,best=~0ULL;
  for(int k=0;k<5;k++){uint64_t x=1,t0=ticks();
