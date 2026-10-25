@@ -60,7 +60,7 @@ int main(int argc,char**argv){
     /* 重建 + 回收都放在计时窗口之外 */
     int (*sw)(void*) = (int(*)(void*))dlsym(RTLD_DEFAULT,"kvspaceViewSweep");
     if(sw) sw(h);   /* 后台回收：窗口外 */
-    for(int i=0;i<K;i++) kvspaceViewRelease(h,&toks[i]);   /* 释放 pin（窗口外） */
+    /* token 无 pin：无需 release */
     for(int i=0;i<K;i++){ if(kvspaceSetValue(h,keys[i],val,vl,0,0,err,sizeof err)!=0) DIE("reset k"); }
     for(int i=0;i<K;i++){ int rr=kvspaceViewResolve(h,keys[i],&toks[i]);
       if(rr!=0){ uint8_t *o=NULL; uint32_t gl=0; (void)kvspaceGet(h,keys[i],1,&o,&gl);
@@ -75,9 +75,9 @@ int main(int argc,char**argv){
   kvspaceClose(h); return 0; }
  for(int b=0;b<batches;b++){
   double ca=calib();uint64_t t0=ticks(),sum=0;
-  if(strcmp(op,"resolve")==0){for(uint64_t i=0;i<ops;i++){kvspaceViewToken_t x;if(kvspaceViewResolve(h,key,&x)!=0)DIE("r");sum+=x.node_id;kvspaceViewRelease(h,&x);}}
-  else if(strcmp(op,"resolve_from")==0){for(uint64_t i=0;i<ops;i++){kvspaceViewToken_t x;if(kvspaceViewResolveFrom(h,&pref,rel,&x)!=0)DIE("rf");sum+=x.node_id;kvspaceViewRelease(h,&x);}}
-  else if(strcmp(op,"from_ref")==0){for(uint64_t i=0;i<ops;i++){kvspaceViewToken_t x;if(kvspaceViewFromRef(h,&ref,key,&x)!=0)DIE("fr");sum+=x.node_id;kvspaceViewRelease(h,&x);}}
+  if(strcmp(op,"resolve")==0){for(uint64_t i=0;i<ops;i++){kvspaceViewToken_t x;if(kvspaceViewResolve(h,key,&x)!=0)DIE("r");sum+=x.node_id;}}
+  else if(strcmp(op,"resolve_from")==0){for(uint64_t i=0;i<ops;i++){kvspaceViewToken_t x;if(kvspaceViewResolveFrom(h,&pref,rel,&x)!=0)DIE("rf");sum+=x.node_id;}}
+  else if(strcmp(op,"from_ref")==0){for(uint64_t i=0;i<ops;i++){kvspaceViewToken_t x;if(kvspaceViewFromRef(h,&ref,key,&x)!=0)DIE("fr");sum+=x.node_id;}}
   else if(strcmp(op,"get")==0){for(uint64_t i=0;i<ops;i++){if(kvspaceViewCheck(h,&t)!=0){if(kvspaceViewResolve(h,key,&t)!=0)DIE("rf");}sum+=t.body[0]+t.body[7];}}
   else if(strcmp(op,"set")==0){for(uint64_t i=0;i<ops;i++){if(kvspaceViewWrite(h,&t,raw,8)!=0){if(kvspaceViewResolve(h,key,&t)!=0)DIE("rf");if(kvspaceViewWrite(h,&t,raw,8)!=0)DIE("w");}sum+=t.body[0];}}
   else if(strcmp(op,"del")==0){for(uint64_t i=0;i<ops;i++){

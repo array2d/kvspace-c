@@ -10,7 +10,6 @@ extern int kvspaceNewChar(const uint8_t *, uint32_t, uint8_t **, uint32_t *);
 extern int kvspaceShmViewResolve(kvspace_t *, const char *, kvspaceViewToken_t *);
 extern int kvspaceShmViewCheck(kvspace_t *, const kvspaceViewToken_t *);
 extern int kvspaceShmViewDel(kvspace_t *, kvspaceViewToken_t *, const char *);
-extern int kvspaceShmViewRelease(kvspace_t *, kvspaceViewToken_t *);
 extern int kvspaceShmViewSweep(kvspace_t *);
 
 int main(int argc, char **argv) {
@@ -36,7 +35,7 @@ int main(int argc, char **argv) {
 
     int freed = kvspaceShmViewSweep(kv);
     printf("5 sweep: freed=%d\n", freed);
-    printf("6 release pin: rc=%d\n", kvspaceShmViewRelease(kv, &t));
+    printf("6 release pin: (removed; no pins)\n");
 
     printf("7 re-set: %d\n", kvspaceShmSetValue(kv, key, val, (int32_t)vl, 0, 0));
     printf("8 get after re-set: %s\n",

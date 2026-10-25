@@ -16,7 +16,6 @@
 extern int kvspaceNewChar(const uint8_t *, uint32_t, uint8_t **, uint32_t *);
 extern int kvspaceShmViewResolve(kvspace_t *, const char *, kvspaceViewToken_t *);
 extern int kvspaceShmViewCheck(kvspace_t *, const kvspaceViewToken_t *);
-extern int kvspaceShmViewRelease(kvspace_t *, kvspaceViewToken_t *);
 extern int kvspaceShmViewSweep(kvspace_t *);
 
 static const char *g_store;
@@ -49,7 +48,6 @@ static void *reader(void *arg) {
         } else {
             atomic_fetch_add(&g_stale, 1);
         }
-        kvspaceShmViewRelease(kv, &t);
     }
     kvspaceShmClose(kv);
     return NULL;

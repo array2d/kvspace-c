@@ -215,7 +215,8 @@ struct kvspace {
     uint32_t quiesced;   /* Q2 进程内镜像；claim 时 = 1 */
     pthread_t maint_thread;
     uint32_t maint_seq;  /* 进程内私有 futex 字 */
-    uint32_t maint_started, maint_stop;
+    uint32_t maint_started, maint_stop;  /* started: 0 未建, 1 运行, 2 创建失败 */
+    uint32_t reclaim_unavailable;        /* 线程创建失败：环 3/4 满后写硬失败 */
     blocks_meta_t *art_meta;
     uint8_t *art_data;
     sbo_meta_t *sbo_meta;
@@ -319,6 +320,23 @@ static int64_t gen_alloc_epoch(kvspace_t *kv) {
     return (int64_t)__atomic_add_fetch(&kv->hdr->gen_epoch, 1ull, __ATOMIC_ACQ_REL);
 }
 
+static int p2_maint_start(kvspace_t *kv);   /* 懒启动（阈值触发） */
+static bool p2_claim_alive(kvspace_t *kv, uint32_t claim);
+static int kv_sync(kvspace_t *kv);
+
+/* 阈值：生产固定 64MiB；测试构建可用 P2_TEST_GARB_THRESHOLD_MB 调低。 */
+static uint64_t p2_garb_threshold(void) {
+#ifdef P2_TEST_HOOKS
+    const char *v = getenv("P2_TEST_GARB_THRESHOLD_MB");
+    if (v) {
+        unsigned long mb = strtoul(v, NULL, 10);
+        if (mb)
+            return (uint64_t)mb << 20;
+    }
+#endif
+    return GARB_THRESHOLD;
+}
+
 /* ── 统一垃圾环：第 2 步只记不回收（drain 在第 3 步接）─────────────
  * reserve 必须发生在任何键值/节点变更之前；失败 = 写路径硬错误，无半写。
  * 每个 reserve 之后必须且只能走 commit 或 cancel。 */
@@ -344,20 +362,47 @@ static int garb_reserve(kvspace_t *kv, uint64_t *idx) {
     uint32_t claim = kv->p2_slot >= 0 ? kv->hdr->slots[kv->p2_slot].claim_id : 0;
     if (!claim)
         return -1;
+    int spins = 0;
     for (;;) {
         uint64_t h = __atomic_load_n(&kv->hdr->garb_head, __ATOMIC_ACQUIRE);
-        uint64_t t = __atomic_load_n(&kv->hdr->garb_tail, __ATOMIC_RELAXED);
+        uint64_t t = __atomic_load_n(&kv->hdr->garb_tail, __ATOMIC_ACQUIRE);
         if (t - h >= kv->hdr->garb_cap) {
             garb_full_report(kv);
             return -1;
         }
-        if (__atomic_compare_exchange_n(&kv->hdr->garb_tail, &t, t + 1, false,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            garb_ent_t *e = &kv->garb[t & (GARB_CAP - 1)];
-            __atomic_store_n(&e->meta, GE_MAKE(GE_RESERVED, claim),
-                             __ATOMIC_RELEASE);
-            *idx = t;
-            return 0;
+        if (kv->reclaim_unavailable &&
+            kv->hdr->garb_cap - (t - h) < kv->hdr->garb_cap / 4) {
+            garb_full_report(kv);        /* 线程建不起来：1/4 安全线硬失败 */
+            return -1;
+        }
+        garb_ent_t *e = &kv->garb[t & (GARB_CAP - 1)];
+        uint32_t m = __atomic_load_n(&e->meta, __ATOMIC_ACQUIRE);
+        if (m == GE_EMPTY) {
+            /* 先写条目、后推进 tail：drain 看到的每个 i < tail 都必然已初始化。 */
+            if (__atomic_compare_exchange_n(&e->meta, &m,
+                                            GE_MAKE(GE_RESERVED, claim), false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                if (!__atomic_compare_exchange_n(&kv->hdr->garb_tail, &t, t + 1,
+                                                 false, __ATOMIC_ACQ_REL,
+                                                 __ATOMIC_ACQUIRE)) {
+                    /* 只可能被死者回收改写（tail 只由条目赢家推进） */
+                    __atomic_store_n(&e->meta, GE_EMPTY, __ATOMIC_RELEASE);
+                    continue;
+                }
+                *idx = t;
+                return 0;
+            }
+            continue;
+        }
+        /* 边界上的已发布 RESERVED：写者窗口（活）或写者已死。 */
+        if (++spins > 1000 && GE_STATE(m) == GE_RESERVED &&
+            !p2_claim_alive(kv, GE_CLAIM(m))) {
+            uint32_t exp = m;
+            __atomic_compare_exchange_n(&e->meta, &exp, GE_EMPTY, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+            spins = 0;
+        } else if (spins > 2000) {
+            sched_yield();
         }
     }
 }
@@ -368,8 +413,11 @@ static void garb_commit(kvspace_t *kv, uint64_t idx, uint64_t off) {
     e->off = off;
     e->epoch = __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE);
     __atomic_store_n(&e->meta, GE_MAKE(GE_COMMITTED, claim), __ATOMIC_RELEASE);
-    __atomic_add_fetch(&kv->hdr->garb_bytes,
-                       sbo_allocated_size(kv->sbo_meta, off), __ATOMIC_ACQ_REL);
+    uint64_t bytes = __atomic_add_fetch(&kv->hdr->garb_bytes,
+                                        sbo_allocated_size(kv->sbo_meta, off),
+                                        __ATOMIC_ACQ_REL);
+    if (bytes >= p2_garb_threshold())
+        (void)p2_maint_start(kv);    /* 失败已置 reclaim_unavailable */
 }
 
 static void garb_cancel(kvspace_t *kv, uint64_t idx) {
@@ -435,6 +483,8 @@ static int p2_proc_starttime(uint32_t pid, uint64_t *out) {
             s++;
         if (!*s)
             break;
+        if (field == 3 && (*s == 'Z' || *s == 'X'))
+            return 1;                   /* 僵尸/已退出：判死（否则会永久占位） */
         if (field == 22) {
             *out = strtoull(s, NULL, 10);
             return 0;
@@ -542,7 +592,11 @@ static void p2_ack_slot(kvspace_t *kv, uint32_t ep) {
                      __ATOMIC_RELEASE);
     __atomic_add_fetch(&kv->hdr->ack_seq, 1u, __ATOMIC_RELEASE);
 #if defined(__linux__)
-    syscall(SYS_futex, &kv->hdr->ack_seq, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+    /* 没有 leader 在等就不要进内核：热路径每 64 条指令一次 ack，
+     * 无条件 FUTEX_WAKE 是每次写系统调用。漏唤醒最坏退化为 5ms 分片。 */
+    if (__atomic_load_n(&kv->hdr->barrier_state, __ATOMIC_ACQUIRE))
+        syscall(SYS_futex, &kv->hdr->ack_seq, FUTEX_WAKE, INT_MAX, NULL, NULL,
+                0);
 #endif
 }
 
@@ -721,16 +775,6 @@ int kvspaceShmViewCheck(kvspace_t *kv, const kvspaceViewToken_t *tok) {
         return 1;
     if (tok->head != kv->sbo_data + AV_OFF(hv))
         return 1;
-    return 0;
-}
-
-/* v2.2 无 pin：token 是调用方持有的普通数据，Release 只做本地作废。 */
-int kvspaceShmViewRelease(kvspace_t *kv, kvspaceViewToken_t *tok) {
-    if (!kv || !tok)
-        return -1;
-    if (tok->store_id != kv->store_id)
-        return 1;
-    tok->store_id = 0;
     return 0;
 }
 
@@ -996,6 +1040,12 @@ static int p2_round(kvspace_t *kv) {
         return -1;                        /* fork 子进程：句柄无效 */
     if (!p2_elect(kv))
         return -1;
+    /* 别的进程可能扩过 ART/SBO/gen：drain 前必须把本进程映射同步到当前尺寸，
+     * 否则 sbo_allocated_size / kv_sbo_free 会越界访问。 */
+    if (kv_sync(kv) != 0) {
+        p2_release_busy(kv);
+        return -1;
+    }
     uint64_t pending = __atomic_exchange_n(&kv->hdr->garb_freeing, 0,
                                            __ATOMIC_ACQ_REL);
     if (pending) {
@@ -1037,25 +1087,52 @@ static void *p2_maint(void *arg) {
         if (__atomic_load_n(&kv->maint_stop, __ATOMIC_ACQUIRE))
             break;
         if (__atomic_load_n(&kv->hdr->garb_bytes, __ATOMIC_ACQUIRE) <
-            GARB_THRESHOLD)
+            p2_garb_threshold())
             continue;
         p2_round(kv);                 /* 内含选举；忙/超时都直接返回 */
     }
     return NULL;
 }
 
+/* 懒启动：open 不建线程；garb_bytes 越过 64MiB 时才建（open / commit 后检查）。
+ * 每个进程最多一个；创建失败置 reclaim_unavailable 并由写路径在环 3/4 满时硬失败。 */
+static int p2_maint_start(kvspace_t *kv) {
+#if !defined(__linux__)
+    (void)kv;
+    return 0;                        /* macOS：不回收，无线程 */
+#else
+    uint32_t st = 0;
+    if (!__atomic_compare_exchange_n(&kv->maint_started, &st, 1u, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return st == 2u ? -1 : 0;    /* 已启动 / 已知失败 */
+    if (kv->pid != (uint32_t)getpid()) {
+        __atomic_store_n(&kv->maint_started, 0u, __ATOMIC_RELEASE);
+        return 0;                    /* fork 子进程不建 */
+    }
+    if (pthread_create(&kv->maint_thread, NULL, p2_maint, kv) != 0) {
+        __atomic_store_n(&kv->maint_started, 2u, __ATOMIC_RELEASE);
+        kv->reclaim_unavailable = 1;
+        fprintf(stderr, "kvspace: maintenance thread create failed; reclaim "
+                        "unavailable (writes hard-fail when the ring is 3/4 "
+                        "full)\n");
+        return -1;
+    }
+    return 0;
+#endif
+}
+
 static void p2_maint_stop(kvspace_t *kv) {
-    if (!kv->maint_started)
-        return;
     if (kv->pid != (uint32_t)getpid()) {   /* fork 子进程里没有该线程 */
-        kv->maint_started = 0;
+        __atomic_store_n(&kv->maint_started, 0u, __ATOMIC_RELEASE);
         return;
     }
+    if (__atomic_load_n(&kv->maint_started, __ATOMIC_ACQUIRE) != 1u)
+        return;                            /* 未启动 / 创建失败 */
     __atomic_store_n(&kv->maint_stop, 1, __ATOMIC_RELEASE);
     __atomic_add_fetch(&kv->maint_seq, 1u, __ATOMIC_RELEASE);
     p2_futex_wake_priv(&kv->maint_seq);
     pthread_join(kv->maint_thread, NULL);
-    kv->maint_started = 0;
+    __atomic_store_n(&kv->maint_started, 0u, __ATOMIC_RELEASE);
 }
 
 /* Q1：op 边界 ack。0 = 已 ack；1 = epoch 变了（先作废 token 再来）；-1 = 非法。 */
@@ -1081,13 +1158,21 @@ int kvspaceShmViewQuiesce(kvspace_t *kv, int on) {
     if (__atomic_load_n(&s->quiesced, __ATOMIC_ACQUIRE) != (uint32_t)on) {
         __atomic_store_n(&s->quiesced, (uint32_t)on, __ATOMIC_RELEASE);
         __atomic_add_fetch(&kv->hdr->ack_seq, 1u, __ATOMIC_RELEASE);
-        p2_futex_wake(&kv->hdr->ack_seq);
+        if (__atomic_load_n(&kv->hdr->barrier_state, __ATOMIC_ACQUIRE))
+            p2_futex_wake(&kv->hdr->ack_seq);
     }
     kv->quiesced = (uint32_t)on;
     return 0;
 }
 
 #ifdef P2_TEST_HOOKS
+void kvspaceShmViewRoundStats(kvspace_t *kv, uint64_t *ok, uint64_t *aborted,
+                              uint64_t *leaks) {
+    *ok = kv ? __atomic_load_n(&kv->hdr->round_ok, __ATOMIC_ACQUIRE) : 0;
+    *aborted = kv ? __atomic_load_n(&kv->hdr->round_aborted, __ATOMIC_ACQUIRE) : 0;
+    *leaks = kv ? __atomic_load_n(&kv->hdr->leak_boxes, __ATOMIC_ACQUIRE) : 0;
+}
+
 uint64_t kvspaceShmViewGarbBytes(kvspace_t *kv) {
     return kv && kv->hdr
                ? __atomic_load_n(&kv->hdr->garb_bytes, __ATOMIC_ACQUIRE)
@@ -2263,9 +2348,10 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
         goto fail;
     kv->pid = (uint32_t)getpid();
     kv->quiesced = 1;               /* claim 时 slot->quiesced=1，二者一致 */
-    if (pthread_create(&kv->maint_thread, NULL, p2_maint, kv) != 0)
-        goto fail;
-    kv->maint_started = 1;
+    if (__atomic_load_n(&kv->hdr->garb_bytes, __ATOMIC_ACQUIRE) >=
+            p2_garb_threshold() &&
+        p2_maint_start(kv) != 0)
+        goto fail;                  /* 已有大量垃圾且建不了线程：open 硬失败 */
 
     pthread_mutex_init(&kv->wlock, NULL);
     for (int i = 0; i < WATCH_TABLE_SZ; i++) {
@@ -2293,10 +2379,51 @@ fail:
     }
     return NULL;
 }
+/* 除自己外是否还有存活进程（macOS 无 /proc：只有 FREE 槽才算“不在”）。 */
+static bool p2_other_alive(kvspace_t *kv) {
+    for (int i = 0; i < P2_SLOT_N; i++) {
+        if (i == kv->p2_slot)
+            continue;
+        p2_slot_t *s = &kv->hdr->slots[i];
+        if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != P2_SLOT_MINE)
+            continue;
+        if (p2_slot_alive(s))
+            return true;
+    }
+    return false;
+}
+
 void kvspaceShmClose(kvspace_t *kv) {
     if (!kv)
         return;
     p2_setstats_dump();
+    /* 最后一个存活进程负责清场：Linux 跑一次机会性 round；macOS 直接清环。 */
+    if (kv->pid == (uint32_t)getpid() && kv->p2_slot >= 0 &&
+        !p2_other_alive(kv)) {
+#if defined(__linux__)
+        __atomic_store_n(&kv->hdr->slots[kv->p2_slot].quiesced, 1u,
+                         __ATOMIC_RELEASE);
+        (void)p2_round(kv);
+#else
+        uint64_t h = __atomic_load_n(&kv->hdr->garb_head, __ATOMIC_ACQUIRE);
+        uint64_t t = __atomic_load_n(&kv->hdr->garb_tail, __ATOMIC_ACQUIRE);
+        for (; h < t; h++) {
+            garb_ent_t *e = &kv->garb[h & (GARB_CAP - 1)];
+            uint32_t m = __atomic_load_n(&e->meta, __ATOMIC_ACQUIRE);
+            if (GE_STATE(m) == GE_COMMITTED) {
+                uint64_t off = __atomic_load_n(&e->off, __ATOMIC_ACQUIRE);
+                uint64_t cap = sbo_allocated_size(kv->sbo_meta, off);
+                __atomic_store_n(&e->meta, GE_EMPTY, __ATOMIC_RELEASE);
+                kv_sbo_free(kv, off);
+                __atomic_sub_fetch(&kv->hdr->garb_bytes, cap,
+                                   __ATOMIC_ACQ_REL);
+            } else {
+                __atomic_store_n(&e->meta, GE_EMPTY, __ATOMIC_RELEASE);
+            }
+        }
+        __atomic_store_n(&kv->hdr->garb_head, t, __ATOMIC_RELEASE);
+#endif
+    }
     p2_maint_stop(kv);
     p2_reg_release(kv);
     for (int i = 0; i < WATCH_TABLE_SZ; i++) {
@@ -2608,7 +2735,14 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
                     if (cap >= 64 && cap <= data_size - off && b <= cap - 64 &&
                         (uint64_t)offset <= 64 + b &&
                         (uint64_t)buf_len <= 64 + b - (uint64_t)offset) {
+                        kv_gens_t *g = gens_at(kv, id);
+                        if (g)
+                            __atomic_add_fetch(&g->value_gen, 1u,
+                                               __ATOMIC_ACQ_REL);
                         memcpy(kv->sbo_data + off + offset, buf, buf_len);
+                        if (g)
+                            __atomic_add_fetch(&g->value_gen, 1u,
+                                               __ATOMIC_ACQ_REL);
                         return 0;
                     }
                 }
@@ -2624,8 +2758,13 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
         uint8_t *d = kvspaceShmGet(kv, key_fallback, 0, &rl);
         if (!d || offset + buf_len > (uint32_t)rl)
             return -1;
-        memcpy(d + offset, buf, buf_len);
         kvspaceShmResolveRef(kv, key_fallback, ref);
+        kv_gens_t *g = gens_at(kv, (int32_t)ref->block_id);
+        if (g)
+            __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
+        memcpy(d + offset, buf, buf_len);
+        if (g)
+            __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
         return 0;
     }
     uint8_t *raw;
@@ -2633,7 +2772,12 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
     if (read_value(kv, AV_OFF(hv), &raw, &rl) < 0 ||
         offset + buf_len > (uint32_t)rl)
         return -1;
+    kv_gens_t *g2 = gens_at(kv, id);
+    if (g2)
+        __atomic_add_fetch(&g2->value_gen, 1u, __ATOMIC_ACQ_REL);
     memcpy(raw + offset, buf, buf_len);
+    if (g2)
+        __atomic_add_fetch(&g2->value_gen, 1u, __ATOMIC_ACQ_REL);
     return 0;
 }
 
@@ -2765,6 +2909,10 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
             if (v && atoi(v) > 0)
                 usleep((useconds_t)atoi(v) * 1000);
         }
+        if (getenv("P2_TEST_FAIL_ALLOC")) {
+            garb_cancel(kv, gidx);
+            return -1;
+        }
 #endif
         g_setstats.realloc_++;
         g_setstats.retired_bytes += cap;
@@ -2781,6 +2929,13 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
         return -1;
     }
     memcpy(kv->sbo_data + off, val, val_len);
+#ifdef P2_TEST_HOOKS
+    if (retiring && getenv("P2_TEST_FAIL_ARTINS")) {
+        garb_cancel(kv, gidx);
+        kv_sbo_free(kv, off);
+        return -1;
+    }
+#endif
     int32_t root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)key,
                            (int)strlen(key), 0, off);
     if (root < 0) {

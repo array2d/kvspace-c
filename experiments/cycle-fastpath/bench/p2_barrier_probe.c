@@ -17,7 +17,6 @@
 extern int kvspaceNewChar(const uint8_t *, uint32_t, uint8_t **, uint32_t *);
 extern int kvspaceShmViewResolve(kvspace_t *, const char *, kvspaceViewToken_t *);
 extern int kvspaceShmViewCheck(kvspace_t *, const kvspaceViewToken_t *);
-extern int kvspaceShmViewRelease(kvspace_t *, kvspaceViewToken_t *);
 extern int kvspaceShmViewSweep(kvspace_t *);
 extern int kvspaceShmViewQuiesce(kvspace_t *, int);
 extern int kvspaceShmViewAck(kvspace_t *, uint32_t *);
@@ -55,7 +54,6 @@ static int m_boxsizes(const char *store) {
         if (kvspaceShmViewResolve(kv, key, &t) != 0) return 2;
         printf("%u,%u,%llu,%llu\n", sizes[i], vl,
                (unsigned long long)t.cap, (unsigned long long)t.body_cap);
-        kvspaceShmViewRelease(kv, &t);
         free(v);
     }
     kvspaceShmClose(kv);

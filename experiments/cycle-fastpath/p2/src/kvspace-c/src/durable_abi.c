@@ -525,8 +525,12 @@ int kvspaceViewResolvePrefix(void *h, const char *path, kvspaceRef_t *ref) {
     return kvspaceShmResolvePrefix((kvspace_t *)h, path, ref) == 0 ? 0 : 1;
 }
 
-int kvspaceViewRelease(void *h, kvspaceViewToken_t *tok) {
-    return kvspaceShmViewRelease((kvspace_t *)h, tok);
+int kvspaceViewAck(void *h, uint32_t *epoch) {
+    return kvspaceShmViewAck((kvspace_t *)h, epoch);
+}
+
+int kvspaceViewQuiesce(void *h, int on) {
+    return kvspaceShmViewQuiesce((kvspace_t *)h, on);
 }
 
 int kvspaceViewSweep(void *h) {

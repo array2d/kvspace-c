@@ -122,8 +122,9 @@ typedef struct {
     uint32_t _pad;
 } kvspaceViewToken_t;
 
-int kvspaceViewRelease(void *h, kvspaceViewToken_t *tok);
 int kvspaceViewSweep(void *h);
+int kvspaceViewAck(void *h, uint32_t *epoch);
+int kvspaceViewQuiesce(void *h, int on);
 int kvspaceViewResolvePrefix(void *h, const char *path, kvspaceRef_t *ref);
 int kvspaceViewResolve(void *h, const char *key, kvspaceViewToken_t *tok);
 int kvspaceViewFromRef(void *h, const kvspaceRef_t *ref, const char *key_fallback,

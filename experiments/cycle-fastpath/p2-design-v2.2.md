@@ -498,11 +498,13 @@ token 只在创建它的进程内消费，进程内唯一即可。
 
 ### 3.1 线程生命周期
 
-- `kvspaceShmOpen`：复用 tomb 线程位置（kvspace.c:2078-2082）改维护线程；创建失败 →
-  open 失败（不降级）。
-- `kvspaceShmClose`：`stop=1` → 唤醒 → join（现有结构照搬）；Linux 下 close **不 free**
+- **懒启动**：open **不创建**线程；`garb_bytes >= 64MiB` 时才创建（commit 后检查一次 +
+  open 时检查一次）。低于阈值的 workload（benchmark 全部 case、tutorial）不会为每个进程
+  付 `pthread_create+join` 的 ~43µs（实测：44.35 → 87.54 µs/open）。创建失败 → 该次写/
+  open 硬错误（不静默降级）。
+- `kvspaceShmClose`：若已启动，`stop=1` → 唤醒 → join；Linux 下 close **不 free**
   垃圾；若自己是最后一个存活进程，先跑一轮机会性屏障。
-- `fail:` 路径同样 join。
+- `fail:` 路径同样 join（未启动则跳过）。
 
 ### 3.2 维护线程主循环
 
@@ -676,7 +678,12 @@ hdr 变长 ⇒ `ART_OFF` 变、新增 `<path>.garb`、节点首部布局变 ⇒ 
 
 ### 5.4 写路径
 
-- 同尺寸热写：pinned cell → `kvspaceViewWrite`（Check + 8B memcpy + 奇偶），无 pin。
+- 同尺寸热写（runtime-c）：保留 A 的**裸 memcpy**（写槽不带 token）。promoted view
+  只覆盖 ≤8B FIXED_SMALL；8B 对齐 inline 写在 x86_64/arm64 是单条原子 store，读侧直接
+  读 body 无撕裂。`value_gen` 只由**后端拷贝路径**维护（SetValue/SetPart/SetPartByRef/
+  `ViewWrite`），与 promoted 集合不相交。
+- `WriteInPlace` / `WriteNewPlace`：返回 body 指针、由调用方填充，**不承诺 value_gen**；
+  只用于 >8B/容器/ext/PC status；view-cached ≤8B 槽**不得**经它们写；仍 one writer per key。
 - 换尺寸/新键：字符串 ABI，后端内部 reserve/commit。
 - 删除：`kvspaceViewDel`（reserve + CAS + commit）。
 
@@ -718,6 +725,7 @@ hdr 变长 ⇒ `ART_OFF` 变、新增 `<path>.garb`、节点首部布局变 ⇒ 
 | **A21** | **原子访问静态检查**：全仓 grep `has_value` / `box_offset` 直接位域访问 = 0 处，全部经 `art_val_*`；resolve 在并发写压力下不产生 (gen, box) 失配通过 Check（debug 断言 + 强压） | 检查脚本 0 命中；压力下无 token 读到已退役 box |
 | **A22** | **新进程中途 open**（claim 后 `quiesced=1`，未跑任何 op） | 不阻塞正在进行的轮次；runtime 就绪调 `ViewQuiesce(0)` 后正常解析/使用；纯持有进程保持 1，轮次永不因它超时 |
 | **A23** | **leader 自己进程**：维护线程当选，但同进程解释器既未 ack 也未声明静默 | 本轮超时且零 free；解释器 Q1 ack 或 Q2 声明后，下一轮成功回收 |
+| **A24** | A 快路径同尺寸写 + view 读并发（多进程） | 读只见 old 或 new（8B 原子）；换尺寸后旧 token `Check` STALE、`Refresh` 后读到新值 |
 
 ### B. 性能（**≥17 核**；隔离 `$ORIGIN` bin；10 轮 repeat=3，只跑 shm）
 
@@ -739,8 +747,11 @@ hdr 变长 ⇒ `ART_OFF` 变、新增 `<path>.garb`、节点首部布局变 ⇒ 
 
 ## 7. 风险与未决
 
-1. **单写者/每键契约**：同键跨进程并发写会双退役（double free）。现状同样不安全；
-   v2 只对删除加了 `has_value` CAS。需在规范里写死“一个键同时只有一个写者进程”。
+1. **单写者/每 store 契约**：ART 结构更新（`art_add`/`art_grow`/`art_resize`/`art_del`）
+   没有跨进程锁（只有 SBO 分配器有共享锁）。两个进程并发写——**即使不同 key**——也会在
+   共享祖先节点上丢更新（实测：put 成功后紧接 del 认为键不存在，或崩溃）。同键并发写还
+   会双退役。契约必须写死：**一个 store 同一时刻只有一个写者进程**；跨进程写者序列化
+   单开 issue（不改 50c 快路径）。
 2. **长 native op / 卡死进程**：不声明 quiesce 且不 ack → 每轮放弃；持续则环满后写硬错误。
    是否加“卡死告警阈值”留给评审。
 3. **RESERVED 悬空**：预留者在 reserve→commit 之间崩溃/被 SIGSTOP。死亡 → 取消+审计；

@@ -18,6 +18,9 @@
  *   a15  默认 quiesced=1 的空进程不阻塞轮次（A22）
  *   a16  Quiesce(0) 后既不 ack 也不声明：每轮放弃；kill 后恢复
  *   a6   leader 在 drain 中 kill -9：下一轮接管，只漏一个 box，不 double free
+ *   a25  reserve 后 alloc / art_ins 失败 → cancel，旧值不变、无残留
+ *   a27  leader 槽被回收后（旧 claim 消失）仍能接管
+ *   churn <store> <ms>  持续制造垃圾的 helper（R4 用），结束时打印轮次统计
  */
 #define _GNU_SOURCE
 #include <pthread.h>
@@ -39,10 +42,10 @@ extern int kvspaceShmViewCheck(kvspace_t *, const kvspaceViewToken_t *);
 extern int kvspaceShmViewWrite(kvspace_t *, kvspaceViewToken_t *,
                                const uint8_t *, uint32_t);
 extern int kvspaceShmViewDel(kvspace_t *, kvspaceViewToken_t *, const char *);
-extern int kvspaceShmViewRelease(kvspace_t *, kvspaceViewToken_t *);
 extern int kvspaceShmViewRefresh(kvspace_t *, kvspaceViewToken_t *, const char *);
 extern int kvspaceShmViewSweep(kvspace_t *);
 extern uint64_t kvspaceShmViewGarbBytes(kvspace_t *);
+extern void kvspaceShmViewRoundStats(kvspace_t *, uint64_t *, uint64_t *, uint64_t *);
 
 #define STORE_SZ (8ull * 64 * 64 * 64 * 64)
 #define FAIL(...)                                                              \
@@ -72,8 +75,9 @@ static void put(kvspace_t *kv, const char *k, const uint8_t *v, uint32_t l) {
 static void churn(kvspace_t *kv, const uint8_t *v, uint32_t l, int n) {
     for (int i = 0; i < n; i++) {
         put(kv, "/g", v, l);
-        if (kvspaceShmDel(kv, "/g") != 0)
-            FAIL("del /g at %d", i);
+        int drc = kvspaceShmDel(kv, "/g");
+        if (drc != 0)
+            FAIL("del /g at %d rc=%d", i, drc);
     }
 }
 
@@ -115,7 +119,6 @@ static uint32_t box_cap(kvspace_t *kv) {
     if (kvspaceShmViewResolve(kv, "/cap", &t) != 0)
         FAIL("resolve cap");
     uint32_t cap = (uint32_t)t.cap;
-    kvspaceShmViewRelease(kv, &t);
     if (kvspaceShmViewQuiesce(kv, 1) != 0)
         FAIL("quiesce on");
     if (kvspaceShmDel(kv, "/cap") != 0)
@@ -348,7 +351,6 @@ static int m_a15(const char *store) {
         kvspaceViewToken_t t = {0};
         if (kvspaceShmViewResolve(c, "/k", &t) != 0) _exit(3);
         if (kvspaceShmViewCheck(c, &t) != 0) _exit(4);
-        kvspaceShmViewRelease(c, &t);
         wr(done[1], 'd');
         _exit(0);
     }
@@ -395,6 +397,85 @@ static int m_a16(const char *store) {
     if (kvspaceShmViewGarbBytes(kv) != 0) FAIL("garb_bytes not zero");
     kvspaceShmClose(kv);
     puts("PASS a16");
+    return 0;
+}
+
+/* A19 补：reserve 后 alloc / art_ins 失败 → cancel；旧值不变、无残留、无泄漏。 */
+static int m_a25(const char *store) {
+    kvspace_t *kv = kvspaceShmOpen(store, STORE_SZ);
+    if (!kv) FAIL("open");
+    uint32_t l8 = 0, l512 = 0;
+    uint8_t *v8 = mkval(8, &l8), *v512 = mkval(512, &l512);
+    put(kv, "/k", v8, l8);
+    setenv("P2_TEST_FAIL_ALLOC", "1", 1);
+    if (kvspaceShmSetValue(kv, "/k", v512, (int32_t)l512, 0, 0) == 0)
+        FAIL("alloc failure accepted");
+    unsetenv("P2_TEST_FAIL_ALLOC");
+    int32_t gl = 0;
+    uint8_t *g = kvspaceShmGet(kv, "/k", 0, &gl);
+    if (!g || gl != (int32_t)l8 || memcmp(g, v8, l8) != 0)
+        FAIL("old value changed after alloc failure");
+    if (kvspaceShmViewGarbBytes(kv) != 0) FAIL("alloc failure left garbage");
+    setenv("P2_TEST_FAIL_ARTINS", "1", 1);
+    if (kvspaceShmSetValue(kv, "/k", v512, (int32_t)l512, 0, 0) == 0)
+        FAIL("art_ins failure accepted");
+    unsetenv("P2_TEST_FAIL_ARTINS");
+    g = kvspaceShmGet(kv, "/k", 0, &gl);
+    if (!g || gl != (int32_t)l8 || memcmp(g, v8, l8) != 0)
+        FAIL("old value changed after art_ins failure");
+    if (kvspaceShmViewGarbBytes(kv) != 0) FAIL("art_ins failure left garbage");
+    if (kvspaceShmViewSweep(kv) != 0) FAIL("residue after failed mutations");
+    if (kvspaceShmSetValue(kv, "/k", v512, (int32_t)l512, 0, 0) != 0)
+        FAIL("normal resize after failures");
+    if (kvspaceShmViewSweep(kv) != 1) FAIL("normal resize must retire exactly 1");
+    if (kvspaceShmViewGarbBytes(kv) != 0) FAIL("garb_bytes not zero");
+    kvspaceShmClose(kv);
+    puts("PASS a25");
+    return 0;
+}
+
+/* A27：leader 被 kill 且它的槽被新进程回收（旧 claim 彻底消失）→ 仍能接管。 */
+static int m_a27(const char *store) {
+    kvspace_t *kv = kvspaceShmOpen(store, STORE_SZ);
+    if (!kv) FAIL("open");
+    uint32_t l = 0;
+    uint8_t *v = mkval(8, &l);
+    churn(kv, v, l, 5);
+    int ready[2];
+    if (pipe(ready)) FAIL("pipe");
+    pid_t a = fork();
+    if (a == 0) {
+        close(ready[0]);
+        kvspace_t *c = kvspaceShmOpen(store, STORE_SZ);
+        if (!c) _exit(2);
+        setenv("P2_TEST_HOLD_DRAIN_MS", "800", 1);
+        wr(ready[1], 'r');
+        kvspaceShmViewSweep(c);
+        _exit(0);
+    }
+    close(ready[1]);
+    rd(ready[0]);
+    usleep(200 * 1000);
+    kill(a, SIGKILL);
+    waitpid(a, NULL, 0);
+    /* B 在 A 死后才 open：注册表回收 A 的槽，旧 claim 不再存在 */
+    pid_t b = fork();
+    if (b == 0) {
+        kvspace_t *c = kvspaceShmOpen(store, STORE_SZ);
+        if (!c) _exit(2);
+        int freed = kvspaceShmViewSweep(c);   /* 必须从 OWNED|dead-claim 接管 */
+        _exit(freed == 4 ? 0 : 3);
+    }
+    int st = 0;
+    waitpid(b, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+        FAIL("takeover after slot recycle failed (st=%d)", st);
+    if (kvspaceShmViewGarbBytes(kv) != 72)
+        FAIL("leaked box accounting wrong: %llu",
+             (unsigned long long)kvspaceShmViewGarbBytes(kv));
+    if (kvspaceShmViewSweep(kv) != 0) FAIL("leaked entry resurfaced");
+    kvspaceShmClose(kv);
+    puts("PASS a27");
     return 0;
 }
 
@@ -476,12 +557,42 @@ static int m_a6(const char *store) {
     return 0;
 }
 
+/* 持续制造垃圾的 helper（R4 括号测试用）：自身默认 quiesced=1，不阻塞别人的轮次。 */
+static int m_churn(const char *store, int ms) {
+    kvspace_t *kv = kvspaceShmOpen(store, STORE_SZ);
+    if (!kv) FAIL("open");
+    uint32_t l = 0;
+    uint8_t *v = mkval(8, &l);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        churn(kv, v, l, 200);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long long el = (t1.tv_sec - t0.tv_sec) * 1000 +
+                       (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        if (el >= ms)
+            break;
+    }
+    uint64_t ok = 0, ab = 0, lk = 0;
+    kvspaceShmViewRoundStats(kv, &ok, &ab, &lk);
+    printf("round_ok=%llu aborted=%llu leaks=%llu garb=%llu\n",
+           (unsigned long long)ok, (unsigned long long)ab,
+           (unsigned long long)lk,
+           (unsigned long long)kvspaceShmViewGarbBytes(kv));
+    kvspaceShmClose(kv);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) FAIL("usage: %s <mode> <store>", argv[0]);
     const char *m = argv[1], *st = argv[2];
     if (!strcmp(m, "t1")) return m_t1(st);
     if (!strcmp(m, "t4")) return m_t4(st);
     if (!strcmp(m, "t3")) return m_t3(st);
+    if (!strcmp(m, "a25")) return m_a25(st);
+    if (!strcmp(m, "churn"))
+        return m_churn(st, argc > 3 ? atoi(argv[3]) : 3000);
+    if (!strcmp(m, "a27")) return m_a27(st);
     if (!strcmp(m, "a19")) return m_a19(st);
     if (!strcmp(m, "a20")) return m_a20(st);
     if (!strcmp(m, "a13")) return m_a13(st, 0);

@@ -17,7 +17,6 @@ extern int kvspaceNewChar(const uint8_t *, uint32_t, uint8_t **, uint32_t *);
 extern int kvspaceShmViewResolve(kvspace_t *, const char *, kvspaceViewToken_t *);
 extern int kvspaceShmViewCheck(kvspace_t *, const kvspaceViewToken_t *);
 extern int kvspaceShmViewDel(kvspace_t *, kvspaceViewToken_t *, const char *);
-extern int kvspaceShmViewRelease(kvspace_t *, kvspaceViewToken_t *);
 extern int kvspaceShmViewSweep(kvspace_t *);
 
 #define STORE_SZ (8ull * 64 * 64 * 64 * 64)
@@ -117,7 +116,6 @@ static int t_orphan(const char *store) {
     kvspaceViewToken_t t = {0};
     if (kvspaceShmViewResolve(kv, key, &t) != 0) return 2;
     if (kvspaceShmViewDel(kv, &t, key) != 0) return 2;
-    kvspaceShmViewRelease(kv, &t);
     kill(kid, SIGKILL);
     waitpid(kid, NULL, 0);
     int freed = kvspaceShmViewSweep(kv);
@@ -152,10 +150,8 @@ static int t_sigstop(const char *store) {
     kvspaceViewToken_t t = {0};
     if (kvspaceShmViewResolve(kv, ka, &t) != 0) return 2;
     kvspaceShmViewDel(kv, &t, ka);
-    kvspaceShmViewRelease(kv, &t);
     if (kvspaceShmViewResolve(kv, kb, &t) != 0) return 2;
     kvspaceShmViewDel(kv, &t, kb);
-    kvspaceShmViewRelease(kv, &t);
     kill(pa, SIGSTOP);
     kill(pb, SIGKILL);
     waitpid(pb, NULL, 0);

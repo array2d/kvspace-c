@@ -145,11 +145,12 @@ int kvspaceShmViewWrite(kvspace_t *kv, kvspaceViewToken_t *tok,
                         const uint8_t *data, uint32_t len);
 int kvspaceShmViewDel(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key);
 int kvspaceShmViewRefresh(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key);
-int kvspaceShmViewRelease(kvspace_t *kv, kvspaceViewToken_t *tok);
 int kvspaceShmViewAck(kvspace_t *kv, uint32_t *epoch);
 int kvspaceShmViewQuiesce(kvspace_t *kv, int on);
 #ifdef P2_TEST_HOOKS
 uint64_t kvspaceShmViewGarbBytes(kvspace_t *kv);
+void kvspaceShmViewRoundStats(kvspace_t *kv, uint64_t *ok, uint64_t *aborted,
+                              uint64_t *leaks);
 #endif
 int kvspaceShmViewSweep(kvspace_t *kv);
 int kvspaceShmViewFlushTomb(kvspace_t *kv);
