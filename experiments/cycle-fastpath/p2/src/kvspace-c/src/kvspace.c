@@ -25,7 +25,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define KVS_MAGIC "kvspace-c.v4"
+#define KVS_MAGIC "kvspace-c.v5"
 #define ART_PREFIX_MAX 10
 #define ART_NODE_MAX_SZ 2112
 #define ART_SLAB_INIT (256UL * 1024 * 1024)
@@ -52,12 +52,28 @@ enum { ART_N4 = 0,
        ART_N256 = 3,
        ART_MOVED = 255 };
 
+/* v5：{has_value, box_offset} 合并成单个 8B 对齐原子字，禁止裸位域访问。
+ * val = bit0 has_value | bit1..63 box_offset（MOVED 节点用 box_offset 存新 id）。 */
 typedef struct {
     uint8_t type, prefix[ART_PREFIX_MAX], prefix_len;
-    uint8_t has_value : 1;
-    uint64_t box_offset : 63;
     uint16_t count;
+    uint16_t _pad;
+    uint64_t val;
 } art_hdr_t;
+
+#define AV_HAS(v) ((int)((v) & 1u))
+#define AV_OFF(v) ((uint64_t)((v) >> 1))
+#define AV_MAKE(has, off) ((((uint64_t)(off)) << 1) | ((has) ? 1ull : 0ull))
+static inline uint64_t art_val_load(const art_hdr_t *h) {
+    return __atomic_load_n(&h->val, __ATOMIC_ACQUIRE);
+}
+static inline void art_val_store(art_hdr_t *h, uint64_t v) {
+    __atomic_store_n(&h->val, v, __ATOMIC_RELEASE);
+}
+static inline bool art_val_cas(art_hdr_t *h, uint64_t *exp, uint64_t nv) {
+    return __atomic_compare_exchange_n(&h->val, exp, nv, false,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
 
 typedef struct {
     art_hdr_t h;
@@ -95,7 +111,23 @@ typedef struct {
     uint32_t state;
     uint64_t starttime;
     uint64_t recovery_ack;
+    uint32_t quiesced;   /* Q2 声明（第 3 步接） */
+    uint32_t claim_id;   /* open 时领取，1..(1<<30)-1 */
 } p2_slot_t;
+
+/* 统一垃圾环：每条 16B，off 恒为真实 box 偏移，状态编码在 meta。
+ * meta = state:2 | claim_id:30（EMPTY=0；RESERVED/COMMITTED 带 claim）。 */
+#define GARB_CAP (1u << 21)              /* 2,097,152 条 = 32MiB VA */
+#define GARB_MAX_CLAIM ((1u << 30) - 1u)
+typedef struct {
+    uint64_t off;
+    uint32_t epoch;
+    uint32_t meta;
+} garb_ent_t;
+enum { GE_EMPTY = 0, GE_RESERVED = 1, GE_COMMITTED = 2 };
+#define GE_STATE(m) ((uint32_t)((m) & 3u))
+#define GE_CLAIM(m) ((uint32_t)((m) >> 2))
+#define GE_MAKE(st, id) ((((uint32_t)(id)) << 2) | (uint32_t)(st))
 
 /* <path>           [kvspace_hdr_t][blocks_meta_t][ART slab ...]
  * <path>.sbo.head  [sbo meta ...]
@@ -106,10 +138,18 @@ typedef struct {
     int32_t art_root;
     /* v3: 旁路 gen 表（节点 id 索引，8B/节点）。 */
     uint64_t gens_size;
-    uint64_t gen_epoch;      /* 节点分配 epoch（原子递增） */
-    uint32_t format_version; /* 1 = v3 with gens */
-    uint32_t recovery_epoch; /* 恢复屏障代（死 pin 作废） */
-    p2_slot_t slots[P2_SLOT_N]; /* v4: 进程注册表 */
+    uint64_t gen_epoch;        /* 节点分配 epoch（原子递增） */
+    uint32_t format_version;   /* = 2（v5：art val 原子字 + 垃圾环） */
+    uint32_t recovery_epoch;   /* 屏障轮次（u32，模比较） */
+    uint32_t ack_seq;          /* 跨进程 futex 字（第 3 步） */
+    uint32_t barrier_state;
+    uint64_t barrier_pid, barrier_starttime;
+    uint64_t garb_cap, garb_head, garb_tail, garb_bytes;
+    uint64_t garb_freeing;
+    uint64_t round_ok, round_aborted, leak_boxes;
+    uint32_t claim_seq;        /* 30 位发号；耗尽 open 硬失败 */
+    uint32_t _pad;
+    p2_slot_t slots[P2_SLOT_N];
 } kvspace_hdr_t;
 
 #define ART_OFF (sizeof(kvspace_hdr_t) + sizeof(blocks_meta_t))
@@ -160,18 +200,14 @@ typedef struct {
 #define P2_TOMB_MAX 256
 
 struct kvspace {
-    shm_region_t r_art, r_head, r_data, r_gen;
+    shm_region_t r_art, r_head, r_data, r_gen, r_garb;
+    garb_ent_t *garb;             /* .garb 映射（GARB_CAP 条） */
+    uint64_t gen_n;               /* gens_at 容量：本进程已映射的节点数 */
+    uint64_t art_total_seen;      /* 上次同步时的 ART slab total_size */
     kvspace_hdr_t *hdr;
     uint64_t store_id;   /* 进程内句柄身份（P2 token 用） */
     int p2_slot;         /* 注册表槽；-1 = 未注册 */
     uint32_t p2_epoch;   /* 本进程已 ack 的 recovery_epoch */
-    uint64_t *tomb_ring;          /* P2: 有界 ring（256 × 8B） */
-    uint32_t tomb_head, tomb_tail;
-    uint64_t tomb_backpressure;
-    pthread_t tomb_thread;
-    pthread_mutex_t tomb_mu;
-    pthread_cond_t tomb_cv;
-    int tomb_stop;
     blocks_meta_t *art_meta;
     uint8_t *art_data;
     sbo_meta_t *sbo_meta;
@@ -253,8 +289,7 @@ static int32_t art_id_of(kvspace_t *kv, const void *p) {
 static kv_gens_t *gens_at(kvspace_t *kv, int32_t id) {
     if (id < 0 || !kv->r_gen.base)
         return NULL;
-    uint64_t n = gen_cap(kv);
-    if ((uint64_t)id >= n)
+    if ((uint64_t)id >= kv->gen_n)   /* gen_n 由 gens_grow / kv_sync 维护 */
         return NULL;
     return (kv_gens_t *)kv->r_gen.base + id;
 }
@@ -274,6 +309,64 @@ static void gen_bump_value(kvspace_t *kv, int32_t id) {
 
 static int64_t gen_alloc_epoch(kvspace_t *kv) {
     return (int64_t)__atomic_add_fetch(&kv->hdr->gen_epoch, 1ull, __ATOMIC_ACQ_REL);
+}
+
+/* ── 统一垃圾环：第 2 步只记不回收（drain 在第 3 步接）─────────────
+ * reserve 必须发生在任何键值/节点变更之前；失败 = 写路径硬错误，无半写。
+ * 每个 reserve 之后必须且只能走 commit 或 cancel。 */
+static void garb_full_report(kvspace_t *kv) {
+    static bool once;
+    if (once)
+        return;
+    once = true;
+    uint64_t h = __atomic_load_n(&kv->hdr->garb_head, __ATOMIC_ACQUIRE);
+    uint64_t t = __atomic_load_n(&kv->hdr->garb_tail, __ATOMIC_ACQUIRE);
+    uint32_t m = __atomic_load_n(&kv->garb[h & (GARB_CAP - 1)].meta,
+                                 __ATOMIC_ACQUIRE);
+    fprintf(stderr,
+            "kvspace: garbage ring full (cap=%llu, head=%llu, tail=%llu, "
+            "bytes=%llu): head entry #%llu state=%u claim=%u is holding "
+            "the drain (no reclaim round yet)\n",
+            (unsigned long long)kv->hdr->garb_cap, (unsigned long long)h,
+            (unsigned long long)t, (unsigned long long)kv->hdr->garb_bytes,
+            (unsigned long long)h, GE_STATE(m), GE_CLAIM(m));
+}
+
+static int garb_reserve(kvspace_t *kv, uint64_t *idx) {
+    uint32_t claim = kv->p2_slot >= 0 ? kv->hdr->slots[kv->p2_slot].claim_id : 0;
+    if (!claim)
+        return -1;
+    for (;;) {
+        uint64_t h = __atomic_load_n(&kv->hdr->garb_head, __ATOMIC_ACQUIRE);
+        uint64_t t = __atomic_load_n(&kv->hdr->garb_tail, __ATOMIC_RELAXED);
+        if (t - h >= kv->hdr->garb_cap) {
+            garb_full_report(kv);
+            return -1;
+        }
+        if (__atomic_compare_exchange_n(&kv->hdr->garb_tail, &t, t + 1, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            garb_ent_t *e = &kv->garb[t & (GARB_CAP - 1)];
+            __atomic_store_n(&e->meta, GE_MAKE(GE_RESERVED, claim),
+                             __ATOMIC_RELEASE);
+            *idx = t;
+            return 0;
+        }
+    }
+}
+
+static void garb_commit(kvspace_t *kv, uint64_t idx, uint64_t off) {
+    garb_ent_t *e = &kv->garb[idx & (GARB_CAP - 1)];
+    uint32_t claim = GE_CLAIM(__atomic_load_n(&e->meta, __ATOMIC_ACQUIRE));
+    e->off = off;
+    e->epoch = __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&e->meta, GE_MAKE(GE_COMMITTED, claim), __ATOMIC_RELEASE);
+    __atomic_add_fetch(&kv->hdr->garb_bytes,
+                       sbo_allocated_size(kv->sbo_meta, off), __ATOMIC_ACQ_REL);
+}
+
+static void garb_cancel(kvspace_t *kv, uint64_t idx) {
+    __atomic_store_n(&kv->garb[idx & (GARB_CAP - 1)].meta, GE_EMPTY,
+                     __ATOMIC_RELEASE);
 }
 
 /* 精确 key 的节点 id（即使 has_value==0 也返回；用于墓碑复活时清 DEAD）。 */
@@ -407,8 +500,16 @@ static int p2_reg_claim(kvspace_t *kv) {
         if (!__atomic_compare_exchange_n(&s->state, &expect, P2_SLOT_CLAIMING, false,
                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             continue;
+        uint32_t cid = __atomic_add_fetch(&kv->hdr->claim_seq, 1u,
+                                          __ATOMIC_ACQ_REL);
+        if (cid > GARB_MAX_CLAIM) {          /* 不静默回绕 */
+            __atomic_store_n(&s->state, P2_SLOT_FREE, __ATOMIC_RELEASE);
+            return -3;
+        }
         s->pid = me;
         s->starttime = st;
+        s->quiesced = 0;
+        s->claim_id = cid;
         __atomic_store_n(&s->recovery_ack,
                          __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE),
                          __ATOMIC_RELEASE);
@@ -443,10 +544,12 @@ static void p2_reg_ack(kvspace_t *kv) {
 #define GEN_RESERVE (64ULL << 20)   /* 64MiB VA 预留：8M 节点 */
 static int gens_grow(kvspace_t *kv) {
     uint64_t want = gen_cap(kv) * sizeof(kv_gens_t);
-    if (want <= kv->r_gen.mapped)
-        return 0;
     if (want > GEN_RESERVE)
         return -1;
+    kv->gen_n = want / sizeof(kv_gens_t);
+    kv->art_total_seen = kv->art_meta->total_size;
+    if (want <= kv->r_gen.mapped)
+        return 0;
     if (!kv->r_gen.base) {
         void *p = mmap(NULL, GEN_RESERVE, PROT_NONE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -465,9 +568,6 @@ static int gens_grow(kvspace_t *kv) {
 
 
 /* ── P2: tombstone 延迟释放（粗粒度 epoch：队满或显式 flush 时统一 free）── */
-static void kv_sbo_free_deferred(kvspace_t *kv, uint64_t off);
-static void p2_flush_tomb(kvspace_t *kv);
-static void p2_setstats_dump(void);
 
 
 int kvspaceShmSlotView(kvspace_t *kv, const kvspaceRef_t *ref,
@@ -490,12 +590,15 @@ int kvspaceShmViewFromRef(kvspace_t *kv, const kvspaceRef_t *ref,
     p2_reg_ack(kv);
     int32_t id = art_follow(kv, (int32_t)ref->block_id);
     art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
-    if (!h || !h->has_value)
+    if (!h)
         return -1;
-    uint64_t cap = sbo_allocated_size(kv->sbo_meta, h->box_offset);
+    uint64_t hv = art_val_load(h);
+    if (!AV_HAS(hv))
+        return -1;
+    uint64_t cap = sbo_allocated_size(kv->sbo_meta, AV_OFF(hv));
     if (cap < 1)
         return -1;
-    uint8_t *raw = kv->sbo_data + h->box_offset;
+    uint8_t *raw = kv->sbo_data + AV_OFF(hv);
     kvspaceXh w;
     if (kvspaceXhHeadView(raw, cap, &w) != 0 || w.total > cap ||
         w.kind == KVSPACE_XH_EXT || (w.kind & KVSPACE_XH_PTR_FLAG))
@@ -603,9 +706,12 @@ int kvspaceShmViewCheck(kvspace_t *kv, const kvspaceViewToken_t *tok) {
     if (__atomic_load_n(&g->struct_gen, __ATOMIC_ACQUIRE) != tok->struct_gen)
         return 1;
     art_hdr_t *h = art_hdr(kv, (int32_t)tok->node_id);
-    if (!h || !h->has_value)
+    if (!h)
         return 1;
-    if (tok->head != kv->sbo_data + h->box_offset)
+    uint64_t hv = art_val_load(h);
+    if (!AV_HAS(hv))
+        return 1;
+    if (tok->head != kv->sbo_data + AV_OFF(hv))
         return 1;
     return 0;
 }
@@ -643,13 +749,21 @@ int kvspaceShmViewDel(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key) {
         return 1;
     kv_gens_t *g = gens_at(kv, (int32_t)tok->node_id);
     art_hdr_t *h = art_hdr(kv, (int32_t)tok->node_id);
-    if (!g || !h || !h->has_value)
+    if (!g || !h)
         return 1;
-    /* 叶子级逻辑墓碑：键立刻不存在；不收 slot、不 bump struct_gen、不入 ring。
-     * 读者靠 value_gen 检测删除；回收交给后台 sweep。 */
-    h->has_value = 0;
+    /* 叶子级逻辑墓碑：CAS 一次原子清零 has_value+box；不 bump struct_gen。 */
+    uint64_t hv = art_val_load(h);
+    if (!AV_HAS(hv))
+        return 1;
+    uint64_t gidx;
+    if (garb_reserve(kv, &gidx) != 0)
+        return -1;                      /* 表满：硬错误，未变更 */
+    if (!art_val_cas(h, &hv, 0)) {
+        garb_cancel(kv, gidx);
+        return 1;
+    }
     __atomic_add_fetch(&g->value_gen, 2u, __ATOMIC_ACQ_REL); /* 静止态保持偶数 */
-    __atomic_thread_fence(__ATOMIC_RELEASE);
+    garb_commit(kv, gidx, AV_OFF(hv));
     (void)key;
     return 0;
 }
@@ -736,70 +850,17 @@ static int p2_barrier(kvspace_t *kv) {
 #endif
 }
 
-/* 后台 sweep：DFS 扫描墓碑叶（has_value==0 且 box 未回收），释放 box 并 bump struct_gen。
- * 调用方保证不与并发写同 key；返回释放数。 */
-static int p2_sweep_node(kvspace_t *kv, int32_t nid) {
-#if !defined(__linux__)
-    /* macOS：无可证的独占锁，不做墓碑回收（box 延迟到 close）。 */
-    (void)kv;
-    (void)nid;
-    return 0;
-#else
-    art_hdr_t *h = art_hdr(kv, nid);
-    if (!h || h->type == ART_MOVED)
-        return 0;
-    int freed = 0;
-    if (!h->has_value && h->box_offset) {
-        uint64_t off = h->box_offset;
-        gen_bump_struct(kv, nid);          /* 先 release 抬 gen：旧 token 全部 STALE */
-        kv_sbo_free(kv, off);
-        h->box_offset = 0;
-        freed += 1;
-    }
-    switch (h->type) {
-    case ART_N4: {
-        art_n4_t *x = (art_n4_t *)h;
-        for (int i = 0; i < (int)h->count; i++)
-            freed += p2_sweep_node(kv, x->children[i]);
-        break;
-    }
-    case ART_N16: {
-        art_n16_t *x = (art_n16_t *)h;
-        for (int i = 0; i < (int)h->count; i++)
-            freed += p2_sweep_node(kv, x->children[i]);
-        break;
-    }
-    case ART_N48: {
-        art_n48_t *x = (art_n48_t *)h;
-        for (int i = 0; i < 256; i++)
-            if (x->index[i] != 255)
-                freed += p2_sweep_node(kv, x->children[x->index[i]]);
-        break;
-    }
-    case ART_N256: {
-        art_n256_t *x = (art_n256_t *)h;
-        for (int i = 0; i < 256; i++)
-            freed += p2_sweep_node(kv, x->children[i]);
-        break;
-    }
-    }
-    return freed;
-#endif
-}
-
+/* 第 2 步：回收由垃圾环 + 屏障轮负责（drain 在第 3 步接）。ViewSweep = 强制一轮屏障。 */
 int kvspaceShmViewSweep(kvspace_t *kv) {
     if (!kv || kv->hdr->art_root < 0)
         return 0;
     p2_reg_ack(kv);
     p2_barrier(kv);                 /* 死 owner 的代推进 + 槽回收 */
-    return p2_sweep_node(kv, kv->hdr->art_root);
+    return 0;
 }
 
 int kvspaceShmViewFlushTomb(kvspace_t *kv) {
-    if (!kv)
-        return -1;
-    p2_flush_tomb(kv);
-    return 0;
+    return kvspaceShmViewSweep(kv);   /* 语义并入屏障轮（drain 在第 3 步接） */
 }
 
 int kvspaceShmViewRefresh(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key) {
@@ -812,6 +873,10 @@ int kvspaceShmViewRefresh(kvspace_t *kv, kvspaceViewToken_t *tok, const char *ke
 
 static int kv_sync(kvspace_t *kv) {
     if (region_map(&kv->r_art, ART_OFF + (size_t)kv->hdr->art_slab_size) != 0)
+        return -1;
+    /* 别的进程可能扩过 ART slab：本进程 gens 映射同步跟到同一容量。 */
+    if (kv->art_meta->total_size != kv->art_total_seen &&
+        gens_grow(kv) != 0)
         return -1;
     if (region_map(&kv->r_head, (size_t)kv->hdr->sbo_head_size) != 0)
         return -1;
@@ -968,61 +1033,6 @@ static void kv_sbo_free(kvspace_t *kv, uint64_t off) {
 /* P2: tombstone —— 有界 ring（L1 内）+ 后台 flush 线程。
  * 前台只做：ring[tail & MASK] = off; tail++（release）; 唤醒后台。
  * 队列满时前台等待（backpressure），绝不在调用线程里 sbo_free。 */
-#define P2_RING 256
-static void *p2_flusher(void *arg);
-
-static void kv_sbo_free_deferred(kvspace_t *kv, uint64_t off) {
-    if (off == 0 || (int64_t)off < 0)
-        return;
-    for (;;) {
-        uint32_t t = __atomic_load_n(&kv->tomb_tail, __ATOMIC_RELAXED);
-        uint32_t h = __atomic_load_n(&kv->tomb_head, __ATOMIC_ACQUIRE);
-        if (t - h < P2_RING) {
-            kv->tomb_ring[t & (P2_RING - 1)] = off;
-            __atomic_store_n(&kv->tomb_tail, t + 1, __ATOMIC_RELEASE);
-            break;
-        }
-        /* 满：唤醒后台并等待空位（backpressure） */
-        __atomic_add_fetch(&kv->tomb_backpressure, 1ull, __ATOMIC_RELAXED);
-        pthread_mutex_lock(&kv->tomb_mu);
-        pthread_cond_signal(&kv->tomb_cv);
-        pthread_mutex_unlock(&kv->tomb_mu);
-        sched_yield();
-    }
-    pthread_mutex_lock(&kv->tomb_mu);
-    pthread_cond_signal(&kv->tomb_cv);
-    pthread_mutex_unlock(&kv->tomb_mu);
-}
-
-static void p2_flush_tomb(kvspace_t *kv) {
-    for (;;) {
-        uint32_t h = __atomic_load_n(&kv->tomb_head, __ATOMIC_ACQUIRE);
-        uint32_t t = __atomic_load_n(&kv->tomb_tail, __ATOMIC_ACQUIRE);
-        if (h == t)
-            break;
-        uint64_t off = kv->tomb_ring[h & (P2_RING - 1)];
-        __atomic_store_n(&kv->tomb_head, h + 1, __ATOMIC_RELEASE);
-        kv_sbo_free(kv, off);
-    }
-}
-
-static void *p2_flusher(void *arg) {
-    kvspace_t *kv = arg;
-    for (;;) {
-        pthread_mutex_lock(&kv->tomb_mu);
-        while (!kv->tomb_stop &&
-               __atomic_load_n(&kv->tomb_head, __ATOMIC_ACQUIRE) ==
-                   __atomic_load_n(&kv->tomb_tail, __ATOMIC_ACQUIRE))
-            pthread_cond_wait(&kv->tomb_cv, &kv->tomb_mu);
-        int stop = kv->tomb_stop;
-        pthread_mutex_unlock(&kv->tomb_mu);
-        p2_flush_tomb(kv);
-        if (stop)
-            break;
-    }
-    return NULL;
-}
-
 /* ---- helpers ---- */
 static void *art_blk(kvspace_t *kv, int32_t id) {
     if (id < 0)
@@ -1118,7 +1128,7 @@ static int32_t art_walk(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen
                 return -1;
         }
         if (d == klen)
-            return h->has_value ? nid : -1;
+            return AV_HAS(art_val_load(h)) ? nid : -1;
         if (par)
             *par = nid;
         if (pard)
@@ -1204,7 +1214,7 @@ static int32_t art_find_dir(kvspace_t *kv, int32_t nid, const uint8_t *key,
                 *dirn = dir;
             if (dird)
                 *dird = dd;
-            return h->has_value ? nid : -1;
+            return AV_HAS(art_val_load(h)) ? nid : -1;
         }
         nid = art_child(kv, h, key[d]);
         d++;
@@ -1223,7 +1233,7 @@ static int32_t art_follow(kvspace_t *kv, int32_t id) {
             return -1;
         if (h->type != ART_MOVED)
             return id;
-        id = (int32_t)h->box_offset;
+        id = (int32_t)AV_OFF(art_val_load(h));
     }
     return -1;
 }
@@ -1236,8 +1246,7 @@ static int32_t art_new_leaf(kvspace_t *kv, uint64_t off) {
     art_n4_t *x = art_blk(kv, id);
     memset(x, 0, sizeof(*x));
     x->h.type = ART_N4;
-    x->h.has_value = 1;
-    x->h.box_offset = off;
+    art_val_store(&x->h, AV_MAKE(1, off));
     return id;
 }
 static int32_t art_new_node(kvspace_t *kv, int t) {
@@ -1276,8 +1285,7 @@ static int32_t art_grow(kvspace_t *kv, void *on) {
     art_hdr_t *nh = art_hdr(kv, nid);
     nh->prefix_len = oh->prefix_len;
     memcpy(nh->prefix, oh->prefix, oh->prefix_len);
-    nh->has_value = oh->has_value;
-    nh->box_offset = oh->box_offset;
+    art_val_store(nh, art_val_load(oh));
     // copy children
     for (int i = 0; i < (int)oh->count; i++) {
         uint8_t b = 0;
@@ -1346,8 +1354,7 @@ static int32_t art_grow(kvspace_t *kv, void *on) {
         gen_bump_struct(kv, oid);   /* 旧节点也失效 */
     }
     oh->type = ART_MOVED;
-    oh->has_value = 0;
-    oh->box_offset = (uint64_t)(uint32_t)nid;
+    art_val_store(oh, AV_MAKE(0, (uint32_t)nid));
     return nid;
 }
 
@@ -1524,8 +1531,7 @@ static int32_t art_ins(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
         if (h->prefix_len > 0)
             memmove(h->prefix, h->prefix + shared + 1, h->prefix_len);
         art_add(kv, nh, ob, nid);
-        nh->has_value = 1;
-        nh->box_offset = off;
+        art_val_store(nh, AV_MAKE(1, off));
         return nn;
     }
     if (shared < mpl) { // prefix split
@@ -1548,12 +1554,7 @@ static int32_t art_ins(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
     }
     d += h->prefix_len;
     if (d == klen) {
-        if (h->has_value)
-            h->box_offset = off;
-        else {
-            h->has_value = 1;
-            h->box_offset = off;
-        }
+        art_val_store(h, AV_MAKE(1, off));
         return nid;
     }
     int32_t cid = art_child(kv, h, key[d]);
@@ -1598,18 +1599,27 @@ static int32_t art_del(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
         d += h->prefix_len;
     }
     if (d == klen) {
-        if (!h->has_value)
+        uint64_t hv = art_val_load(h);
+        if (!AV_HAS(hv))
             return nid;
-        h->has_value = 0;
+        uint64_t gidx;
+        if (garb_reserve(kv, &gidx) != 0)
+            return -1;                  /* 表满：硬错误，未变更 */
+        if (!art_val_cas(h, &hv, 0)) {
+            garb_cancel(kv, gidx);
+            return nid;
+        }
         gen_bump_value(kv, art_id_of(kv, h)); /* P2: 值删 */
         gen_bump_struct(kv, art_id_of(kv, h)); /* P2: 槽消失，view 失效 */
-        kv_sbo_free_deferred(kv, h->box_offset);
-        h->box_offset = 0;
+        garb_commit(kv, gidx, AV_OFF(hv));
         *del = true;
     } else {
         int32_t cid = art_child(kv, h, key[d]);
-        if (cid >= 0)
-            art_del(kv, cid, key, klen, d + 1, del);
+        if (cid >= 0) {
+            int32_t rc = art_del(kv, cid, key, klen, d + 1, del);
+            if (rc < 0)
+                return rc;
+        }
     }
     return nid;
 }
@@ -1752,7 +1762,7 @@ static int art_has_live_value(kvspace_t *kv, int32_t nid) {
     art_hdr_t *h = art_hdr(kv, nid);
     if (!h)
         return -1;
-    if (h->has_value)
+    if (AV_HAS(art_val_load(h)))
         return 1;
     const int32_t *children;
     int count = h->count;
@@ -1804,11 +1814,13 @@ static int art_scan_children(kvspace_t *kv, int32_t nid, char *buf, int bpos, in
             int live = art_has_live_value(kv, nid);
             if (live <= 0)
                 return live;
-            if (rest[len] == '/' && len + 1 == restlen && h->has_value)
+            if (rest[len] == '/' && len + 1 == restlen &&
+                AV_HAS(art_val_load(h)))
                 len++;
             return keyscan_add_n(scan, rest, (size_t)len);
         }
-        if (h->has_value && keyscan_add_n(scan, rest, (size_t)len) != 0)
+        if (AV_HAS(art_val_load(h)) &&
+            keyscan_add_n(scan, rest, (size_t)len) != 0)
             return -1;
     }
     switch (h->type) {
@@ -1892,20 +1904,24 @@ static bool sbo_data_size_ok(size_t n) {
 kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
     if (!path)
         return NULL;
-    char head_path[PATH_MAX], data_path[PATH_MAX], gen_path[PATH_MAX];
+    char head_path[PATH_MAX], data_path[PATH_MAX], gen_path[PATH_MAX],
+        garb_path[PATH_MAX];
     if (snprintf(head_path, sizeof head_path, "%s.sbo.head", path) >=
             (int)sizeof head_path ||
         snprintf(data_path, sizeof data_path, "%s.sbo.data", path) >=
             (int)sizeof data_path ||
         snprintf(gen_path, sizeof gen_path, "%s.gen", path) >=
-            (int)sizeof gen_path)
+            (int)sizeof gen_path ||
+        snprintf(garb_path, sizeof garb_path, "%s.garb", path) >=
+            (int)sizeof garb_path)
         return NULL;
 
     kvspace_t *kv = calloc(1, sizeof(*kv));
     if (!kv)
         return NULL;
     kv->p2_slot = -1;
-    kv->r_art.fd = kv->r_head.fd = kv->r_data.fd = kv->r_gen.fd = -1;
+    kv->r_art.fd = kv->r_head.fd = kv->r_data.fd = kv->r_gen.fd =
+        kv->r_garb.fd = -1;
 
     /* validate before O_EXCL create: no empty file left behind */
     bool created = false;
@@ -1941,7 +1957,11 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
         region_attach(&kv->r_head, created, sbo_head, REGION_RESERVE) != 0 ||
         (kv->r_data.fd = open(data_path, fl, 0644)) < 0 ||
         region_attach(&kv->r_data, created, data_size, DATA_RESERVE) != 0 ||
-        (kv->r_gen.fd = open(gen_path, fl, 0644)) < 0)
+        (kv->r_gen.fd = open(gen_path, fl, 0644)) < 0 ||
+        (kv->r_garb.fd = open(garb_path, fl, 0644)) < 0 ||
+        region_attach(&kv->r_garb, created,
+                      (size_t)GARB_CAP * sizeof(garb_ent_t),
+                      (size_t)GARB_CAP * sizeof(garb_ent_t)) != 0)
         goto fail;
 
     kv->hdr = (kvspace_hdr_t *)kv->r_art.base;
@@ -1949,6 +1969,7 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
     kv->art_data = kv->r_art.base + ART_OFF;
     kv->sbo_meta = (sbo_meta_t *)kv->r_head.base;
     kv->sbo_data = kv->r_data.base;
+    kv->garb = (garb_ent_t *)kv->r_garb.base;
 
     /* 每进程单调句柄序号：close 后重开即使 malloc 复用同一 kv 地址，旧 token 也失效。 */
     {
@@ -1958,7 +1979,8 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
 
     if (created) {
         memset(kv->hdr, 0, sizeof(*kv->hdr));
-        kv->hdr->format_version = 1;
+        kv->hdr->format_version = 2;
+        kv->hdr->garb_cap = GARB_CAP;
         kv->hdr->art_slab_size = art_slab;
         kv->hdr->sbo_head_size = sbo_head;
         kv->hdr->sbo_data_size = data_size;
@@ -1968,6 +1990,13 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
             goto fail;
         /* magic last: half-initialized file fails reopen */
         memcpy(kv->hdr->magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1);
+    }
+    if (!created &&
+        (kv->hdr->format_version != 2 || kv->hdr->garb_cap != GARB_CAP)) {
+        fprintf(stderr, "kvspace: unsupported store format (version=%u, "
+                        "garb_cap=%llu); rebuild the shm store\n",
+                kv->hdr->format_version, (unsigned long long)kv->hdr->garb_cap);
+        goto fail;
     }
     if (gens_grow(kv) != 0)   /* P2: gen 表在 blocks_init 之后 */
         goto fail;
@@ -1982,17 +2011,14 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
         fprintf(stderr, "kvspace: too many processes, N=%d\n", P2_SLOT_N);
         goto fail;
     }
+    if (kv->p2_slot == -3) {
+        fprintf(stderr, "kvspace: claim_id exhausted (2^30 opens): "
+                        "rebuild the store\n");
+        goto fail;
+    }
     if (kv->p2_slot < 0)
         goto fail;
     kv->p2_epoch = __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE);
-
-    kv->tomb_ring = calloc(P2_RING, sizeof(uint64_t));
-    if (!kv->tomb_ring)
-        goto fail;
-    pthread_mutex_init(&kv->tomb_mu, NULL);
-    pthread_cond_init(&kv->tomb_cv, NULL);
-    if (pthread_create(&kv->tomb_thread, NULL, p2_flusher, kv) != 0)
-        goto fail;
 
     pthread_mutex_init(&kv->wlock, NULL);
     for (int i = 0; i < WATCH_TABLE_SZ; i++) {
@@ -2006,22 +2032,16 @@ fail:
         p2_reg_release(kv);
     region_close(&kv->r_art);
     region_close(&kv->r_head);
-    if (kv->tomb_ring) {
-        pthread_mutex_lock(&kv->tomb_mu);
-        kv->tomb_stop = 1;
-        pthread_cond_signal(&kv->tomb_cv);
-        pthread_mutex_unlock(&kv->tomb_mu);
-        pthread_join(kv->tomb_thread, NULL);
-        p2_flush_tomb(kv);
-        free(kv->tomb_ring);
-    }
     region_close(&kv->r_data);
     region_close(&kv->r_gen);
+    region_close(&kv->r_garb);
     free(kv);
     if (created) {
         unlink(path);
         unlink(head_path);
         unlink(data_path);
+        unlink(gen_path);
+        unlink(garb_path);
     }
     return NULL;
 }
@@ -2038,17 +2058,9 @@ void kvspaceShmClose(kvspace_t *kv) {
     pthread_mutex_destroy(&kv->wlock);
     region_close(&kv->r_art);
     region_close(&kv->r_head);
-    if (kv->tomb_ring) {
-        pthread_mutex_lock(&kv->tomb_mu);
-        kv->tomb_stop = 1;
-        pthread_cond_signal(&kv->tomb_cv);
-        pthread_mutex_unlock(&kv->tomb_mu);
-        pthread_join(kv->tomb_thread, NULL);
-        p2_flush_tomb(kv);
-        free(kv->tomb_ring);
-    }
     region_close(&kv->r_data);
     region_close(&kv->r_gen);
+    region_close(&kv->r_garb);
     free(kv);
 }
 
@@ -2080,11 +2092,14 @@ static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
     for (int depth = 0; depth < 16; depth++) {
         art_hdr_t *h =
             art_search(kv, kv->hdr->art_root, (const uint8_t *)out, (int)strlen(out));
-        if (!h || !h->has_value)
+        if (!h)
+            return;
+        uint64_t hv = art_val_load(h);
+        if (!AV_HAS(hv))
             return;
         uint8_t *raw;
         int32_t rl;
-        if (read_value(kv, h->box_offset, &raw, &rl) < 0)
+        if (read_value(kv, AV_OFF(hv), &raw, &rl) < 0)
             return;
         kvspaceXh wire;
         if (rl > 0 && kvspaceXhView(raw, (uint64_t)rl, &wire) == 0) {
@@ -2112,10 +2127,13 @@ static art_hdr_t *resolve_fetch(kvspace_t *kv, const char *path, char *out, int 
     for (int depth = 0; depth < 16; depth++) {
         art_hdr_t *h =
             art_search(kv, kv->hdr->art_root, (const uint8_t *)out, (int)strlen(out));
-        if (!h || !h->has_value)
+        if (!h)
             return h;
-        uint8_t *s = kv->sbo_data + h->box_offset;
-        size_t sz = sbo_allocated_size(kv->sbo_meta, h->box_offset);
+        uint64_t hv = art_val_load(h);
+        if (!AV_HAS(hv))
+            return h;
+        uint8_t *s = kv->sbo_data + AV_OFF(hv);
+        size_t sz = sbo_allocated_size(kv->sbo_meta, AV_OFF(hv));
         kvspaceXh wire;
         if (kvspaceXhView(s, sz, &wire) == 0) {
             if (wire.total > INT32_MAX)
@@ -2143,11 +2161,14 @@ static int dir_ext_path(kvspace_t *kv, const char *dir, char *out, int osz) {
     out[0] = 0;
     art_hdr_t *h =
         art_search(kv, kv->hdr->art_root, (const uint8_t *)dir, (int)strlen(dir));
-    if (!h || !h->has_value)
+    if (!h)
+        return 0;
+    uint64_t hv = art_val_load(h);
+    if (!AV_HAS(hv))
         return 0;
     uint8_t *raw;
     int32_t rl;
-    if (read_value(kv, h->box_offset, &raw, &rl) < 0)
+    if (read_value(kv, AV_OFF(hv), &raw, &rl) < 0)
         return 0;
     kvspaceXh wire;
     if (rl <= 0 || kvspaceXhDecode(raw, (uint64_t)rl, &wire) != 0 ||
@@ -2181,7 +2202,8 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
         h = art_search(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
                        (int)strlen(kbuf));
     }
-    if (!h || !h->has_value) {
+    uint64_t hv = h ? art_val_load(h) : 0;
+    if (!h || !AV_HAS(hv)) {
         /* extindex fallback：父目录是 extindex → 读 extpath + name */
         char *parent = NULL, *name = NULL;
         psplit(kbuf, &parent, &name);
@@ -2191,10 +2213,11 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
             art_hdr_t *eh = art_search(kv, kv->hdr->art_root, (const uint8_t *)target,
                                        (int)strlen(target));
             free(target);
-            if (eh && eh->has_value) {
+            uint64_t ehv = eh ? art_val_load(eh) : 0;
+            if (eh && AV_HAS(ehv)) {
                 uint8_t *raw;
                 int32_t rl;
-                if (read_value(kv, eh->box_offset, &raw, &rl) == 0) {
+                if (read_value(kv, AV_OFF(ehv), &raw, &rl) == 0) {
                     *ol = rl;
                     free(parent);
                     free(name);
@@ -2206,7 +2229,7 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
         free(name);
         return NULL;
     }
-    if (!fetched && read_value(kv, h->box_offset, &raw, &rl) < 0)
+    if (!fetched && read_value(kv, AV_OFF(hv), &raw, &rl) < 0)
         return NULL;
     *ol = rl;
     return raw;
@@ -2273,10 +2296,11 @@ uint8_t *kvspaceShmGetByRef(kvspace_t *kv, kvspaceRef_t *ref,
         return NULL;
     int32_t id = ref_leaf(kv, ref, key_fallback);
     art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
-    if (h && h->has_value) {
+    uint64_t hv = h ? art_val_load(h) : 0;
+    if (h && AV_HAS(hv)) {
         uint8_t *raw;
         int32_t rl;
-        if (read_value(kv, h->box_offset, &raw, &rl) == 0) {
+        if (read_value(kv, AV_OFF(hv), &raw, &rl) == 0) {
             *ol = rl;
             return raw;
         }
@@ -2306,9 +2330,10 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
      * （gen>0、无值、head 不足 64B、pow/kind/Ptr 不符、langtype 无 NUL、
      * a>b、b/offset/buf_len 越界、超出 box 物理容量）一律回退现有路径，
      * 行为不变。不修改 head，不更新 a/b。 */
-    if (h && h->has_value && ref->gen == 0) {
+    uint64_t hv = h ? art_val_load(h) : 0;
+    if (h && AV_HAS(hv) && ref->gen == 0) {
         uint64_t data_size = kv->hdr->sbo_data_size;
-        uint64_t off = h->box_offset;
+        uint64_t off = AV_OFF(hv);
         if (off <= data_size && data_size - off >= 64) {
             const uint8_t *hs = kv->sbo_data + off;
             uint8_t flags = hs[1];
@@ -2341,7 +2366,7 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
             }
         }
     }
-    if (!h || !h->has_value) {
+    if (!h || !AV_HAS(hv)) {
         if (ref->gen != 0)
             return -1;
         if (!key_fallback)
@@ -2356,7 +2381,7 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
     }
     uint8_t *raw;
     int32_t rl;
-    if (read_value(kv, h->box_offset, &raw, &rl) < 0 ||
+    if (read_value(kv, AV_OFF(hv), &raw, &rl) < 0 ||
         offset + buf_len > (uint32_t)rl)
         return -1;
     memcpy(raw + offset, buf, buf_len);
@@ -2406,11 +2431,14 @@ int kvspaceShmSlotView(kvspace_t *kv, const kvspaceRef_t *ref,
     kvspaceRef_t r = *ref;
     int32_t id = ref_leaf(kv, &r, key_fallback);
     art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
-    if (!h || !h->has_value)
+    if (!h)
+        return -1;
+    uint64_t hv = art_val_load(h);
+    if (!AV_HAS(hv))
         return -1;
     uint8_t *raw = NULL;
     int32_t rl = 0;
-    if (read_value(kv, h->box_offset, &raw, &rl) < 0 || !raw)
+    if (read_value(kv, AV_OFF(hv), &raw, &rl) < 0 || !raw)
         return -1;
     kvspaceXh wire;
     if (kvspaceXhDecode(raw, (uint64_t)rl, &wire) != 0)
@@ -2419,7 +2447,7 @@ int kvspaceShmSlotView(kvspace_t *kv, const kvspaceRef_t *ref,
     if (wire.kind == KVSPACE_XH_EXT ||
         (wire.kind & KVSPACE_XH_PTR_FLAG))
         return -1;
-    uint64_t cap = sbo_allocated_size(kv->sbo_meta, h->box_offset);
+    uint64_t cap = sbo_allocated_size(kv->sbo_meta, AV_OFF(hv));
     if (cap < wire.headlen || wire.content_len > cap - wire.headlen)
         return -1;
     /* status：只暴露规范形状且物理容量达标的槽；旧小 cap/异型 → -1，
@@ -2463,24 +2491,27 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
         static bool reg;
         if (!reg) { reg = true; atexit(p2_setstats_dump); }
     }
-    if (old && old->has_value) {
-        /* 同尺寸原地覆写：新值 ≤ 旧 box 容量时直接 memcpy，跳过 free+alloc，
-           不改共享 buddy 树。容量读自共享 mmap，零进程内状态。 */
-        uint64_t cap = sbo_allocated_size(kv->sbo_meta, old->box_offset);
+    uint64_t ohv = old ? art_val_load(old) : 0;
+    bool retiring = old && AV_HAS(ohv);
+    uint64_t gidx = 0;
+    if (retiring) {
+        uint64_t cap = sbo_allocated_size(kv->sbo_meta, AV_OFF(ohv));
         if ((uint64_t)val_len <= cap) {
-            /* P2: 同尺寸就地写 —— 指针不变，value_gen 奇偶保护（一次查表） */
+            /* 同尺寸就地写：指针不变，value_gen 奇偶保护（一次查表） */
             kv_gens_t *g = gens_at(kv, art_id_of(kv, old));
             if (g)
                 __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
-            memcpy(kv->sbo_data + old->box_offset, val, (size_t)val_len);
+            memcpy(kv->sbo_data + AV_OFF(ohv), val, (size_t)val_len);
             if (g)
                 __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
             g_setstats.same++;
             return 0;
         }
+        /* 换 box：reserve 在任何变更之前；失败 = 硬错误、旧值原样 */
+        if (garb_reserve(kv, &gidx) != 0)
+            return -1;
         g_setstats.realloc_++;
         g_setstats.retired_bytes += cap;
-        kv_sbo_free(kv, old->box_offset);
     } else {
         g_setstats.fresh++;
     }
@@ -2488,21 +2519,32 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
     if (is_vthread_status_key(key) && alloc_len < KVSPACE_STATUS_MIN_CAP)
         alloc_len = KVSPACE_STATUS_MIN_CAP;
     uint64_t off = kv_sbo_alloc(kv, alloc_len);
-    if (off == (uint64_t)-1)
+    if (off == (uint64_t)-1) {
+        if (retiring)
+            garb_cancel(kv, gidx);
         return -1;
+    }
     memcpy(kv->sbo_data + off, val, val_len);
-    kv->hdr->art_root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)key,
-                                (int)strlen(key), 0, off);
-    /* P2: 换 box / 墓碑复活——清 pending/dead 并抬 gen（旧 token 失效）。 */
-    {
+    int32_t root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)key,
+                           (int)strlen(key), 0, off);
+    if (root < 0) {
+        if (retiring)
+            garb_cancel(kv, gidx);
+        kv_sbo_free(kv, off);          /* 新 box 从未被引用 */
+        return -1;
+    }
+    kv->hdr->art_root = root;
+    {   /* 换 box / 墓碑复活：旧 token 全部 STALE */
         int32_t nid = p2_node_at(kv, key);
         kv_gens_t *g = gens_at(kv, nid);
         if (getenv("P2_DEBUG")) { fprintf(stderr, "DBG reset-lookup key=%s nid=%d g=%p root=%d\n", key, nid, (void *)g, kv->hdr->art_root); }
         if (g) {
-            gen_bump_struct(kv, nid);      /* 换 box：旧 token 全部 STALE */
-            gen_bump_value(kv, nid);       /* +2：内容整体替换 */
+            gen_bump_struct(kv, nid);
+            gen_bump_value(kv, nid);
         }
     }
+    if (retiring)
+        garb_commit(kv, gidx, AV_OFF(ohv));
     return 0;
 }
 
@@ -2534,9 +2576,12 @@ static int sync_metadata(kvspace_t *kv, const char *key, uint8_t ro, uint32_t vi
                     (int)strlen(meta)))
         return 0;
     bool removed = false;
-    kv->hdr->art_root = art_del(kv, kv->hdr->art_root,
-                                (const uint8_t *)meta, (int)strlen(meta), 0,
-                                &removed);
+    int32_t root = art_del(kv, kv->hdr->art_root,
+                           (const uint8_t *)meta, (int)strlen(meta), 0,
+                           &removed);
+    if (root < 0)
+        return -1;                  /* 表满等硬错误：树未变 */
+    kv->hdr->art_root = root;
     return 0;
 }
 
@@ -2552,10 +2597,13 @@ int kvspaceShmMetaGetAt(kvspace_t *kv, const char *key, uint8_t *ro,
     art_hdr_t *h = art_search(kv, kv->hdr->art_root,
                               (const uint8_t *)meta, (int)strlen(meta));
     free(meta);
-    if (!h || !h->has_value)
+    if (!h)
         return 0;
-    const uint8_t *data = kv->sbo_data + h->box_offset;
-    uint64_t allocated = sbo_allocated_size(kv->sbo_meta, h->box_offset);
+    uint64_t hv = art_val_load(h);
+    if (!AV_HAS(hv))
+        return 0;
+    const uint8_t *data = kv->sbo_data + AV_OFF(hv);
+    uint64_t allocated = sbo_allocated_size(kv->sbo_meta, AV_OFF(hv));
     kvspaceXh head;
     if (kvspaceXhDecode(data, allocated, &head) != 0)
         return -1;
@@ -2600,7 +2648,8 @@ static int shm_set_validated(kvspace_t *kv, const char *key,
     art_hdr_t *local = art_search(kv, kv->hdr->art_root,
                                    (const uint8_t *)kbuf, (int)strlen(kbuf));
     /* Existing local values already shadow the extension. */
-    if (!local || !local->has_value) {
+    uint64_t lhv = local ? art_val_load(local) : 0;
+    if (!local || !AV_HAS(lhv)) {
         char *pp = NULL, *nn = NULL;
         psplit(kbuf, &pp, &nn);
         char extpath[1024];
@@ -2609,7 +2658,8 @@ static int shm_set_validated(kvspace_t *kv, const char *key,
             art_hdr_t *eh = art_search(kv, kv->hdr->art_root,
                                        (const uint8_t *)tgt, (int)strlen(tgt));
             free(tgt);
-            if (eh && eh->has_value && !frame_operand_ptr(kbuf, wire)) {
+            if (eh && AV_HAS(art_val_load(eh)) &&
+                !frame_operand_ptr(kbuf, wire)) {
                 free(pp);
                 free(nn);
                 return -1;
@@ -2628,9 +2678,9 @@ static int shm_set_validated(kvspace_t *kv, const char *key,
             wire->headlen != (1u << KVSPACE_XH_POW_SLACK) ||
             !is_status_langtype(wire))
             return -1;
-        if (local && local->has_value) {
-            uint8_t *old_raw = kv->sbo_data + local->box_offset;
-            uint64_t old_sz = sbo_allocated_size(kv->sbo_meta, local->box_offset);
+        if (local && AV_HAS(lhv)) {
+            uint8_t *old_raw = kv->sbo_data + AV_OFF(lhv);
+            uint64_t old_sz = sbo_allocated_size(kv->sbo_meta, AV_OFF(lhv));
             kvspaceXh old;
             /* 旧 store 的不合规 status 槽（形状/尺寸/容量任一不符）：
              * 不自动升级、不 realloc——写入硬错，需重建/重置。 */
@@ -2685,7 +2735,7 @@ int kvspaceShmSetValueByRef(kvspace_t *kv, kvspaceRef_t *ref,
         return -1;
     int32_t id = ref_leaf(kv, ref, key_fallback);
     art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
-    if (h && h->has_value) {
+    if (h && AV_HAS(art_val_load(h))) {
         if (shm_set_local(kv, key_fallback, val, val_len, h) != 0)
             return -1;
         return sync_metadata(kv, key_fallback, ro, vid);
@@ -2716,9 +2766,12 @@ int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
         h = art_search(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
                        (int)strlen(kbuf));
     }
-    if (!h || !h->has_value)
+    if (!h)
         return -1;
-    if ((!fetched && read_value(kv, h->box_offset, &raw, &rl) < 0) || rl <= 0)
+    uint64_t hv = art_val_load(h);
+    if (!AV_HAS(hv))
+        return -1;
+    if ((!fetched && read_value(kv, AV_OFF(hv), &raw, &rl) < 0) || rl <= 0)
         return -1; /* None 或读失败 → 强制走 NewPlace */
     kvspaceXh wire;
     if (kvspaceXhDecode(raw, (uint64_t)rl, &wire) == 0) {
@@ -2772,9 +2825,12 @@ int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
         return -1;
     art_hdr_t *node = art_search(kv, kv->hdr->art_root,
                                  (const uint8_t *)key, (int)key_len);
-    if (!node || !node->has_value)
+    if (!node)
         return -1;
-    *body = kv->sbo_data + node->box_offset + headlen;
+    uint64_t nv = art_val_load(node);
+    if (!AV_HAS(nv))
+        return -1;
+    *body = kv->sbo_data + AV_OFF(nv) + headlen;
     return 0;
 }
 
@@ -2804,8 +2860,11 @@ int kvspaceShmDel(kvspace_t *kv, const char *key) {
     if (sync_metadata(kv, kbuf, 0, 0) != 0)
         return -1;
     bool d = false;
-    kv->hdr->art_root = art_del(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
-                                (int)strlen(kbuf), 0, &d);
+    int32_t root = art_del(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
+                           (int)strlen(kbuf), 0, &d);
+    if (root < 0)
+        return -1;                  /* 表满等硬错误：树未变 */
+    kv->hdr->art_root = root;
     return d ? 0 : -1;
 }
 
@@ -2817,10 +2876,11 @@ int kvspaceShmDeltree(kvspace_t *kv, const char *prefix) {
     // if prefix itself is a link, only delete the link
     art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)prefix,
                               (int)strlen(prefix));
-    if (h && h->has_value) {
+    uint64_t hv = h ? art_val_load(h) : 0;
+    if (h && AV_HAS(hv)) {
         uint8_t *raw;
         int32_t rl;
-        read_value(kv, h->box_offset, &raw, &rl);
+        read_value(kv, AV_OFF(hv), &raw, &rl);
         kvspaceXh wire;
         int is_ptr = rl > 0 && kvspaceXhDecode(raw, (uint64_t)rl, &wire) == 0 &&
                      (wire.kind & KVSPACE_XH_PTR_FLAG) != 0;
