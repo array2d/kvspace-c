@@ -182,10 +182,20 @@ void garb_commit (kvspace_t *kv, uint64_t idx, uint64_t off);/* 变更之后调�
 void garb_cancel (kvspace_t *kv, uint64_t idx);
 ```
 
-- `reserve`：CAS 循环检查 `tail - head < cap`，CAS 成功则写 `meta=GE_MAKE(GE_RESERVED, claim)`
-  （release）——此时 `off/epoch` 不解释；满 → 返回 -1。
+**单写者降级（v2.3）**：契约为“一个 store 同一时刻只有一个写者进程”
+（kvspace-c #58），因此 `entry/tail` 只有写者写，**不需要任何 CAS**：
+
+- `reserve`：acquire 读 `head/tail`，检查 `tail - head < cap`；写
+  `meta=GE_MAKE(GE_RESERVED, claim)`（release），再 release 写 `tail = t+1`。
+  槽位若不是 EMPTY：只可能是上一个写者死在 store 与 tail 之间（未发布、`i==tail`），
+  此时查 claim 存活，死者 → release 写 EMPTY 后重试；**活 claim 占着 tail 槽 =
+  契约被违反 → 返回 -1 硬错误**（不猜、不等待）。满 → 返回 -1。
 - `commit`：写 `off=retired_off`、`epoch=load(recovery_epoch, acquire)`，最后 release 写
-  `meta=GE_MAKE(GE_COMMITTED, claim)`；`garb_bytes += sbo_allocated_size(off)`。
+  `meta=GE_MAKE(GE_COMMITTED, claim)`；`committed_bytes += cap`（写者单方，普通加；
+  leader 只 acquire 读）。
+- `garb_bytes` 拆成两个计数：`committed_bytes`（只写者改）与 `freed_bytes`（只
+  leader 改），阈值/满检查读 `committed - freed`。写者与 leader 可能是不同进程，
+  两个计数各自单写者，所以都不需要 RMW。
 - `cancel`：release 写 `meta=GE_EMPTY`（claim 位清 0）。reserve 之后、变更之前任何失败
   都必须 cancel。
 - 读者一律先 acquire 读 `meta`；只有 COMMITTED 才解释 `off/epoch`（release 覆盖它们）。
@@ -194,7 +204,8 @@ void garb_cancel (kvspace_t *kv, uint64_t idx);
 （正常、`kv_sbo_alloc` 失败、`art_ins` 失败、`has_value` CAS 失败）= `commit` 或
 `cancel` **二选一**，没有第三条路。实现用单出口结构（`goto out` + `bool settled`），
 禁止在 reserve 与 commit 之间 `return`。`tail` 单调，`cancel` 不回退 tail（条目由
-drain 当 EMPTY 跳过）；`garb_bytes` 只统计 COMMITTED 的物理容量，RESERVED/EMPTY 不计。
+drain 当 EMPTY 跳过）；`committed_bytes - freed_bytes` 只统计已提交、未释放的物理
+容量（RESERVED/EMPTY 不计）。
 每进程 close 时断言 `reserved == committed + cancelled`（P2_DEBUG 下 abort）。
 
 三条路径的落点（**都不产生半写**）：
@@ -244,6 +255,18 @@ typedef struct {
     uint64_t val;                                       /* 16..24，bit0=has_value，bit1..63=box_offset */
 } art_hdr_t;                                            /* 24B，与现布局同尺寸 */
 ```
+
+**节点地址必须 8 字节对齐**（v2.2 补）：`val` 天然 8 对齐是上面的前提，但
+blockmalloc 的 `blocks_init` 按容量自动选 2/4/8 字节块头，256MB slab + 2112B 块
+选到 **4 字节头**：`blockdata_offset = id*(4+2112)+4`，节点地址在 `8k`/`8k+4`
+交替。于是半数节点的 `val` 非对齐，其中跨 64B 行的那个（每 16 个节点 1 个）让
+`lock cmpxchg` 退化为 **split lock**（本 pod 实测 ~7k tick/次，del_tokens
+p95 25.9k）；非对齐 8B 原子在 x86 上还可能撕裂，读者与写者并发时读到
+`has_value`/`box_offset` 不一致的组合——这是正确性问题，不只是性能。
+因此：创建 store 时在 `blocks_init` 之后强制 `sizeof_block_head = 8`
+（stride = 8+2112 = 2120 ≡ 0 mod 8，data = id*2120+8 恒 8 对齐），并断言
+`(sizeof_block_head + block_size) % 8 == 0`；open 时校验头宽 = 8，否则
+"unsupported store format; rebuild"。
 
 **所有访问只经三个 helper**，仓库里不再出现裸位域读写（这条连同上面的布局写进
 kvspace-c 的 shm 格式设计文档，并由 A21 的 grep 检查守住）：
@@ -557,7 +580,7 @@ sweep 里的 PEND/DEAD CAS。`kv_gens_t` 回到 `{uint32_t struct_gen; uint32_t 
 `kv_sbo_free_deferred` / `p2_flush_tomb` / `p2_flusher` / `tomb_ring` / `tomb_mu` /
 `tomb_cv` 全删。保留 `kv_sbo_free`（只由 leader 在 drain 里调用）。
 
-### 4.3 hdr v5（format_version = 2）
+### 4.3 hdr v5（format_version = 4）
 
 ```c
 typedef struct {
@@ -565,12 +588,14 @@ typedef struct {
     uint64_t art_slab_size, sbo_head_size, sbo_data_size;
     int32_t art_root;
     uint64_t gens_size, gen_epoch;
-    uint32_t format_version;      /* = 2 */
+    uint32_t format_version;      /* = 4（v2.3：对齐 + 单写者降级） */
     uint32_t recovery_epoch;      /* 屏障轮次（模比较） */
     uint32_t ack_seq;             /* 跨进程 futex 字 */
     uint32_t barrier_state;       /* state:2 | claim_id:30（FREE=0/OWNED=1） */
     uint64_t barrier_pid, barrier_starttime;
-    uint64_t garb_cap, garb_head, garb_tail, garb_bytes;
+    uint64_t garb_cap, garb_head, garb_tail;
+    uint64_t committed_bytes;     /* 只写者改 */
+    uint64_t freed_bytes;         /* 只 leader 改 */
     uint64_t garb_freeing;
     uint64_t round_ok, round_aborted, leak_boxes;
     uint32_t claim_seq;           /* 30 位发号；到 (1<<30)-1 时 open 硬失败 */
@@ -591,7 +616,9 @@ typedef struct {
 节点仍是 24B，ART 内存不增长）。
 
 hdr 变长 ⇒ `ART_OFF` 变、新增 `<path>.garb`、节点首部布局变 ⇒ **格式不兼容**：
-`format_version != 2` 的 shm store 在 open 时明确报错并提示重建（不迁移、不兼容，p5）。
+`format_version != 4`（或 ART 块头宽度不是 8）的 shm store 在 open 时明确报错并提示
+重建（不迁移、不兼容，p5）。3→4 的差别只有 `garb_bytes` 拆成
+`committed_bytes/freed_bytes`（单写者降级）。
 
 ### 4.4 macOS
 

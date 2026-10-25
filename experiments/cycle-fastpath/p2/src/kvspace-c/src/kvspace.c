@@ -21,6 +21,7 @@
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #endif
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -145,12 +146,14 @@ typedef struct {
     /* v3: 旁路 gen 表（节点 id 索引，8B/节点）。 */
     uint64_t gens_size;
     uint64_t gen_epoch;        /* 节点分配 epoch（原子递增） */
-    uint32_t format_version;   /* = 2（v5：art val 原子字 + 垃圾环） */
+    uint32_t format_version;   /* = 4（art val 原子字 + 垃圾环 + 单写者降级） */
     uint32_t recovery_epoch;   /* 屏障轮次（u32，模比较） */
     uint32_t ack_seq;          /* 跨进程 futex 字（第 3 步） */
     uint32_t barrier_state;
     uint64_t barrier_pid, barrier_starttime;
-    uint64_t garb_cap, garb_head, garb_tail, garb_bytes;
+    uint64_t garb_cap, garb_head, garb_tail;
+    uint64_t committed_bytes;  /* 只由写者改（单写者契约，普通 add） */
+    uint64_t freed_bytes;      /* 只由 leader 改 */
     uint64_t garb_freeing;
     uint64_t round_ok, round_aborted, leak_boxes;
     uint32_t claim_seq;        /* 30 位发号；耗尽 open 硬失败 */
@@ -355,7 +358,9 @@ static void garb_full_report(kvspace_t *kv) {
             "bytes=%llu): head entry #%llu state=%u claim=%u is holding "
             "the drain (no reclaim round yet)\n",
             (unsigned long long)kv->hdr->garb_cap, (unsigned long long)h,
-            (unsigned long long)t, (unsigned long long)kv->hdr->garb_bytes,
+            (unsigned long long)t,
+            (unsigned long long)(kv->hdr->committed_bytes -
+                                 kv->hdr->freed_bytes),
             (unsigned long long)h, GE_STATE(m), GE_CLAIM(m));
 }
 
@@ -363,49 +368,32 @@ static int garb_reserve(kvspace_t *kv, uint64_t *idx) {
     uint32_t claim = kv->p2_slot >= 0 ? kv->hdr->slots[kv->p2_slot].claim_id : 0;
     if (!claim)
         return -1;
-    int spins = 0;
-    for (;;) {
-        uint64_t h = __atomic_load_n(&kv->hdr->garb_head, __ATOMIC_ACQUIRE);
-        uint64_t t = __atomic_load_n(&kv->hdr->garb_tail, __ATOMIC_ACQUIRE);
-        if (t - h >= kv->hdr->garb_cap) {
-            garb_full_report(kv);
-            return -1;
-        }
-        if (kv->reclaim_unavailable &&
-            kv->hdr->garb_cap - (t - h) < kv->hdr->garb_cap / 4) {
-            garb_full_report(kv);        /* 线程建不起来：1/4 安全线硬失败 */
-            return -1;
-        }
-        garb_ent_t *e = &kv->garb[t & (GARB_CAP - 1)];
-        uint32_t m = __atomic_load_n(&e->meta, __ATOMIC_ACQUIRE);
-        if (m == GE_EMPTY) {
-            /* 先写条目、后推进 tail：drain 看到的每个 i < tail 都必然已初始化。 */
-            if (__atomic_compare_exchange_n(&e->meta, &m,
-                                            GE_MAKE(GE_RESERVED, claim), false,
-                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-                if (!__atomic_compare_exchange_n(&kv->hdr->garb_tail, &t, t + 1,
-                                                 false, __ATOMIC_ACQ_REL,
-                                                 __ATOMIC_ACQUIRE)) {
-                    /* 只可能被死者回收改写（tail 只由条目赢家推进） */
-                    __atomic_store_n(&e->meta, GE_EMPTY, __ATOMIC_RELEASE);
-                    continue;
-                }
-                *idx = t;
-                return 0;
-            }
-            continue;
-        }
-        /* 边界上的已发布 RESERVED：写者窗口（活）或写者已死。 */
-        if (++spins > 1000 && GE_STATE(m) == GE_RESERVED &&
-            !p2_claim_alive(kv, GE_CLAIM(m))) {
-            uint32_t exp = m;
-            __atomic_compare_exchange_n(&e->meta, &exp, GE_EMPTY, false,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
-            spins = 0;
-        } else if (spins > 2000) {
-            sched_yield();
-        }
+    uint64_t h = __atomic_load_n(&kv->hdr->garb_head, __ATOMIC_ACQUIRE);
+    uint64_t t = __atomic_load_n(&kv->hdr->garb_tail, __ATOMIC_ACQUIRE);
+    if (t - h >= kv->hdr->garb_cap) {
+        garb_full_report(kv);
+        return -1;
     }
+    if (kv->reclaim_unavailable &&
+        kv->hdr->garb_cap - (t - h) < kv->hdr->garb_cap / 4) {
+        garb_full_report(kv);        /* 线程建不起来：1/4 安全线硬失败 */
+        return -1;
+    }
+    /* 单写者契约（kvspace-c #58）：entry/tail 只有写者写，普通 release store。
+     * leader 只读；唯一的写者进程若死在 store 与 tail 之间，槽位停在 RESERVED
+     * 且未发布（i == tail），下一个写者在这里回收死 claim（冷路径）。
+     * 活 claim 占着 tail 槽 = 契约被违反 → 硬错误，不猜。 */
+    garb_ent_t *e = &kv->garb[t & (GARB_CAP - 1)];
+    uint32_t m = __atomic_load_n(&e->meta, __ATOMIC_ACQUIRE);
+    if (m != GE_EMPTY) {
+        if (GE_STATE(m) != GE_RESERVED || p2_claim_alive(kv, GE_CLAIM(m)))
+            return -1;
+        __atomic_store_n(&e->meta, GE_EMPTY, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(&e->meta, GE_MAKE(GE_RESERVED, claim), __ATOMIC_RELEASE);
+    __atomic_store_n(&kv->hdr->garb_tail, t + 1, __ATOMIC_RELEASE);
+    *idx = t;
+    return 0;
 }
 
 /* bytes 由退役点在“不拿分配器锁”的前提下给出（ViewDel 用 token 缓存的 cap，
@@ -417,9 +405,10 @@ static void garb_commit(kvspace_t *kv, uint64_t idx, uint64_t off,
     e->off = off;
     e->epoch = __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE);
     __atomic_store_n(&e->meta, GE_MAKE(GE_COMMITTED, claim), __ATOMIC_RELEASE);
-    uint64_t bytes = __atomic_add_fetch(&kv->hdr->garb_bytes, bytes_retired,
-                                        __ATOMIC_ACQ_REL);
-    if (bytes >= p2_garb_threshold())
+    uint64_t bytes = kv->hdr->committed_bytes + bytes_retired;
+    __atomic_store_n(&kv->hdr->committed_bytes, bytes, __ATOMIC_RELEASE);
+    if (bytes - __atomic_load_n(&kv->hdr->freed_bytes, __ATOMIC_ACQUIRE) >=
+        p2_garb_threshold())
         (void)p2_maint_start(kv);    /* 失败已置 reclaim_unavailable */
 }
 
@@ -1033,7 +1022,8 @@ static int p2_drain(kvspace_t *kv, uint32_t r) {
         }
 #endif
         kv_sbo_free(kv, off);
-        __atomic_sub_fetch(&kv->hdr->garb_bytes, cap, __ATOMIC_ACQ_REL);
+        __atomic_store_n(&kv->hdr->freed_bytes,
+                         kv->hdr->freed_bytes + cap, __ATOMIC_RELEASE);
         i++;
         freed++;
     }
@@ -1101,7 +1091,8 @@ static void *p2_maint(void *arg) {
         p2_futex_wait_priv(&kv->maint_seq, seq, 50);
         if (__atomic_load_n(&kv->maint_stop, __ATOMIC_ACQUIRE))
             break;
-        if (__atomic_load_n(&kv->hdr->garb_bytes, __ATOMIC_ACQUIRE) <
+        if (kv->hdr->committed_bytes -
+                __atomic_load_n(&kv->hdr->freed_bytes, __ATOMIC_ACQUIRE) <
             p2_garb_threshold())
             continue;
         p2_round(kv);                 /* 内含选举；忙/超时都直接返回 */
@@ -1109,7 +1100,7 @@ static void *p2_maint(void *arg) {
     return NULL;
 }
 
-/* 懒启动：open 不建线程；garb_bytes 越过 64MiB 时才建（open / commit 后检查）。
+/* 懒启动：open 不建线程；未回收垃圾越过 64MiB 时才建（open / commit 后检查）。
  * 每个进程最多一个；创建失败置 reclaim_unavailable 并由写路径在环 3/4 满时硬失败。 */
 static int p2_maint_start(kvspace_t *kv) {
 #if !defined(__linux__)
@@ -1189,8 +1180,36 @@ void kvspaceShmViewRoundStats(kvspace_t *kv, uint64_t *ok, uint64_t *aborted,
 
 uint64_t kvspaceShmViewGarbBytes(kvspace_t *kv) {
     return kv && kv->hdr
-               ? __atomic_load_n(&kv->hdr->garb_bytes, __ATOMIC_ACQUIRE)
+               ? kv->hdr->committed_bytes -
+                     __atomic_load_n(&kv->hdr->freed_bytes, __ATOMIC_ACQUIRE)
                : 0;
+}
+
+/* 对齐验收：块头 8、stride 8 倍数，且每个块的 val（偏移 16）不跨 64B 行。
+ * 返回 -1 = 通过；>=0 = 第一个坏块 id；-2 = 块头宽度不是 8。 */
+int64_t kvspaceShmArtAlignCheck(kvspace_t *kv) {
+    if (!kv || !kv->art_meta)
+        return -2;
+    blocks_meta_t *m = kv->art_meta;
+    if (m->sizeof_block_head != 8)
+        return -2;
+    uint64_t stride = (uint64_t)m->sizeof_block_head + m->block_size;
+    if (stride % 8)
+        return -2;
+    uint64_t n = m->total_size / stride;
+    for (uint64_t id = 0; id < n; id++) {
+        uint64_t off = blockdata_offset(m, id);
+        uint64_t val = off + offsetof(art_hdr_t, val);
+        if (off % 8 || val % 8 || (val & 63) > 56)
+            return (int64_t)id;
+    }
+    return -1;
+}
+
+/* 旧 store 拒绝测试：把 hdr 的 format_version 改成指定值（只测试用）。 */
+void kvspaceShmTestSetFormatVersion(kvspace_t *kv, uint32_t v) {
+    if (kv && kv->hdr)
+        kv->hdr->format_version = v;
 }
 #endif
 
@@ -2322,7 +2341,7 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
 
     if (created) {
         memset(kv->hdr, 0, sizeof(*kv->hdr));
-        kv->hdr->format_version = 3;
+        kv->hdr->format_version = 4;
         kv->hdr->garb_cap = GARB_CAP;
         kv->hdr->art_slab_size = art_slab;
         kv->hdr->sbo_head_size = sbo_head;
@@ -2343,7 +2362,7 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
         memcpy(kv->hdr->magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1);
     }
     if (!created &&
-        (kv->hdr->format_version != 3 ||
+        (kv->hdr->format_version != 4 ||
          kv->art_meta->sizeof_block_head != 8 ||
          kv->hdr->garb_cap != GARB_CAP)) {
         fprintf(stderr, "kvspace: unsupported store format (version=%u, "
@@ -2375,7 +2394,8 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
     (void)pthread_once(&g_atfork_once, p2_atfork_install);
     kv->fork_gen = __atomic_load_n(&g_fork_gen, __ATOMIC_ACQUIRE);
     kv->quiesced = 1;               /* claim 时 slot->quiesced=1，二者一致 */
-    if (__atomic_load_n(&kv->hdr->garb_bytes, __ATOMIC_ACQUIRE) >=
+    if (kv->hdr->committed_bytes -
+            __atomic_load_n(&kv->hdr->freed_bytes, __ATOMIC_ACQUIRE) >=
             p2_garb_threshold() &&
         p2_maint_start(kv) != 0)
         goto fail;                  /* 已有大量垃圾且建不了线程：open 硬失败 */
@@ -2442,8 +2462,8 @@ void kvspaceShmClose(kvspace_t *kv) {
                 uint64_t cap = sbo_allocated_size(kv->sbo_meta, off);
                 __atomic_store_n(&e->meta, GE_EMPTY, __ATOMIC_RELEASE);
                 kv_sbo_free(kv, off);
-                __atomic_sub_fetch(&kv->hdr->garb_bytes, cap,
-                                   __ATOMIC_ACQ_REL);
+                __atomic_store_n(&kv->hdr->freed_bytes,
+                                 kv->hdr->freed_bytes + cap, __ATOMIC_RELEASE);
             } else {
                 __atomic_store_n(&e->meta, GE_EMPTY, __ATOMIC_RELEASE);
             }
