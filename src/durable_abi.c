@@ -146,9 +146,9 @@ int kvspaceGetByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
     return 0;
 }
 
-int kvspaceSlotView(void *h, const kvspaceRef_t *ref, const char *key_fallback,
-                    kvspaceSlotView_t *out) {
-    return kvspaceShmSlotView((kvspace_t *)h, ref, key_fallback, out);
+int kvspaceXvalueBodyView(void *h, const kvspaceRef_t *ref, const char *key_fallback,
+                    kvspaceXvalueBodyView_t *out) {
+    return kvspaceShmXvalueBodyView((kvspace_t *)h, ref, key_fallback, out);
 }
 
 int kvspaceSetPartByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,

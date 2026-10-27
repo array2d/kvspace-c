@@ -44,8 +44,8 @@ int main(void) {
     kvspaceRef_t r;
     memset(&r, 0, sizeof r);
     CHECK(kvspaceShmResolveRef(kv, "/a/s", &r) == 0);
-    kvspaceSlotView_t view;
-    CHECK(kvspaceShmSlotView(kv, &r, "/a/s", &view) == 0);
+    kvspaceXvalueBodyView_t view;
+    CHECK(kvspaceShmXvalueBodyView(kv, &r, "/a/s", &view) == 0);
     CHECK(view.head && view.body == view.head + view.headlen);
     CHECK(view.cap >= view.headlen && view.body_cap == view.cap - view.headlen);
     kvspaceXh xh;
@@ -53,8 +53,8 @@ int main(void) {
     CHECK(xh.content_len <= view.body_cap);
 
     /* key_fallback 必填：NULL → -1。 */
-    kvspaceSlotView_t nv;
-    CHECK(kvspaceShmSlotView(kv, &r, NULL, &nv) == -1);
+    kvspaceXvalueBodyView_t nv;
+    CHECK(kvspaceShmXvalueBodyView(kv, &r, NULL, &nv) == -1);
 
     /* status：短值 / 16B 合法，17B 与异型硬错。 */
     const char *sk = "/vthread/7/\xE2\x80\xA5status";
@@ -64,7 +64,7 @@ int main(void) {
     free(v);
     memset(&r, 0, sizeof r);
     CHECK(kvspaceShmResolveRef(kv, sk, &r) == 0);
-    CHECK(kvspaceShmSlotView(kv, &r, sk, &view) == 0);
+    CHECK(kvspaceShmXvalueBodyView(kv, &r, sk, &view) == 0);
     uint8_t *head0 = view.head, *body0 = view.body;
     uint64_t cap0 = view.cap;
     CHECK(view.headlen == (1u << KVSPACE_XH_POW_SLACK));
@@ -75,8 +75,8 @@ int main(void) {
         CHECK(v != NULL);
         CHECK(kvspaceShmSet(kv, sk, v, (int32_t)n) == 0);
         free(v);
-        kvspaceSlotView_t again;
-        CHECK(kvspaceShmSlotView(kv, &r, sk, &again) == 0);
+        kvspaceXvalueBodyView_t again;
+        CHECK(kvspaceShmXvalueBodyView(kv, &r, sk, &again) == 0);
         CHECK(again.head == head0 && again.body == body0 && again.cap == cap0);
     }
     v = slack("0123456789abcdef", &n);
@@ -100,8 +100,8 @@ int main(void) {
     kvspaceRef_t lr;
     memset(&lr, 0, sizeof lr);
     CHECK(kvspaceShmResolveRef(kv, lk, &lr) == 0);
-    kvspaceSlotView_t lv;
-    CHECK(kvspaceShmSlotView(kv, &lr, lk, &lv) == -1);
+    kvspaceXvalueBodyView_t lv;
+    CHECK(kvspaceShmXvalueBodyView(kv, &lr, lk, &lv) == -1);
     v = slack("init", &n);
     CHECK(v != NULL);
     CHECK(kvspaceShmSet(kv, lk, v, (int32_t)n) != 0);
@@ -115,8 +115,8 @@ int main(void) {
     kvspaceRef_t wr;
     memset(&wr, 0, sizeof wr);
     CHECK(kvspaceShmResolveRef(kv, wk, &wr) == 0);
-    kvspaceSlotView_t wv;
-    CHECK(kvspaceShmSlotView(kv, &wr, wk, &wv) == -1);
+    kvspaceXvalueBodyView_t wv;
+    CHECK(kvspaceShmXvalueBodyView(kv, &wr, wk, &wv) == -1);
     v = slack("init", &n);
     CHECK(v != NULL);
     CHECK(kvspaceShmSet(kv, wk, v, (int32_t)n) != 0);
@@ -128,9 +128,9 @@ int main(void) {
     CHECK(kvspaceShmResolveRef(kv, sk, &s17) == 0);
     uint8_t a17[8] = {17, 0, 0, 0, 0, 0, 0, 0};
     CHECK(kvspaceShmSetPartByRef(kv, &s17, sk, 2, a17, 8) == 0);
-    kvspaceSlotView_t v17;
-    CHECK(kvspaceShmSlotView(kv, &s17, sk, &v17) == -1);
-    CHECK(kvspaceShmSlotView(kv, &s17, NULL, &v17) == -1);
+    kvspaceXvalueBodyView_t v17;
+    CHECK(kvspaceShmXvalueBodyView(kv, &s17, sk, &v17) == -1);
+    CHECK(kvspaceShmXvalueBodyView(kv, &s17, NULL, &v17) == -1);
 
     /* 越界 content（head.a 被改大）：view -1。 */
     v = slack("hello", &n);
@@ -145,14 +145,14 @@ int main(void) {
     kvspaceRef_t cr;
     memset(&cr, 0, sizeof cr);
     CHECK(kvspaceShmResolveRef(kv, "/a/corrupt", &cr) == 0);
-    kvspaceSlotView_t cv;
-    CHECK(kvspaceShmSlotView(kv, &cr, "/a/corrupt", &cv) == -1);
+    kvspaceXvalueBodyView_t cv;
+    CHECK(kvspaceShmXvalueBodyView(kv, &cr, "/a/corrupt", &cv) == -1);
 
     /* 不存在的 key → -1。 */
     kvspaceRef_t miss;
     memset(&miss, 0xff, sizeof miss);
-    kvspaceSlotView_t mv;
-    CHECK(kvspaceShmSlotView(kv, &miss, "/no/such", &mv) == -1);
+    kvspaceXvalueBodyView_t mv;
+    CHECK(kvspaceShmXvalueBodyView(kv, &miss, "/no/such", &mv) == -1);
 
     kvspaceShmClose(kv);
     printf("ok: slot view\n");
