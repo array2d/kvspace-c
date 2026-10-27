@@ -622,8 +622,8 @@ static int gens_grow(kvspace_t *kv) {
 /* ── P2: tombstone 延迟释放（粗粒度 epoch：队满或显式 flush 时统一 free）── */
 
 
-int kvspaceShmSlotView(kvspace_t *kv, const kvspaceRef_t *ref,
-                       const char *key_fallback, kvspaceSlotView_t *out);
+int kvspaceShmXvalueBodyView(kvspace_t *kv, const kvspaceRef_t *ref,
+                       const char *key_fallback, kvspaceXvalueBodyView_t *out);
 static int32_t art_id_of(kvspace_t *kv, const void *p);
 static art_hdr_t *art_hdr(kvspace_t *kv, int32_t id);
 static int32_t art_follow(kvspace_t *kv, int32_t id);
@@ -2859,8 +2859,8 @@ static int is_vthread_status_key(const char *key) {
            memcmp(key + n - sl, suf, sl) == 0;
 }
 
-int kvspaceShmSlotView(kvspace_t *kv, const kvspaceRef_t *ref,
-                       const char *key_fallback, kvspaceSlotView_t *out) {
+int kvspaceShmXvalueBodyView(kvspace_t *kv, const kvspaceRef_t *ref,
+                       const char *key_fallback, kvspaceXvalueBodyView_t *out) {
     /* status 识别依赖 key_fallback；view 一律要求非 NULL（runtime 必须传）。 */
     if (!kv || !ref || !out || !key_fallback)
         return -1;
