@@ -12,9 +12,9 @@
 #include <unistd.h>
 
 #define SBO_DATA_SIZE (8UL * 64 * 64 * 64 * 64) /* 8 * 64^4 */
-#define ART_SLAB_INIT (256UL * 1024 * 1024)
-/* 600B keys take ~60 ART blocks each: 3000 * 125KB > 256MB, one doubling */
-#define GROW_KEYS 3000
+#define ART_SLAB_INIT (64UL * 1024 * 1024)
+/* 600B keys take ~55 ART blocks of 112B each: 16000 * 6KB > 64MB, one doubling */
+#define GROW_KEYS 16000
 #define GROW_KEY_LEN 600
 
 /* unique prefix + random tail, no shared prefix between keys */
@@ -148,7 +148,7 @@ static void t_grow_and_reopen(const char *db) {
   kvspaceShmClose(kv);
 }
 
-/* child maps 256MB, parent grows, child reads/writes the grown area */
+/* child maps the initial slab, parent grows, child reads/writes the grown area */
 static void t_cross_process(const char *dir) {
   printf("[xproc] one process grows, another syncs and reads the grown area\n");
   char db[512];
@@ -174,7 +174,7 @@ static void t_cross_process(const char *dir) {
       _exit(12);
     if (read(to_child[0], &c, 1) != 1)
       _exit(13);
-    /* last key lives beyond 256MB */
+    /* last key lives beyond ART_SLAB_INIT */
     char key[GROW_KEY_LEN + 8];
     key_of(key, sizeof key, GROW_KEYS - 1);
     if (get_int32(ckv, key) != GROW_KEYS - 1)
