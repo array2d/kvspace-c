@@ -115,7 +115,8 @@ int kvspaceShmMkindex(
  * ExtIndex
  * ================================================================ */
 
-int kvspaceShmExtindex(kvspace_t *kv, const char *path, const char *extpath);
+int kvspaceShmExtindex(kvspace_t *kv, const char *path, const char *extpath,
+                       char *err, uint32_t err_cap);
 int kvspaceShmDelextindex(kvspace_t *kv, const char *path); // 移除 extindex
 
 /* ================================================================

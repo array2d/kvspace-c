@@ -203,7 +203,7 @@ static void t_correct(const char *db) {
             ro == 0 && vid == 0, "deleted tree sidecar");
 
   CHECK(kvspaceShmMkindex(kv, "/lib/", 0) == 0, "new directory value");
-  CHECK(kvspaceShmExtindex(kv, "/e/", "/lib/") == 0, "extindex");
+  CHECK(kvspaceShmExtindex(kv, "/e/", "/lib/", NULL, 0) == 0, "extindex");
   REQUIRE(kvspaceShmList(kv, "/e/", true, 0, &ns, &n) == 0, "list /e/ ex");
   CHECK(list_has(ns, n, "a") && list_has(ns, n, "b") && list_has(ns, n, "mod"),
         "extindex children");
@@ -361,7 +361,7 @@ static void t_direct_children(const char *db) {
   CHECK(set_int32(kv, "/remote/a/deep/value", 7) == 0, "remote child");
   CHECK(set_int32(kv, "/remote/z/value", 8) == 0, "remote z");
   CHECK(set_int32(kv, "/local/a/value", 9) == 0, "local child");
-  CHECK(kvspaceShmExtindex(kv, "/local/", "/remote/") == 0, "extend index");
+  CHECK(kvspaceShmExtindex(kv, "/local/", "/remote/", NULL, 0) == 0, "extend index");
   const char *extended[] = {"a/", "z"};
   expect_children(kv, "/local/", true, extended, 2);
   const char *local[] = {"a"};
