@@ -3675,15 +3675,27 @@ fail:
     return -1;
 }
 
-int kvspaceShmExtindex(kvspace_t *kv, const char *p, const char *ep) {
+int kvspaceShmExtindex(kvspace_t *kv, const char *p, const char *ep,
+                       char *err, uint32_t err_cap) {
     if (!kv || !p || !ep)
         return -1;
+    /* 对齐 durable ext_index：path 与 ext_path 必须是目录形键（/ 或 · 结尾）。 */
+    if (bad_dir_prefix(p) || bad_dir_prefix(ep)) {
+        if (err && err_cap)
+            snprintf(err, err_cap,
+                     "kvspace: index must end with /: ExtIndex path=%s extpath=%s",
+                     p, ep);
+        return -1;
+    }
     int32_t source_len = 0;
     uint8_t *source = kvspaceShmGet(kv, ep, 0, &source_len);
     kvspaceXh source_head;
     if (!source || source_len <= 0 ||
-        kvspaceXhDecode(source, (uint64_t)source_len, &source_head) != 0)
+        kvspaceXhDecode(source, (uint64_t)source_len, &source_head) != 0) {
+        if (err && err_cap)
+            snprintf(err, err_cap, "ExtIndex target missing: %s", ep);
         return -1;
+    }
     char *type = strndup((const char *)source_head.langtype, source_head.langtype_len);
     if (!type)
         return -1;

@@ -90,7 +90,7 @@ int main(void) {
     CHECK(kvspaceShmSet(kv, "/lib/f/[1,-1]", value, (int32_t)n) == 0);
     CHECK(kvspaceShmSet(kv, "/lib/f/[1,0]", value, (int32_t)n) == 0);
     free(value);
-    CHECK(kvspaceShmExtindex(kv, "/vthread/1/[1]/", "/lib/f/") == 0);
+    CHECK(kvspaceShmExtindex(kv, "/vthread/1/[1]/", "/lib/f/", NULL, 0) == 0);
     CHECK(kvspaceXhNewPtr("int64", "/x", 2, &value, &n) == 0);
     CHECK(kvspaceShmSet(kv, "/vthread/1/[1]/[1,0]", value, (int32_t)n) != 0);
     CHECK(kvspaceShmSetValue(kv, "/vthread/1/[1]/[1,-1]", value,

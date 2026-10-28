@@ -314,9 +314,7 @@ int kvspaceMkindex(void *h, const char *path, uint32_t capacity, char *err,
 
 int kvspaceMkindexExt(void *h, const char *path, const char *ext_path,
                       char *err, uint32_t err_cap) {
-    (void)err;
-    (void)err_cap;
-    return kvspaceShmExtindex((kvspace_t *)h, path, ext_path);
+    return kvspaceShmExtindex((kvspace_t *)h, path, ext_path, err, err_cap);
 }
 
 int kvspaceRmindexExt(void *h, const char *path, char *err, uint32_t err_cap) {
