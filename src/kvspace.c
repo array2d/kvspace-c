@@ -32,14 +32,18 @@
 
 #define KVS_MAGIC "kvspace-c.v5"
 #define ART_PREFIX_MAX 10
-#define ART_NODE_MAX_SZ 2112
-#define ART_SLAB_INIT (256UL * 1024 * 1024)
+/* ART block = one N4/N16 node; N48/N256 take a run of consecutive blocks.
+   The pool only appends (nodes are never freed), so runs are bump-allocated. */
+#define ART_BLOCK_SZ 104
+#define ART_SLAB_INIT (64UL * 1024 * 1024)
 /* blocks_init picks 30-bit ids only if the initial pool holds > 8191 blocks;
    a smaller pool would be capped at 16384 blocks forever. */
 #define SBO_HEAD_POOL_INIT (4UL * 1024 * 1024)
 /* Reserved VA per region: grow in place, base never moves.
    data grows x64 per step; 2^40 fits 8 * 64^6 = 512GB. */
 #define REGION_RESERVE (1ULL << 38)
+/* ART ids are 30-bit: reserve <= 2^30 blocks. */
+#define ART_RESERVE (1ULL << 36)
 #define DATA_RESERVE (1ULL << 40)
 /* Values >= 64KB are level-3+ objects (32KB aligned): punch pages on delete. */
 #define SBO_PUNCH_MIN (64UL * 1024)
@@ -100,6 +104,9 @@ typedef struct {
     int32_t children[256];
 } art_n256_t;
 
+_Static_assert(sizeof(art_n4_t) <= ART_BLOCK_SZ && sizeof(art_n16_t) <= ART_BLOCK_SZ,
+               "N4/N16 must fit one ART block");
+
 static int art_node_sz(int t) {
     return t == ART_N4    ? sizeof(art_n4_t)
            : t == ART_N16 ? sizeof(art_n16_t)
@@ -157,17 +164,18 @@ typedef struct {
     uint64_t garb_freeing;
     uint64_t round_ok, round_aborted, leak_boxes;
     uint32_t claim_seq;        /* 30 位发号；耗尽 open 硬失败 */
-    uint32_t _pad;
+    uint32_t meta_used;        /* set once any ro/vid sidecar is written; never cleared */
     p2_slot_t slots[P2_SLOT_N];
 } kvspace_hdr_t;
 
 #define ART_OFF (sizeof(kvspace_hdr_t) + sizeof(blocks_meta_t))
 
 /* blocks_init fixes the block-head width (30-bit ids) from the initial size. */
-_Static_assert(ART_SLAB_INIT / (ART_NODE_MAX_SZ + 2) > 32767ULL / 4,
+_Static_assert(ART_SLAB_INIT / (ART_BLOCK_SZ + 2) > 32767ULL / 4,
                "ART_SLAB_INIT too small: blockmalloc would pick 14-bit ids");
-_Static_assert(REGION_RESERVE / (ART_NODE_MAX_SZ + 4) <= (1ULL << 30),
-               "REGION_RESERVE too large for 30-bit block ids");
+_Static_assert(ART_RESERVE / (ART_BLOCK_SZ + 8) <= (1ULL << 30),
+               "ART_RESERVE too large for 30-bit block ids");
+_Static_assert((ART_BLOCK_SZ + 8) % 8 == 0, "ART stride must keep 8B alignment");
 _Static_assert(
     SBO_HEAD_POOL_INIT / (sizeof(sbo_box_t) + 2) > 32767ULL / 4,
     "SBO_HEAD_POOL_INIT too small: blockmalloc would pick 14-bit ids");
@@ -593,7 +601,7 @@ static void p2_ack_slot(kvspace_t *kv, uint32_t ep) {
 }
 
 /* 表随 ART slab 增长（容量按当前 block 配置重算）。 */
-#define GEN_RESERVE (64ULL << 20)   /* 64MiB VA 预留：8M 节点 */
+#define GEN_RESERVE (8ULL << 30)    /* 8GiB VA: one gens entry per ART block id */
 static int gens_grow(kvspace_t *kv) {
     uint64_t want = gen_cap(kv) * sizeof(kv_gens_t);
     if (want > GEN_RESERVE)
@@ -1400,12 +1408,32 @@ static void *art_blk(kvspace_t *kv, int32_t id) {
         return NULL;
     return kv->art_data + blockdata_offset(kv->art_meta, (uint64_t)id);
 }
-static int32_t art_balloc(kvspace_t *kv) {
-    int64_t id = blocks_alloc(kv->art_meta, kv->art_data);
-    if (id < 0) {
+/* Bump-allocate k consecutive blocks; the node spans them (interior heads unused). */
+static int64_t art_bump(kvspace_t *kv, uint32_t k) {
+    blocks_meta_t *m = kv->art_meta;
+    spin_lock(&m->lock);
+    uint64_t id = m->malloc_blocks;
+    if ((uint64_t)block_offset(m, id + k) > m->total_size) {
+        spin_unlock(&m->lock);
+        return -1;
+    }
+    m->malloc_blocks += k;
+    m->used_blocks += k;
+    setblock_t(m, kv->art_data + block_offset(m, id), 1, -1);
+    spin_unlock(&m->lock);
+    return (int64_t)id;
+}
+static int32_t art_balloc(kvspace_t *kv, int t) {
+    const uint64_t stride = (uint64_t)kv->art_meta->sizeof_block_head +
+                            kv->art_meta->block_size;
+    const uint32_t k = (uint32_t)(((uint64_t)art_node_sz(t) +
+                                   kv->art_meta->sizeof_block_head + stride - 1) /
+                                  stride);
+    int64_t id = art_bump(kv, k);
+    while (id < 0) {
         if (art_slab_grow(kv) != 0 || gens_grow(kv) != 0)
             return -1;
-        id = blocks_alloc(kv->art_meta, kv->art_data);
+        id = art_bump(kv, k);
     }
     if (id >= 0) {
         kv_gens_t *g = gens_at(kv, (int32_t)id);
@@ -1601,7 +1629,7 @@ static int32_t art_follow(kvspace_t *kv, int32_t id) {
 
 /* ---- node create ---- */
 static int32_t art_new_leaf(kvspace_t *kv, uint64_t off) {
-    int32_t id = art_balloc(kv);
+    int32_t id = art_balloc(kv, ART_N4);
     if (id < 0)
         return -1;
     art_n4_t *x = art_blk(kv, id);
@@ -1611,7 +1639,7 @@ static int32_t art_new_leaf(kvspace_t *kv, uint64_t off) {
     return id;
 }
 static int32_t art_new_node(kvspace_t *kv, int t) {
-    int32_t id = art_balloc(kv);
+    int32_t id = art_balloc(kv, t);
     if (id < 0)
         return -1;
     void *x = art_blk(kv, id);
@@ -2314,7 +2342,7 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
     /* O_TRUNC: sbo_init rejects a stale magic */
     int fl = created ? O_RDWR | O_CREAT | O_TRUNC : O_RDWR;
     if (region_attach(&kv->r_art, created, ART_OFF + art_slab,
-                      REGION_RESERVE) != 0 ||
+                      ART_RESERVE) != 0 ||
         (kv->r_head.fd = open(head_path, fl, 0644)) < 0 ||
         region_attach(&kv->r_head, created, sbo_head, REGION_RESERVE) != 0 ||
         (kv->r_data.fd = open(data_path, fl, 0644)) < 0 ||
@@ -2347,7 +2375,7 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
         kv->hdr->sbo_head_size = sbo_head;
         kv->hdr->sbo_data_size = data_size;
         kv->hdr->art_root = -1;
-        if (blocks_init(kv->art_meta, art_slab, ART_NODE_MAX_SZ) != 0 ||
+        if (blocks_init(kv->art_meta, art_slab, ART_BLOCK_SZ) != 0 ||
             sbo_init(kv->sbo_meta, sbo_head, data_size) != 0)
             goto fail;
         /* blocks_init 按容量选 2/4/8 字节块头。4 字节头 + 8 对齐的块大小使
@@ -3021,11 +3049,14 @@ static int sync_metadata(kvspace_t *kv, const char *key, uint8_t ro, uint32_t vi
     char meta[META_KEY_MAX];
     if (kvspaceMetaKeyInto(key, meta, sizeof meta) != 0)
         return -1;
+    if (!ro && !vid && !__atomic_load_n(&kv->hdr->meta_used, __ATOMIC_ACQUIRE))
+        return 0;   /* no sidecar was ever written: nothing to clear */
     if (ro || vid) {
         uint8_t *value = NULL;
         uint64_t len = 0;
         if (kvspaceMetaEncode(ro, vid, &value, &len) != 0)
             return -1;
+        __atomic_store_n(&kv->hdr->meta_used, 1u, __ATOMIC_RELEASE);
         int rc = shm_set_raw(kv, meta, value, (int32_t)len);
         free(value);
         return rc;

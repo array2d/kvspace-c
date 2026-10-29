@@ -17,7 +17,7 @@ typedef struct kvspace kvspace_t;
 
 /* shm store 格式版本：4 = ART val 原子字 + 垃圾环 + 单写者降级 + 8B 节点对齐。
  * 不兼容旧版本：open 硬失败并提示重建（不迁移）。 */
-#define KVSPACE_FORMAT_VERSION 4
+#define KVSPACE_FORMAT_VERSION 5
 
 /* 对齐 kvspace/include/kvspace/kvspace.h：叶子 + 目录祖先。 */
 typedef struct {
