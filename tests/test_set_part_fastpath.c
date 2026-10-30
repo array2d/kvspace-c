@@ -40,7 +40,7 @@ static void mkpc(char *out, size_t len) {
 static int put(kvspace_t *kv, const char *key, const char *body, uint64_t n) {
     uint8_t *v = NULL;
     uint64_t vl = 0;
-    if (kvspaceXvalueHeadNewSlack( (const uint8_t *)body, n, CAP, &v, &vl) != 0)
+    if (kvspaceXvalueHeadNewSlack( (const uint8_t *)body, n, CAP, "", &v, &vl) != 0)
         return -1;
     int rc = kvspaceShmSet(kv, key, v, (int32_t)vl);
     free(v);

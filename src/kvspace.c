@@ -2537,8 +2537,13 @@ static int read_value(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
         if (l > INT32_MAX)
             return -1;
         *out = s;
-        /* None = 空 body（len 0）；ptr/ext 由 ptr 字段判定（值恒为叶子）。 */
-        *ol = (int32_t)(KVSPACE_XVALUE_HEAD_LEN + l);
+        /* 完整值长 = head + body + attr（attr_len:u16 @8+len 自描述；空 attr=2）。 */
+        if ((uint64_t)sz < KVSPACE_XVALUE_HEAD_LEN + l + 2)
+            return -1;
+        uint64_t alen = kvspaceXvalueHeadAttrLen(s, l);
+        if (alen < 2 || alen > (uint64_t)sz - KVSPACE_XVALUE_HEAD_LEN - l)
+            return -1;
+        *ol = (int32_t)(KVSPACE_XVALUE_HEAD_LEN + l + alen);
         return 0;
     }
     return -1;
@@ -2600,8 +2605,14 @@ static art_hdr_t *resolve_fetch(kvspace_t *kv, const char *path, char *out, int 
         if (head_of(s, (int32_t)sz, &wire) == 0) {
             uint64_t l3 = kvspaceXvalueHeadLen(&wire);
             if (wire.ptr != KVSPACE_XVALUE_PTR_PTR || l3 >= (uint64_t)osz) {
+                /* 完整值长 = head + body + attr（attr_len @8+len 自描述）。 */
+                if ((uint64_t)sz < KVSPACE_XVALUE_HEAD_LEN + l3 + 2)
+                    return NULL;
+                uint64_t alen = kvspaceXvalueHeadAttrLen(s, l3);
+                if (alen < 2 || alen > (uint64_t)sz - KVSPACE_XVALUE_HEAD_LEN - l3)
+                    return NULL;
                 *raw = s;
-                *rl = (int32_t)(KVSPACE_XVALUE_HEAD_LEN + l3);
+                *rl = (int32_t)(KVSPACE_XVALUE_HEAD_LEN + l3 + alen);
                 *fetched = 1;
                 return h;
             }
@@ -3173,7 +3184,7 @@ int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
 
 int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
                             uint8_t storetype, int32_t body_len,
-                            uint64_t body_cap,
+                            uint64_t body_cap, const char *langtype,
                             uint8_t **body) {
     if (!kv || !key || !body || body_len < 0)
         return -1;
@@ -3197,13 +3208,13 @@ int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
     uint8_t *value = NULL;
     uint64_t total = 0;
     if (kvspaceXvalueHeadReserve(storetype, (uint64_t)body_len,
-                                 body_cap, &value, &total) != 0)
+                                 body_cap, langtype, &value, &total) != 0)
         return -1;
     if (total > INT32_MAX) {
         free(value);
         return -1;
     }
-    /* 固定头 8 字节：body 偏移恒 = 8。langtype 由调用方写 x‥langtype attr key。 */
+    /* 固定头 8 字节：body 偏移恒 = 8；langtype 尾部 @8+body_len 整体单写。 */
     uint32_t headlen = KVSPACE_XVALUE_HEAD_LEN;
     (void)ptr;
     int rc = shm_set_raw(kv, key, value, (int32_t)total);
@@ -3630,11 +3641,28 @@ int kvspaceShmExtindex(kvspace_t *kv, const char *p, const char *ep,
             snprintf(err, err_cap, "ExtIndex target missing: %s", ep);
         return -1;
     }
-    /* source 类型在 ep‥langtype attr key（明文事实源）；ext 句柄同样侧写。 */
+    /* source 类型在 ep 值 attr 区（明文事实源）；ext 句柄同样携带。 */
+    char lt[256];
+    const uint8_t *ltd = NULL;
+    uint16_t ltl = 0;
+    if (source_len >= (int32_t)KVSPACE_XVALUE_HEAD_LEN) {
+        kvspaceXvalueHead sh;
+        memcpy(&sh, source, sizeof sh);
+        if (sh.storetype <= KVSPACE_XVALUE_ST_EXT &&
+            sh.ptr <= KVSPACE_XVALUE_PTR_EXT) {
+            uint64_t sbody = kvspaceXvalueHeadLen(&sh);
+            if (sbody <= (uint64_t)source_len - KVSPACE_XVALUE_HEAD_LEN)
+                ltl = kvspaceXvalueHeadLangtype(source, sbody, &ltd);
+        }
+    }
+    if (ltl > (uint16_t)(sizeof lt - 1))
+        ltl = (uint16_t)(sizeof lt - 1);
+    memcpy(lt, ltd, ltl);
+    lt[ltl] = 0;
     uint8_t *v = NULL;
     uint64_t vl = 0;
     int r = kvspaceXvalueHeadNewExt((const uint8_t *)ep, (uint32_t)strlen(ep),
-                                    &v, &vl);
+                                    lt, &v, &vl);
     if (r == 0)
         r = kvspaceShmSetValue(kv, p, v, (int32_t)vl);
     free(v);

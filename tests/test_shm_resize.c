@@ -35,7 +35,7 @@ static int set_bytes(kvspace_t *kv, const char *key, int32_t n, int seed) {
     raw[j] = (uint8_t)(seed + j);
   uint8_t *xv;
   uint64_t dims[1] = {(uint64_t)n}, len = 0;
-  if (kvspaceXvalueHeadNewTensor(dims, 1, raw, (uint64_t)n, &xv, &len) != 0) {
+  if (kvspaceXvalueHeadNewTensor(dims, 1, raw, (uint64_t)n, "", &xv, &len) != 0) {
     free(raw);
     return -1;
   }
