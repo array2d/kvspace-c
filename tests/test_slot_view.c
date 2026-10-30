@@ -22,7 +22,7 @@
 static uint8_t *slack(const char *s, uint64_t *n) {
     uint8_t *v = NULL;
     if (kvspaceXvalueHeadNewSlack( (const uint8_t *)s, strlen(s),
-                          strlen(s), &v, n) != 0)
+                          strlen(s), "", &v, n) != 0)
         return NULL;
     return v;
 }
@@ -88,14 +88,14 @@ int main(void) {
     CHECK(kvspaceShmSet(kv, sk, v, (int32_t)n) != 0);
     free(v);
     uint8_t raw[8] = {1};
-    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, &v, &n) == 0);
+    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, "", &v, &n) == 0);
     CHECK(kvspaceShmSet(kv, sk, v, (int32_t)n) != 0);
     free(v);
 
     /* status 槽（固定头 SLACK）：创建即 view 成功（类型在 attr key，不在 head）。 */
     const char *lk = "/vthread/8/\xE2\x80\xA5status";
     uint8_t *lbody = NULL;
-    CHECK(kvspaceShmWriteNewPlace(kv, lk, 0, KVSPACE_XVALUE_ST_SLACK, 0, 0, &lbody) == 0);
+    CHECK(kvspaceShmWriteNewPlace(kv, lk, 0, KVSPACE_XVALUE_ST_SLACK, 0, 0, "", &lbody) == 0);
     kvspaceRef_t lr;
     memset(&lr, 0, sizeof lr);
     CHECK(kvspaceShmResolveRef(kv, lk, &lr) == 0);
@@ -109,7 +109,7 @@ int main(void) {
     /* 非 SLACK 形态（SHORT）作 status：view -1、写入硬错。 */
     const char *wk = "/vthread/9/\xE2\x80\xA5status";
     uint8_t *wbody = NULL;
-    CHECK(kvspaceShmWriteNewPlace(kv, wk, 0, KVSPACE_XVALUE_ST_SHORT, 0, 0, &wbody) == 0);
+    CHECK(kvspaceShmWriteNewPlace(kv, wk, 0, KVSPACE_XVALUE_ST_SHORT, 0, 0, "", &wbody) == 0);
     kvspaceRef_t wr;
     memset(&wr, 0, sizeof wr);
     CHECK(kvspaceShmResolveRef(kv, wk, &wr) == 0);

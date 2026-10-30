@@ -77,11 +77,11 @@ int kvspaceShmSetValueByRef(kvspace_t *kv, kvspaceRef_t *ref,
 // 覆写）；否则返回非 0。
 int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
                            int32_t body_len, uint8_t **body);
-// WriteNewPlace: 按 (ref, storetype, body_len) 分配新 box、写固定头、
-// 维护父索引，返回 body 指针。langtype 由调用方顺写 x‥langtype attr key。
+// WriteNewPlace: 按 (ref, storetype, body_len, langtype) 分配新 box、写固定头 +
+// langtype 尾部（整体单写）、维护父索引，返回 body 指针。
 int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
                             uint8_t storetype, int32_t body_len,
-                            uint64_t body_cap,
+                            uint64_t body_cap, const char *langtype,
                             uint8_t **body);
 // ListLen: 只返回前缀下子项计数，无缓冲。
 int kvspaceShmListLen(kvspace_t *kv, const char *prefix, bool expand_ext,

@@ -33,7 +33,7 @@ static int set_int32(kvspace_t *kv, const char *key, int32_t v) {
                     (uint8_t)(v >> 24)};
   uint8_t *xv;
   uint64_t n = 0;
-  if (kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 4, &xv, &n) != 0)
+  if (kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 4, "", &xv, &n) != 0)
     return -1;
   int rc = kvspaceShmSet(kv, key, xv, (int32_t)n);
   free(xv);

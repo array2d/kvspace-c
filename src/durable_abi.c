@@ -34,7 +34,7 @@ typedef struct {
     uint64_t body_cap;
 } kvspaceHead_t;
 
-/* 固定 8 字节 head → 元数据（langtype 不在 head，见 kvspaceGetHead attr key）。 */
+/* 固定 8 字节 head → 元数据（langtype 在 body 尾 @8+len，见 kvspaceGetHead）。 */
 static int from_wire_head(const uint8_t *d, uint32_t total, kvspaceHead_t *out) {
     if (!out || !d || total < KVSPACE_XVALUE_HEAD_LEN)
         return 1;
@@ -204,32 +204,20 @@ int kvspaceGetHead(void *h, const char *key, kvspaceHead_t *out) {
         return 1;
     if (from_wire_head(d, (uint32_t)total, out) != 0)
         return 1;
-    /* langtype 在 x‥langtype attr key：值是字符串 XValue（8 字节 head + body=明文
-       类型串），从 body 取 out->langtype。attr 缺失/非 wire 串/空 body =
-       None/无类型（普通值也走 attr，由上层创建时写）。 */
-    char ltkey[1028];
-    int ltn = snprintf(ltkey, sizeof ltkey, "%s\xE2\x80\xA5" "langtype", key);
-    if (ltn < 0 || ltn >= (int)sizeof ltkey)
-        return 1;
-    int32_t ltl = 0;
-    uint8_t *ltd = kvspaceShmGet((kvspace_t *)h, ltkey, 0, &ltl);
-    if (ltd && ltl >= (int32_t)KVSPACE_XVALUE_HEAD_LEN) {
-        kvspaceXvalueHead lth;
-        memcpy(&lth, ltd, sizeof lth);
-        uint64_t body_len = kvspaceXvalueHeadLen(&lth);
-        if (lth.storetype <= KVSPACE_XVALUE_ST_EXT &&
-            lth.ptr <= KVSPACE_XVALUE_PTR_EXT &&
-            body_len <= (uint64_t)ltl - KVSPACE_XVALUE_HEAD_LEN) {
-            size_t take = body_len < (uint64_t)sizeof out->langtype - 1
-                              ? (size_t)body_len
-                              : (size_t)sizeof out->langtype - 1;
-            memcpy(out->langtype, ltd + KVSPACE_XVALUE_HEAD_LEN, take);
-            out->langtype[take] = 0;
-            out->langtype_len = (int32_t)take;
-            return 0;
-        }
+    /* langtype 在 attr 区 tag=1 记录（@8+len 自描述）；无记录 = 无类型。 */
+    uint64_t blen = (uint64_t)out->body_len;
+    const uint8_t *lt = NULL;
+    uint16_t ltl = kvspaceXvalueHeadLangtype(d, blen, &lt);
+    if (lt && ltl > 0) {
+        size_t take = (size_t)ltl < (uint64_t)sizeof out->langtype - 1
+                          ? (size_t)ltl
+                          : (size_t)sizeof out->langtype - 1;
+        memcpy(out->langtype, lt, take);
+        out->langtype[take] = 0;
+        out->langtype_len = (int32_t)take;
+    } else {
+        out->langtype_len = 0;
     }
-    out->langtype_len = 0;
     return 0;
 }
 
@@ -246,14 +234,15 @@ int kvspaceWriteInPlace(void *h, const char *key, int resolve,
     return 0;
 }
 
-/* 新位置写：按 (ref, storetype, body_len, body_cap) 分配 box、写固定头，
- * 返回 body 偏移指针。kvspace 层不写 attr key——`x‥langtype` 归属上层：
- * 调用方需要类型时自写 attr key（attr 先落、x 后落 = 提交点），kvspace 只做裸写。 */
+/* 新位置写：按 (ref, storetype, body_len, body_cap, langtype) 分配 box、写固定头 +
+ * langtype 尾部（整体单写），返回 body 偏移指针。 */
 int kvspaceWriteNewPlace(void *h, const char *key, uint8_t ref,
                          uint8_t storetype, uint32_t body_len, uint64_t body_cap,
+                         const char *langtype,
                          uint8_t **body, char *err, uint32_t err_cap) {
     if (kvspaceShmWriteNewPlace((kvspace_t *)h, key, ref, storetype,
-                                (int32_t)body_len, body_cap, body) != 0) {
+                                (int32_t)body_len, body_cap, langtype,
+                                body) != 0) {
         if (err && err_cap)
             snprintf(err, err_cap, "kvspace: write-new-place failed at %s", key);
         return 1;
@@ -371,42 +360,50 @@ int kvspaceNewPtr(const char *target_kindexpr, const char *target,
                   uint8_t **out, uint32_t *out_len) {
     if (!target_kindexpr || !target || !out || !out_len)
         return 1;
+    /* `any` 不是类型名（空 kindexpr = 不约束）。 */
+    if (strcmp(target_kindexpr, "any") == 0)
+        return 1;
     uint8_t *value = NULL;
     uint64_t total = 0;
     if (kvspaceXvalueHeadNewPtr((const uint8_t *)target,
-                                (uint32_t)strlen(target), &value, &total) != 0)
+                                (uint32_t)strlen(target), target_kindexpr,
+                                &value, &total) != 0)
         return 1;
     return finish(value, total, out, out_len);
 }
 
-int kvspaceNewChar(const uint8_t *bytes, uint32_t len, uint8_t **out, uint32_t *out_len) {
+int kvspaceNewChar(const uint8_t *bytes, uint32_t len, const char *langtype,
+                   uint8_t **out, uint32_t *out_len) {
     uint8_t *value = NULL;
     uint64_t total = 0;
-    int rc = kvspaceXvalueHeadNewSlack(bytes, len, len, &value, &total);
+    int rc = kvspaceXvalueHeadNewSlack(bytes, len, len, langtype, &value, &total);
     return rc == 0 ? finish(value, total, out, out_len) : 1;
 }
 
-int kvspaceNewBool(uint8_t v, uint8_t **out, uint32_t *out_len) {
+int kvspaceNewBool(uint8_t v, const char *langtype,
+                   uint8_t **out, uint32_t *out_len) {
     uint8_t b = v ? 1 : 0;
     uint8_t *value = NULL;
     uint64_t total = 0;
-    int rc = kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, &b, 1,
+    int rc = kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, &b, 1, langtype,
                                         &value, &total);
     return rc == 0 ? finish(value, total, out, out_len) : 1;
 }
 
-int kvspaceNewInt64(int64_t v, uint8_t **out, uint32_t *out_len) {
+int kvspaceNewInt64(int64_t v, const char *langtype,
+                    uint8_t **out, uint32_t *out_len) {
     uint8_t raw[8];
     for (int i = 0; i < 8; i++)
         raw[i] = (uint8_t)((uint64_t)v >> (8 * i));
     uint8_t *value = NULL;
     uint64_t total = 0;
-    int rc = kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8,
+    int rc = kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, langtype,
                                         &value, &total);
     return rc == 0 ? finish(value, total, out, out_len) : 1;
 }
 
-int kvspaceNewFloat64(double v, uint8_t **out, uint32_t *out_len) {
+int kvspaceNewFloat64(double v, const char *langtype,
+                      uint8_t **out, uint32_t *out_len) {
     uint64_t bits;
     memcpy(&bits, &v, sizeof bits);
     uint8_t raw[8];
@@ -414,7 +411,7 @@ int kvspaceNewFloat64(double v, uint8_t **out, uint32_t *out_len) {
         raw[i] = (uint8_t)(bits >> (8 * i));
     uint8_t *value = NULL;
     uint64_t total = 0;
-    int rc = kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8,
+    int rc = kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, langtype,
                                         &value, &total);
     return rc == 0 ? finish(value, total, out, out_len) : 1;
 }
