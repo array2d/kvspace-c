@@ -3574,6 +3574,22 @@ int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
             free(children.keys[i]);
             continue;
         }
+        /* 成员名含 ‥（\xE2\x80\xA5）是系统变量/attr key（`0‥langtype` 等），
+           List 时隐藏——对齐 durable 后端（RUNTIME_MEMBER_SEP 隐藏）。 */
+        {
+            const char *p = children.keys[i];
+            for (; *p; p++) {
+                if ((unsigned char)p[0] == 0xE2 && (unsigned char)p[1] == 0x80 &&
+                    (unsigned char)p[2] == 0xA5) {
+                    free(children.keys[i]);
+                    goto hidden;
+                }
+            }
+        }
+        if (0) {
+hidden:
+            continue;
+        }
         if (unique && same_child(children.keys[unique - 1], children.keys[i])) {
             if (children.keys[i][strlen(children.keys[i]) - 1] == '/') {
                 free(children.keys[unique - 1]);
