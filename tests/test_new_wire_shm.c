@@ -9,6 +9,15 @@
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "failed: %s\n", #x); return 1; } } while (0)
 
+/* 固定 head 8 字节 [len:u48][storetype][ptr]：body 偏移恒 8；
+   类型在 x‥langtype attr key；ro/vid 已删。 */
+
+static int wire_len_of(const uint8_t *stored) {
+    kvspaceXvalueHead h;
+    memcpy(&h, stored, sizeof h);
+    return (int)(KVSPACE_XVALUE_HEAD_LEN + kvspaceXvalueHeadLen(&h));
+}
+
 int main(void) {
     char dir[] = "/tmp/kvspace-new-wire-XXXXXX";
     CHECK(mkdtemp(dir) != NULL);
@@ -19,35 +28,26 @@ int main(void) {
     uint8_t *value = NULL;
     uint64_t n = 0;
     uint8_t raw[8] = {42};
-    CHECK(kvspaceXhNewScalar("int64", raw, 8, &value, &n) == 0);
+    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8,
+                                     &value, &n) == 0);
+    CHECK(n == 16);
     CHECK(kvspaceShmSet(kv, "/x", value, (int32_t)n) == 0);
     free(value);
     int32_t got = 0;
     uint8_t *stored = kvspaceShmGet(kv, "/x", 0, &got);
-    kvspaceXh head;
-    CHECK(stored && got == 40 && kvspaceXhDecode(stored, got, &head) == 0 &&
-          head.body[0] == 42);
+    CHECK(stored && got == 16 && stored[8] == 42);
 
-    CHECK(kvspaceXhNewPtr("int64", "/x", 2, &value, &n) == 0);
+    CHECK(kvspaceXvalueHeadNewPtr((const uint8_t *)"/x", 2, &value, &n) == 0);
     CHECK(kvspaceShmSet(kv, "/p", value, (int32_t)n) == 0);
     free(value);
     stored = kvspaceShmGet(kv, "/p", 1, &got);
-    CHECK(stored && got == 40 && kvspaceXhDecode(stored, got, &head) == 0 &&
-          head.body[0] == 42);
+    CHECK(stored && got == 16 && stored[8] == 42);
 
-    /* 空 kindexpr = 不约束：Ptr 目标为空，读写往返保留 ref 位与空 langtype。 */
-    CHECK(kvspaceXhNewPtr("", "/x", 2, &value, &n) == 0);
-    CHECK(kvspaceShmSet(kv, "/pe", value, (int32_t)n) == 0);
-    free(value);
-    stored = kvspaceShmGet(kv, "/pe", 0, &got);
-    CHECK(stored && got > 0 && kvspaceXhDecode(stored, got, &head) == 0 &&
-          head.kind == (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG) &&
-          head.langtype_len == 0 && head.content_len == 2);
-
-    CHECK(kvspaceXhNewShort("[int64]·int64", NULL, 0, &value, &n) == 0);
+    CHECK(kvspaceXvalueHeadNewNone(&value, &n) == 0);
     CHECK(kvspaceShmSet(kv, "/m", value, (int32_t)n) == 0);
     free(value);
-    CHECK(kvspaceXhNewScalar("int64", raw, 8, &value, &n) == 0);
+    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8,
+                                     &value, &n) == 0);
     CHECK(kvspaceShmSet(kv, "/m·[0]", value, (int32_t)n) == 0);
     free(value);
     char **names = NULL;
@@ -67,47 +67,41 @@ int main(void) {
         char member[32];
         snprintf(member, sizeof member, "%s·[0]", base);
         stored = kvspaceShmGet(kv, member, 0, &got);
-        CHECK(stored && kvspaceXhDecode(stored, got, &head) == 0 &&
-              head.body[0] == 42);
+        CHECK(stored && stored[8] == 42);
     }
     CHECK(kvspaceShmGet(kv, "/m-tree·", 0, &got) == NULL);
     CHECK(kvspaceShmGet(kv, "/m-list·", 0, &got) == NULL);
 
-    CHECK(kvspaceXhNewShort("rwfunc", NULL, 0, &value, &n) == 0);
-    CHECK(kvspaceShmSetValue(kv, "/fn/", value, (int32_t)n, 1, 7) == 0);
+    CHECK(kvspaceXvalueHeadNewNone(&value, &n) == 0);
+    CHECK(kvspaceShmSetValue(kv, "/fn/", value, (int32_t)n) == 0);
     free(value);
     CHECK(kvspaceShmMkindex(kv, "/fn/", 0) == 0);
-    stored = kvspaceShmGet(kv, "/fn/", 0, &got);
-    CHECK(stored && kvspaceXhDecode(stored, got, &head) == 0 &&
-          head.langtype_len == 6 && memcmp(head.langtype, "rwfunc", 6) == 0);
-    uint8_t ro = 0;
-    uint32_t vid = 0;
-    CHECK(kvspaceShmMetaGet(kv, "/fn/", &ro, &vid) == 0 && ro == 1 && vid == 7);
 
     CHECK(kvspaceShmMkindex(kv, "/lib/f/", 0) == 0);
     const uint8_t code[] = {0, 0, 0, 0, 0, 'x'};
-    CHECK(kvspaceXhNewCode("rwir", code, sizeof code, sizeof code, &value, &n) == 0);
+    CHECK(kvspaceXvalueHeadNewCode(code, sizeof code, sizeof code,
+                                   &value, &n) == 0);
     CHECK(kvspaceShmSet(kv, "/lib/f/[1,-1]", value, (int32_t)n) == 0);
     CHECK(kvspaceShmSet(kv, "/lib/f/[1,0]", value, (int32_t)n) == 0);
     free(value);
     CHECK(kvspaceShmExtindex(kv, "/vthread/1/[1]/", "/lib/f/", NULL, 0) == 0);
-    CHECK(kvspaceXhNewPtr("int64", "/x", 2, &value, &n) == 0);
+    CHECK(kvspaceXvalueHeadNewPtr((const uint8_t *)"/x", 2, &value, &n) == 0);
     CHECK(kvspaceShmSet(kv, "/vthread/1/[1]/[1,0]", value, (int32_t)n) != 0);
     CHECK(kvspaceShmSetValue(kv, "/vthread/1/[1]/[1,-1]", value,
-                             (int32_t)n, 0, 0) == 0);
+                             (int32_t)n) == 0);
     free(value);
     stored = kvspaceShmGet(kv, "/vthread/1/[1]/[1,-1]", 0, &got);
-    CHECK(stored && kvspaceXhDecode(stored, got, &head) == 0 &&
-          head.kind == (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG));
+    CHECK(stored != NULL);
+    kvspaceXvalueHead wh;
+    memcpy(&wh, stored, sizeof wh);
+    CHECK(wh.storetype == KVSPACE_XVALUE_ST_SLACK &&
+          wh.ptr == KVSPACE_XVALUE_PTR_PTR);
 
-    CHECK(kvspaceXhNewScalar("int64", raw, 8, &value, &n) == 0);
+    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8,
+                                     &value, &n) == 0);
     CHECK(kvspaceShmSetValue(kv, "/vthread/1/[1]/[1,-1]", value,
-                             (int32_t)n, 1, 23) == 0);
-    CHECK(kvspaceShmMetaGetAt(kv, "/vthread/1/[1]/[1,-1]", &ro, &vid) == 0 &&
-          ro == 1 && vid == 23);
+                             (int32_t)n) == 0);
     CHECK(kvspaceShmSet(kv, "/vthread/1/[1]/[1,-1]", value, (int32_t)n) == 0);
-    CHECK(kvspaceShmMetaGetAt(kv, "/vthread/1/[1]/[1,-1]", &ro, &vid) == 0 &&
-          ro == 0 && vid == 0);
     CHECK(kvspaceShmSet(kv, "/vthread/1/[1]/[1,-1]/child", value,
                         (int32_t)n) == 0);
     CHECK(kvspaceShmDel(kv, "/vthread/1/[1]/[1,-1]") == 0);
@@ -118,51 +112,47 @@ int main(void) {
     CHECK(kvspaceShmWriteInPlace(kv, "/x", 0, 8, &body) == 0);
     body[0] = 43;
     stored = kvspaceShmGet(kv, "/x", 0, &got);
-    CHECK(stored && kvspaceXhDecode(stored, got, &head) == 0 && head.body[0] == 43);
+    CHECK(stored && stored[8] == 43);
 
-    CHECK(kvspaceShmWriteNewPlace(kv, "/fresh", 0, KVSPACE_XH_FIXED_SMALL,
-                                  1, 19, "int64", 8, 8, &body) == 0);
+    CHECK(kvspaceShmWriteNewPlace(kv, "/fresh", 0, KVSPACE_XVALUE_ST_SHORT,
+                                  8, 8, &body) == 0);
     memcpy(body, raw, 8);
     stored = kvspaceShmGet(kv, "/fresh", 0, &got);
-    CHECK(stored && kvspaceXhDecode(stored, got, &head) == 0 && head.body[0] == 42);
-    CHECK(kvspaceShmMetaGet(kv, "/fresh", &ro, &vid) == 0 && ro == 1 && vid == 19);
+    CHECK(stored && stored[8] == 42);
     CHECK(kvspaceShmCp(kv, "/fresh", "/fresh-copy") == 0);
-    CHECK(kvspaceShmMetaGet(kv, "/fresh-copy", &ro, &vid) == 0 && ro == 1 && vid == 19);
     CHECK(kvspaceShmCptree(kv, "/fresh", "/fresh-tree") == 0);
-    CHECK(kvspaceShmMetaGet(kv, "/fresh-tree", &ro, &vid) == 0 && ro == 1 && vid == 19);
 
     static const uint8_t utf8[] = {0xc3, 0xa9, 'a'};
-    CHECK(kvspaceShmWriteNewPlace(kv, "/text", 0, KVSPACE_XH_SLACK,
-                                  0, 0, "[2]char/utf8", 3, 9, &body) == 0);
+    CHECK(kvspaceShmWriteNewPlace(kv, "/text", 0, KVSPACE_XVALUE_ST_SLACK,
+                                  3, 3, &body) == 0);
     memcpy(body, utf8, sizeof utf8);
     stored = kvspaceShmGet(kv, "/text", 0, &got);
-    CHECK(stored && kvspaceXhDecode(stored, got, &head) == 0 && head.a == 3 &&
-          head.b == 9 && got == 73 &&
-          memcmp(head.body, utf8, sizeof utf8) == 0);
+    CHECK(stored && wire_len_of(stored) == 3 + KVSPACE_XVALUE_HEAD_LEN &&
+          memcmp(stored + KVSPACE_XVALUE_HEAD_LEN, utf8, sizeof utf8) == 0);
     body[0] = 0xff;
-    CHECK(kvspaceShmGet(kv, "/text", 0, &got) == NULL);
-    CHECK(kvspaceShmGet(kv, "/text", 1, &got) == NULL);
+    /* 固定头存储层不校验 UTF-8（码点校验移明文层按 attr key 类型做）——可读回。 */
+    CHECK(kvspaceShmGet(kv, "/text", 0, &got) != NULL);
     body[0] = utf8[0];
     CHECK(kvspaceShmGet(kv, "/text", 1, &got) != NULL);
 
     uint8_t boolean = 1;
-    CHECK(kvspaceXhNewScalar("bool", &boolean, 1, &value, &n) == 0);
+    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, &boolean, 1,
+                                     &value, &n) == 0);
     CHECK(kvspaceShmSet(kv, "/flag", value, (int32_t)n) == 0);
     free(value);
     stored = kvspaceShmGet(kv, "/flag", 0, &got);
-    CHECK(stored && kvspaceXhDecode(stored, got, &head) == 0);
-    uint8_t *flag_body = (uint8_t *)head.body;
+    CHECK(stored != NULL);
+    uint8_t *flag_body = stored + KVSPACE_XVALUE_HEAD_LEN;
     flag_body[0] = 2;
-    CHECK(kvspaceShmGet(kv, "/flag", 0, &got) == NULL);
-    CHECK(kvspaceShmGet(kv, "/flag", 1, &got) == NULL);
+    /* 存储层不校验 bool 值域（明文层按 attr key 类型校验）——可读回。 */
+    CHECK(kvspaceShmGet(kv, "/flag", 0, &got) != NULL);
     flag_body[0] = 1;
     CHECK(kvspaceShmGet(kv, "/flag", 1, &got) != NULL);
     kvspaceShmClose(kv);
     unlink(path);
     char extra[144];
-    snprintf(extra, sizeof extra, "%s.sbo.head", path); unlink(extra);
-    snprintf(extra, sizeof extra, "%s.sbo.data", path); unlink(extra);
-    rmdir(dir);
+    snprintf(extra, sizeof extra, "rm -rf %s", dir);
+    CHECK(system(extra) == 0);
     puts("ok");
     return 0;
 }

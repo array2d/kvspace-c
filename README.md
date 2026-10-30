@@ -27,24 +27,22 @@ Two surfaces:
    `kvspaceConnect/Close/Disconnect`, `kvspaceGet` (zero-copy borrow) `/WriteInPlace/WriteNewPlace`,
    `kvspaceListLen/ListAt/Del/DelTree/Cp/CpTree`,
    `kvspaceMkindex/MkindexExt/RmindexExt/Watch/Clear`,
-   `kvspaceXvalueEncode/XvalueEncodeMode/DecodeHead`,
    `kvspaceNewPtr/NewChar/NewBool/NewInt64/NewFloat64`.
 
    A consumer (e.g. the kvlang layout) links this ABI and switches backends by DSN only, with no code change.
 
 ## XValue
 
-kindexpr XValue uses the headlenpow wire format:
+Fixed 8-byte head wire format (`#566`), read/written by direct `memcpy` of the
+`kvspaceXvalueHead` struct:
 
 ```
-[pow:u8][flags:u8][a:u64le][b:u64le][langtype, padded to 2^pow][body]
+[len:u48 le @0-5][storetype:u8 @6][ptr:u8 @7][body @8]
 ```
 
-- The low two flag bits select fixed, sized, tensor, or extension storage; bit 2 marks a pointer.
-- Directory members come from physical key prefixes. `@ext` stores its locator in class 3.
-- `ro` and `vid` live at `/.kvspace-meta/<hex-encoded key>`.
-
-The codec accepts `None`, scalars, sized uint8 and character arrays, tensors, maps, and code values.
+- storetype selects short, slack, large, or extension storage; ptr marks pointer/ext.
+- langtype (kindexpr) is not in the head — it lives in the `x‥langtype` attr key.
+- The head is built with `kvspaceXvalueHeadNew*` constructors.
 
 ## Tutorial
 

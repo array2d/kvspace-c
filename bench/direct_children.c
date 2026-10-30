@@ -74,9 +74,9 @@ int main(int argc, char **argv) {
     kvspace_t *kv = kvspaceShmOpen(argv[1], SBO_DATA_SIZE);
     if (!kv)
         return 1;
-    uint8_t value[4] = {1}, *encoded = NULL;
+    uint8_t value[4] = {1}, *xv = NULL;
     uint64_t size = 0;
-    if (kvspaceXhNewScalar("int32", value, sizeof value, &encoded, &size) != 0)
+    if (kvspaceXhNewScalar("int32", value, sizeof value, &xv, &size) != 0)
         return 1;
     for (int i = 0; i < values; i++) {
         char key[1024];
@@ -85,11 +85,11 @@ int main(int argc, char **argv) {
         else
             snprintf(key, sizeof key, "/bench/%05d/deep/%05d/value",
                      i % groups, i);
-        if (kvspaceShmSet(kv, key, encoded, (int32_t)size) != 0 ||
+        if (kvspaceShmSet(kv, key, xv, (int32_t)size) != 0 ||
             (i < tombstones && kvspaceShmDel(kv, key) != 0))
             return 1;
     }
-    free(encoded);
+    free(xv);
     int expected = tombstones == VALUES ? 0 : groups;
     char **names = NULL;
     int32_t count = 0;

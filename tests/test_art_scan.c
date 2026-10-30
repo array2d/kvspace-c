@@ -40,7 +40,7 @@ static int set_int32(kvspace_t *kv, const char *key, int32_t v) {
                     (uint8_t)(v >> 24)};
   uint8_t *xv;
   uint64_t n = 0;
-  if (kvspaceXhNewScalar("int32", raw, 4, &xv, &n) != 0)
+  if (kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 4, &xv, &n) != 0)
     return -1;
   int rc = kvspaceShmSet(kv, key, xv, (int32_t)n);
   free(xv);
@@ -52,11 +52,13 @@ static int32_t get_int32(kvspace_t *kv, const char *key) {
   uint8_t *d = kvspaceShmGet(kv, key, 1, &len);
   if (!d || len <= 0)
     return -1;
-  kvspaceXh h;
-  if (kvspaceXhDecode(d, (uint64_t)len, &h) != 0 || h.content_len != 4)
+  kvspaceXvalueHead h;
+  memcpy(&h, d, sizeof h);
+  if (kvspaceXvalueHeadLen(&h) != 4 || 0 /* reserved 并入 len */)
     return -1;
-  return (int32_t)((uint32_t)h.body[0] | ((uint32_t)h.body[1] << 8) |
-                   ((uint32_t)h.body[2] << 16) | ((uint32_t)h.body[3] << 24));
+  const uint8_t *b = d + KVSPACE_XVALUE_HEAD_LEN;
+  return (int32_t)((uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+                   ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24));
 }
 
 static void list_free(char **ns, int32_t n) {
@@ -97,34 +99,24 @@ static void t_correct(const char *db) {
   uint8_t raw[4] = {7};
   uint8_t *permitted = NULL;
   uint64_t permitted_len = 0;
-  CHECK(kvspaceXhNewScalar("int32", raw, 4, &permitted, &permitted_len) == 0 &&
-            kvspaceShmSetValue(kv, "/private", permitted, (int32_t)permitted_len, 1, 42) == 0,
+  CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 4, &permitted, &permitted_len) == 0 &&
+            kvspaceShmSetValue(kv, "/private", permitted,
+                               (int32_t)permitted_len) == 0,
         "set permitted value");
   free(permitted);
-  uint8_t ro = 0;
-  uint32_t vid = 0;
-  CHECK(kvspaceShmMetaGet(kv, "/private", &ro, &vid) == 0 &&
-            ro == 1 && vid == 42, "read sidecar");
   CHECK(kvspaceShmCp(kv, "/private", "/private_copy") == 0,
         "copy permitted value");
-  CHECK(kvspaceShmMetaGet(kv, "/private_copy", &ro, &vid) == 0 &&
-            ro == 1 && vid == 42, "copy sidecar");
   CHECK(kvspaceShmDel(kv, "/private_copy") == 0, "delete copied value");
-  CHECK(kvspaceShmMetaGet(kv, "/private_copy", &ro, &vid) == 0 &&
-            ro == 0 && vid == 0, "delete copied sidecar");
 
   uint8_t *ptr = NULL;
   uint64_t ptr_len = 0;
-  CHECK(kvspaceXhNewPtr("int32", "/private", 8, &ptr, &ptr_len) == 0 &&
-            kvspaceShmSetValue(kv, "/link", ptr, (int32_t)ptr_len, 1, 17) == 0,
-        "set pointer metadata");
+  CHECK(kvspaceXvalueHeadNewPtr((const uint8_t *)"/private", 8,
+                                &ptr, &ptr_len) == 0 &&
+            kvspaceShmSetValue(kv, "/link", ptr, (int32_t)ptr_len) == 0,
+        "set pointer");
   free(ptr);
   CHECK(kvspaceShmCp(kv, "/link", "/link_copy") == 0,
-        "copy pointer metadata");
-  CHECK(kvspaceShmMetaGetAt(kv, "/link_copy", &ro, &vid) == 0 &&
-            ro == 1 && vid == 17, "copy pointer slot metadata");
-  CHECK(kvspaceShmMetaGet(kv, "/link_copy", &ro, &vid) == 0 &&
-            ro == 1 && vid == 42, "resolve pointer target metadata");
+        "copy pointer");
 
   char **ns;
   int32_t n;
@@ -173,34 +165,26 @@ static void t_correct(const char *db) {
   list_free(ns, n);
 
   CHECK(set_int32(kv, "/private", 8) == 0, "overwrite permitted value");
-  CHECK(kvspaceShmMetaGet(kv, "/private", &ro, &vid) == 0 &&
-            ro == 0 && vid == 0, "clear sidecar on overwrite");
   uint8_t *body = NULL;
-  CHECK(kvspaceShmWriteNewPlace(kv, "/private", 0, KVSPACE_XH_FIXED_SMALL,
-                                1, 7, "int32", 4, 4, &body) == 0,
+  CHECK(kvspaceShmWriteNewPlace(kv, "/private", 0, KVSPACE_XVALUE_ST_SHORT,
+                                4, 4, &body) == 0,
         "write new permitted place");
   if (body)
     memcpy(body, raw, 4);
-  CHECK(kvspaceShmMetaGet(kv, "/private", &ro, &vid) == 0 &&
-            ro == 1 && vid == 7, "write-new sidecar");
   CHECK(kvspaceShmDel(kv, "/private") == 0, "delete private value");
-  CHECK(kvspaceShmMetaGet(kv, "/private", &ro, &vid) == 0 &&
-            ro == 0 && vid == 0, "delete sidecar");
 
   permitted = NULL;
   permitted_len = 0;
-  CHECK(kvspaceXhNewScalar("int32", raw, 4, &permitted, &permitted_len) == 0 &&
-            kvspaceShmSetValue(kv, "/tree/a", permitted, (int32_t)permitted_len, 1, 11) == 0,
-        "set tree metadata");
+  CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 4,
+                                   &permitted, &permitted_len) == 0 &&
+            kvspaceShmSetValue(kv, "/tree/a", permitted,
+                               (int32_t)permitted_len) == 0,
+        "set tree value");
   free(permitted);
   CHECK(kvspaceShmCptree(kv, "/tree", "/tree_copy") == 0,
-        "copy tree metadata");
-  CHECK(kvspaceShmMetaGet(kv, "/tree_copy/a", &ro, &vid) == 0 &&
-            ro == 1 && vid == 11, "copied tree sidecar");
+        "copy tree");
   CHECK(kvspaceShmDeltree(kv, "/tree_copy") == 0,
         "delete copied tree");
-  CHECK(kvspaceShmMetaGet(kv, "/tree_copy/a", &ro, &vid) == 0 &&
-            ro == 0 && vid == 0, "deleted tree sidecar");
 
   CHECK(kvspaceShmMkindex(kv, "/lib/", 0) == 0, "new directory value");
   CHECK(kvspaceShmExtindex(kv, "/e/", "/lib/", NULL, 0) == 0, "extindex");

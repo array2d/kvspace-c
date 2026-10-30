@@ -33,7 +33,7 @@ static int set_int32(kvspace_t *kv, const char *key, int32_t v) {
                     (uint8_t)(v >> 24)};
   uint8_t *xv;
   uint64_t n = 0;
-  if (kvspaceXhNewScalar("int32", raw, 4, &xv, &n) != 0)
+  if (kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 4, &xv, &n) != 0)
     return -1;
   int rc = kvspaceShmSet(kv, key, xv, (int32_t)n);
   free(xv);
@@ -45,11 +45,13 @@ static int32_t get_int32(kvspace_t *kv, const char *key) {
   uint8_t *d = kvspaceShmGet(kv, key, 1, &len);
   if (!d || len <= 0)
     return -1;
-  kvspaceXh h;
-  if (kvspaceXhDecode(d, (uint64_t)len, &h) != 0 || h.content_len != 4)
+  kvspaceXvalueHead h;
+  memcpy(&h, d, sizeof h);
+  if (kvspaceXvalueHeadLen(&h) != 4 || 0 /* reserved 并入 len */)
     return -1;
-  return (int32_t)((uint32_t)h.body[0] | ((uint32_t)h.body[1] << 8) |
-                   ((uint32_t)h.body[2] << 16) | ((uint32_t)h.body[3] << 24));
+  const uint8_t *b = d + KVSPACE_XVALUE_HEAD_LEN;
+  return (int32_t)((uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+                   ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24));
 }
 
 /* returns failure count */

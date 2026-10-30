@@ -7,7 +7,7 @@
 //! kv.mkindex("/t/", 0);
 //! kv.set("/t/x", &xvalue::int64(42));
 //! let v = kv.get("/t/x").unwrap();
-//! assert_eq!(xvalue::kind(&v), "int64");
+//! assert_eq!(xvalue::from_wire(&v), (0, 0, &[42, 0, 0, 0, 0, 0, 0, 0][..]));
 //! ```
 
 use std::ffi::{CStr, CString};
@@ -51,155 +51,171 @@ mod ffi {
             path: *const c_char,
             extpath: *const c_char,
         ) -> i32;
-        // Codec (kvspace ABI, no handle) — the single source of wire truth.
-        pub fn kvspaceXvalueEncodeMode(
-            kind: *const c_char,
+        // Head 构造（#566：head 固定 8 字节 [len:u48][storetype][ptr]，直接 memcpy
+        // struct + body——构造器输出 frontend malloc，由调用方 free）。
+        pub fn kvspaceXvalueHeadNewScalar(
+            storetype: u8,
             raw: *const u8,
             raw_len: u32,
-            dims: *const i32,
-            ndim: i32,
-            r#ref: i32,
-            ro: u8,
-            vid: u32,
             out: *mut *mut u8,
-            out_len: *mut u32,
+            out_len: *mut u64,
         ) -> i32;
-        pub fn kvspaceDecodeHead(data: *const u8, data_len: u32, out: *mut kvspaceHead_t) -> i32;
+        pub fn kvspaceXvalueHeadNewSlack(
+            data: *const u8,
+            data_len: u64,
+            cap: u64,
+            out: *mut *mut u8,
+            out_len: *mut u64,
+        ) -> i32;
+        pub fn kvspaceXvalueHeadNewPtr(
+            path: *const u8,
+            path_len: u32,
+            out: *mut *mut u8,
+            out_len: *mut u64,
+        ) -> i32;
+        pub fn kvspaceXvalueHeadNewExt(
+            locator: *const u8,
+            locator_len: u32,
+            out: *mut *mut u8,
+            out_len: *mut u64,
+        ) -> i32;
         // Codec output is frontend malloc; release it with libc free.
         pub fn free(p: *mut std::ffi::c_void);
     }
-
-    #[repr(C)]
-    pub struct kvspaceHead_t {
-        pub headlen: u16,
-        pub r#ref: u8,
-        pub storetype: u8,
-        pub ro: u8,
-        pub vid: u32,
-        pub body_len: i32,
-        pub ndim: i32,
-        pub dims: [i32; 8],
-        pub langtype: [u8; 256],
-        pub langtype_len: i32,
-        pub body_offset: i32,
-        pub body_cap: u64,
-    }
 }
 
-// ── xvalue 编解码 helpers ──────────────────────────────────────
+// ── xvalue helpers ─────────────────────────────────────────────
 //
-// 编解码一律委托权威 C codec（kvspaceXvalueEncodeMode / kvspaceDecodeHead），
-// 本地不再复刻 wire 布局。wire：[pow:u8][flags:u8][a:u64le][b:u64le][langtype][padding][body]，
-// headlen = 1 << pow，flags 低 2 位为 storage class、bit2 为指针位。
+// #566：head 固定 8 字节 [len:u48][storetype][ptr]，body 偏移恒 8。直接 memcpy
+// struct + body——构造走 C 构造器 kvspaceXvalueHeadNew*，读取本地 memcpy 固定头 + 字段访问。
+// langtype 不在 head（x‥langtype attr key），固定头读取只给存储元数据。
 
 pub mod xvalue {
     use super::ffi;
     use super::*;
 
-    /// langtype 起于固定前缀偏移（KVSPACE_XH_PREFIX）。
-    const XH_PREFIX: usize = 18;
-    /// 存储位置：与 KVSPACE_REF_* 对齐。
-    pub const REF_INLINE: i32 = 0;
-    pub const REF_PTR: i32 = 1;
-    pub const REF_EXT: i32 = 2;
+    pub const ST_SHORT: u8 = 0;
+    pub const ST_SLACK: u8 = 1;
+    pub const ST_EXT: u8 = 3;
+    pub const PTR_INLINE: u8 = 0;
+    pub const PTR_PTR: u8 = 1;
+    pub const PTR_EXT: u8 = 2;
+    pub const HEAD_LEN: usize = 8;
 
-    /// 编码 XValue head+body：绑定 C codec `kvspaceXvalueEncodeMode`。
-    /// dims 落形状（tensor），ref 选存储位置（inline/ptr/ext）。
-    fn xvalue_encode(kind: &str, raw: &[u8], dims: &[i32], r#ref: i32) -> Vec<u8> {
-        let ckind = CString::new(kind).expect("kind 含 NUL");
-        let rp = if raw.is_empty() { ptr::null() } else { raw.as_ptr() };
-        let dp = if dims.is_empty() { ptr::null() } else { dims.as_ptr() };
+    /// 取 C 构造器 malloc 输出（to_vec 后 free）。
+    fn take(out: *mut u8, total: u64) -> Vec<u8> {
+        let bytes = unsafe { std::slice::from_raw_parts(out, total as usize).to_vec() };
+        unsafe { ffi::free(out as *mut std::ffi::c_void) };
+        bytes
+    }
+
+    pub fn int64(v: i64) -> Vec<u8> {
         let mut out: *mut u8 = ptr::null_mut();
-        let mut len: u32 = 0;
+        let mut total: u64 = 0;
+        let raw = v.to_le_bytes();
         let rc = unsafe {
-            ffi::kvspaceXvalueEncodeMode(
-                ckind.as_ptr(),
-                rp,
-                raw.len() as u32,
-                dp,
-                dims.len() as i32,
-                r#ref,
-                0,
-                0,
+            ffi::kvspaceXvalueHeadNewScalar(ST_SHORT, raw.as_ptr(), 8, &mut out, &mut total)
+        };
+        if rc != 0 {
+            return Vec::new();
+        }
+        take(out, total)
+    }
+    pub fn float64(v: f64) -> Vec<u8> {
+        let mut out: *mut u8 = ptr::null_mut();
+        let mut total: u64 = 0;
+        let raw = v.to_le_bytes();
+        let rc = unsafe {
+            ffi::kvspaceXvalueHeadNewScalar(ST_SHORT, raw.as_ptr(), 8, &mut out, &mut total)
+        };
+        if rc != 0 {
+            return Vec::new();
+        }
+        take(out, total)
+    }
+    pub fn string(s: &str) -> Vec<u8> {
+        let mut out: *mut u8 = ptr::null_mut();
+        let mut total: u64 = 0;
+        let rc = unsafe {
+            ffi::kvspaceXvalueHeadNewSlack(
+                s.as_ptr(),
+                s.len() as u64,
+                s.len() as u64,
                 &mut out,
-                &mut len,
+                &mut total,
             )
         };
         if rc != 0 {
             return Vec::new();
         }
-        let bytes = unsafe { std::slice::from_raw_parts(out, len as usize).to_vec() };
-        unsafe { ffi::free(out as *mut std::ffi::c_void) };
-        bytes
+        take(out, total)
     }
-
-    /// 剥掉纯数字 `[dims]` 段取 base kind；含 `·` 的 map langtype 整串即基 kind（不剥）。
-    fn kx_base(kx: &str) -> &str {
-        if kx.contains('·') {
-            return kx;
-        }
-        if let Some(rest) = kx.strip_prefix('[') {
-            if let Some(end) = rest.find(']') {
-                let inner = &kx[1..end + 1];
-                if inner.split(',').all(|d| d.is_empty() || d.parse::<i32>().is_ok()) {
-                    return &kx[end + 2..];
-                }
-            }
-        }
-        kx
-    }
-
-    pub fn int64(v: i64) -> Vec<u8> {
-        xvalue_encode("int64", &v.to_le_bytes(), &[], REF_INLINE)
-    }
-    pub fn float64(v: f64) -> Vec<u8> {
-        xvalue_encode("float64", &v.to_le_bytes(), &[], REF_INLINE)
-    }
-    pub fn string(s: &str) -> Vec<u8> {
-        xvalue_encode("char/utf8", s.as_bytes(), &[], REF_INLINE)
-    }
-    /// 目录值。旧 `index` 值类型已由「值/索引分离」移除，现行目录值 kind 为 `lib`。
+    /// 目录值（空 body 的 SHORT 头）。
     pub fn index() -> Vec<u8> {
-        xvalue_encode("lib", &[], &[], REF_INLINE)
-    }
-    /// 指针值（ptr 位）：body = 目标 key，langtype = 目标 kindexpr。
-    pub fn link(target: &str) -> Vec<u8> {
-        xvalue_encode("lib", target.as_bytes(), &[], REF_PTR)
-    }
-    /// 外部定位符（EXT class）：body = locator，langtype = 目标 kindexpr。
-    pub fn ext(locator: &str) -> Vec<u8> {
-        xvalue_encode("lib", locator.as_bytes(), &[], REF_EXT)
-    }
-
-    /// 解码 head → (kind, array_len, raw)：绑定 C codec `kvspaceDecodeHead`，借用 data。
-    pub fn decode(data: &[u8]) -> (&str, i32, &[u8]) {
-        if data.is_empty() {
-            return ("", 0, &[]);
-        }
-        let mut h: ffi::kvspaceHead_t = unsafe { std::mem::zeroed() };
-        if unsafe { ffi::kvspaceDecodeHead(data.as_ptr(), data.len() as u32, &mut h) } != 0 {
-            return ("", 0, &[]);
-        }
-        let lt_end = XH_PREFIX + h.langtype_len.max(0) as usize;
-        let langtype = data
-            .get(XH_PREFIX..lt_end)
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .unwrap_or("");
-        let kind = kx_base(langtype);
-        let dims = &h.dims[..h.ndim.clamp(0, 8) as usize];
-        let array_len: i32 = if dims.is_empty() {
-            1
-        } else {
-            dims.iter().product()
+        let mut out: *mut u8 = ptr::null_mut();
+        let mut total: u64 = 0;
+        let rc = unsafe {
+            ffi::kvspaceXvalueHeadNewScalar(ST_SHORT, ptr::null(), 0, &mut out, &mut total)
         };
-        let off = h.body_offset.max(0) as usize;
-        let blen = h.body_len.max(0) as usize;
-        let raw = data.get(off..off + blen).unwrap_or(&[]);
-        (kind, array_len, raw)
+        if rc != 0 {
+            return Vec::new();
+        }
+        take(out, total)
+    }
+    /// 指针值（ptr 位）：body = 目标 key。langtype 由调用方写 x‥langtype attr key。
+    pub fn link(target: &str) -> Vec<u8> {
+        let mut out: *mut u8 = ptr::null_mut();
+        let mut total: u64 = 0;
+        let rc = unsafe {
+            ffi::kvspaceXvalueHeadNewPtr(target.as_ptr(), target.len() as u32, &mut out, &mut total)
+        };
+        if rc != 0 {
+            return Vec::new();
+        }
+        take(out, total)
+    }
+    /// 外部定位符（EXT class）：body = locator。langtype 由调用方写 x‥langtype attr key。
+    pub fn ext(locator: &str) -> Vec<u8> {
+        let mut out: *mut u8 = ptr::null_mut();
+        let mut total: u64 = 0;
+        let rc = unsafe {
+            ffi::kvspaceXvalueHeadNewExt(
+                locator.as_ptr(),
+                locator.len() as u32,
+                &mut out,
+                &mut total,
+            )
+        };
+        if rc != 0 {
+            return Vec::new();
+        }
+        take(out, total)
     }
 
-    pub fn kind(data: &[u8]) -> String {
-        decode(data).0.to_string()
+    /// 读固定头 → (ref, storetype, body)。ref 由 ptr 位推导；body 借用 data。
+    /// langtype 不在 head，kind 无从解析（读 x‥langtype attr key 是调用方的事）。
+    pub fn from_wire(data: &[u8]) -> (u8, u8, &[u8]) {
+        if data.len() < HEAD_LEN {
+            return (0, 0, &[]);
+        }
+        let len6 = &data[..6];
+        let mut body_len: u64 = 0;
+        for (i, b) in len6.iter().enumerate() {
+            body_len |= (*b as u64) << (8 * i);
+        }
+        let storetype = data[6];
+        let ptr = data[7];
+        if storetype > ST_EXT || ptr > PTR_EXT || HEAD_LEN + body_len as usize > data.len() {
+            return (0, 0, &[]);
+        }
+        let r#ref = if ptr == PTR_PTR {
+            1
+        } else if ptr == PTR_EXT {
+            2
+        } else {
+            0
+        };
+        (r#ref, storetype, &data[HEAD_LEN..])
     }
 }
 

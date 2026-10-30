@@ -52,9 +52,6 @@ void kvspaceShmClose(kvspace_t *kv);
 // Get: resolve=1 穿透 link，resolve=0 返回 link 本身。
 uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
                        int32_t *out_len);
-int kvspaceShmMetaGet(kvspace_t *kv, const char *key, uint8_t *ro, uint32_t *vid);
-int kvspaceShmMetaGetAt(kvspace_t *kv, const char *key, uint8_t *ro, uint32_t *vid);
-
 int kvspaceShmResolveRef(kvspace_t *kv, const char *key, kvspaceRef_t *ref);
 uint8_t *kvspaceShmGetByRef(kvspace_t *kv, kvspaceRef_t *ref,
                             const char *key_fallback, int32_t *out_len);
@@ -69,22 +66,21 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
 int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
                   int32_t val_len);
 int kvspaceShmSetValue(kvspace_t *kv, const char *key, const uint8_t *val,
-                       int32_t val_len, uint8_t ro, uint32_t vid);
+                       int32_t val_len);
 /* 整值写 by cached ref：ref 失效时退回 key 的完整 SetValue 并重解析。 */
 int kvspaceShmSetValueByRef(kvspace_t *kv, kvspaceRef_t *ref,
                             const char *key_fallback, const uint8_t *val,
-                            int32_t val_len, uint8_t ro, uint32_t vid);
+                            int32_t val_len);
 
 // 零拷贝写原语——返回 SHM 常驻 body 偏移指针供调用方直接写；写即持久，无收尾。
 // WriteInPlace: key 必须已存在、body_len 必须等于原 body_len（同 kind
 // 覆写）；否则返回非 0。
 int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
                            int32_t body_len, uint8_t **body);
-// WriteNewPlace: 按 (ref, storetype, ro, vid, langtype, body_len) 分配新 box、
-// 写好 head、维护父索引，返回 body 指针。
+// WriteNewPlace: 按 (ref, storetype, body_len) 分配新 box、写固定头、
+// 维护父索引，返回 body 指针。langtype 由调用方顺写 x‥langtype attr key。
 int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
-                            uint8_t storetype, uint8_t ro, uint32_t vid,
-                            const char *langtype, int32_t body_len,
+                            uint8_t storetype, int32_t body_len,
                             uint64_t body_cap,
                             uint8_t **body);
 // ListLen: 只返回前缀下子项计数，无缓冲。

@@ -13,3 +13,13 @@ rust/target/
 
 # CodeGraph 索引（本地知识图，不入库）
 .codegraph/
+
+# 本地实验区（复制源码 + 构建产物，不入库）
+experiments/
+
+# CLI/测试冒烟 store 产物
+smoke
+smoke.garb
+smoke.gen
+smoke.sbo.data
+smoke.sbo.head

@@ -21,7 +21,7 @@ static int failures;
 static int set_i64(kvspace_t *kv, const char *key, int64_t v) {
   uint8_t *xv;
   uint64_t n = 0;
-  if (kvspaceXhNewScalar("int64", (const uint8_t *)&v, 8, &xv, &n) != 0)
+  if (kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, (const uint8_t *)&v, 8, &xv, &n) != 0)
     return -1;
   int rc = kvspaceShmSet(kv, key, xv, (int32_t)n);
   free(xv);
@@ -31,11 +31,13 @@ static int set_i64(kvspace_t *kv, const char *key, int64_t v) {
 static int64_t get_i64(const uint8_t *d, int32_t len) {
   if (!d || len <= 0)
     return -999;
-  kvspaceXh h;
-  if (kvspaceXhDecode(d, (uint64_t)len, &h) != 0 || h.content_len != 8)
+  kvspaceXvalueHead h;
+  memcpy(&h, d, sizeof h);
+  if (kvspaceXvalueHeadLen(&h) != 8 || 0 /* reserved 并入 len */)
     return -999;
+  const uint8_t *b = d + KVSPACE_XVALUE_HEAD_LEN;
   uint64_t v = 0;
-  for (int i = 0; i < 8; i++) v |= (uint64_t)h.body[i] << (i * 8);
+  for (int i = 0; i < 8; i++) v |= (uint64_t)b[i] << (i * 8);
   return (int64_t)v;
 }
 
@@ -93,15 +95,13 @@ int main(void) {
   kvspaceRef_t pr;
   CHECK(kvspaceShmResolveRef(kv, "/p", &pr) == 0);
   d = kvspaceShmGet(kv, "/p", 0, &len);
-  CHECK(d && len > 8);
-  kvspaceXh hh;
-  CHECK(kvspaceXhDecode(d, (uint64_t)len, &hh) == 0);
+  CHECK(d && len > KVSPACE_XVALUE_HEAD_LEN);
   int64_t nv = 200;
   uint8_t raw[8];
   for (int i = 0; i < 8; i++)
     raw[i] = (uint8_t)((uint64_t)nv >> (8 * i));
   CHECK(kvspaceShmSetPartByRef(kv, &pr, "/p",
-                               hh.headlen, raw,
+                               KVSPACE_XVALUE_HEAD_LEN, raw,
                                8) == 0);
   d = kvspaceShmGetByRef(kv, &pr, "/p", &len);
   CHECK(get_i64(d, len) == 200);
