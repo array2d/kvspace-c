@@ -35,7 +35,7 @@ static int set_bytes(kvspace_t *kv, const char *key, int32_t n, int seed) {
     raw[j] = (uint8_t)(seed + j);
   uint8_t *xv;
   uint64_t dims[1] = {(uint64_t)n}, len = 0;
-  if (kvspaceXhNewTensor(dims, 1, "uint8", raw, (uint64_t)n, &xv, &len) != 0) {
+  if (kvspaceXvalueHeadNewTensor(dims, 1, raw, (uint64_t)n, &xv, &len) != 0) {
     free(raw);
     return -1;
   }
@@ -51,11 +51,13 @@ static int check_bytes(kvspace_t *kv, const char *key, int32_t n, int seed) {
   uint8_t *d = kvspaceShmGet(kv, key, 1, &len);
   if (!d || len <= 0)
     return 1;
-  kvspaceXh h;
-  if (kvspaceXhDecode(d, (uint64_t)len, &h) != 0 || h.content_len != (uint64_t)n)
+  kvspaceXvalueHead h;
+  memcpy(&h, d, sizeof h);
+  if (kvspaceXvalueHeadLen(&h) != (uint32_t)n || 0 /* reserved 并入 len */)
     return 2;
+  const uint8_t *b = d + KVSPACE_XVALUE_HEAD_LEN;
   for (int32_t j = 0; j < n; j++)
-    if (h.body[j] != (uint8_t)(seed + j))
+    if (b[j] != (uint8_t)(seed + j))
       return 3;
   return 0;
 }

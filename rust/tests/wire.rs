@@ -1,83 +1,77 @@
-//! Wrapper ↔ C codec 双向对拍。
+//! Wrapper ↔ C 构造器双向对拍。
 //!
-//! wrapper 编码 → C 权威 `kvspaceDecodeHead` 解头；
-//! C 权威 `kvspaceXvalueEncode(Mode)` 编码 → wrapper `xvalue::decode` 解头。
-//! 断言 langtype / body / storage class / 指针位一致。
-
-use std::ffi::c_void;
-use std::os::raw::c_char;
+//! #566：head 固定 8 字节 [len:u48][storetype][ptr]，body 偏移恒 8。直接 memcpy
+//! struct + body——C 侧权威是 kvspaceXvalueHeadNew* 构造器；Rust 侧 xvalue::* 走同一构造器，
+//! from_wire 本地 memcpy 固定头 + 字段访问。断言 storetype/ref(ptr)/body 一致。
 
 use kvspace_c::xvalue;
 
-#[repr(C)]
-struct Head {
-    headlen: u16,
-    r#ref: u8,
-    storetype: u8,
-    ro: u8,
-    vid: u32,
-    body_len: i32,
-    ndim: i32,
-    dims: [i32; 8],
-    langtype: [u8; 256],
-    langtype_len: i32,
-    body_offset: i32,
-    body_cap: u64,
-}
-
 extern "C" {
-    fn kvspaceXvalueEncodeMode(
-        kind: *const c_char,
+    fn kvspaceXvalueHeadNewScalar(
+        storetype: u8,
         raw: *const u8,
         raw_len: u32,
-        dims: *const i32,
-        ndim: i32,
-        r#ref: i32,
-        ro: u8,
-        vid: u32,
         out: *mut *mut u8,
-        out_len: *mut u32,
+        out_len: *mut u64,
     ) -> i32;
-    fn kvspaceDecodeHead(data: *const u8, data_len: u32, out: *mut Head) -> i32;
-    fn free(p: *mut c_void);
+    fn kvspaceXvalueHeadNewPtr(
+        path: *const u8,
+        path_len: u32,
+        out: *mut *mut u8,
+        out_len: *mut u64,
+    ) -> i32;
+    fn kvspaceXvalueHeadNewExt(
+        locator: *const u8,
+        locator_len: u32,
+        out: *mut *mut u8,
+        out_len: *mut u64,
+    ) -> i32;
+    fn free(p: *mut std::ffi::c_void);
 }
 
-/// C 侧编码（独立 oracle）。
-fn c_encode(kind: &str, raw: &[u8], dims: &[i32], r#ref: i32) -> Vec<u8> {
-    let ck = std::ffi::CString::new(kind).unwrap();
-    let rp = if raw.is_empty() { std::ptr::null() } else { raw.as_ptr() };
-    let dp = if dims.is_empty() { std::ptr::null() } else { dims.as_ptr() };
+/// C 侧构造（独立 oracle）：(storetype, ptr, body) → 8 字节固定头 + body。
+fn c_new(storetype: u8, ptr: u8, body: &[u8]) -> Vec<u8> {
     let mut out: *mut u8 = std::ptr::null_mut();
-    let mut len: u32 = 0;
-    let rc = unsafe {
-        kvspaceXvalueEncodeMode(
-            ck.as_ptr(),
-            rp,
-            raw.len() as u32,
-            dp,
-            dims.len() as i32,
-            r#ref,
-            0,
-            0,
-            &mut out,
-            &mut len,
-        )
+    let mut total: u64 = 0;
+    let rc = match ptr {
+        xvalue::PTR_INLINE if body.is_empty() => unsafe {
+            kvspaceXvalueHeadNewScalar(storetype, std::ptr::null(), 0, &mut out, &mut total)
+        },
+        xvalue::PTR_INLINE => unsafe {
+            kvspaceXvalueHeadNewScalar(storetype, body.as_ptr(), body.len() as u32, &mut out, &mut total)
+        },
+        xvalue::PTR_PTR => unsafe {
+            kvspaceXvalueHeadNewPtr(body.as_ptr(), body.len() as u32, &mut out, &mut total)
+        },
+        xvalue::PTR_EXT => unsafe {
+            kvspaceXvalueHeadNewExt(body.as_ptr(), body.len() as u32, &mut out, &mut total)
+        },
+        _ => panic!("bad ptr {ptr}"),
     };
-    assert_eq!(rc, 0, "c_encode({kind}) 失败");
-    let v = unsafe { std::slice::from_raw_parts(out, len as usize).to_vec() };
-    unsafe { free(out as *mut c_void) };
+    assert_eq!(rc, 0, "c_new(st={storetype}, ptr={ptr}) 失败");
+    let v = unsafe { std::slice::from_raw_parts(out, total as usize).to_vec() };
+    unsafe { free(out as *mut std::ffi::c_void) };
     v
 }
 
-/// C 侧解码；返回 (ref, storetype, langtype, body)。
-fn c_decode(data: &[u8]) -> (u8, u8, String, Vec<u8>) {
-    let mut h: Head = unsafe { std::mem::zeroed() };
-    let rc = unsafe { kvspaceDecodeHead(data.as_ptr(), data.len() as u32, &mut h) };
-    assert_eq!(rc, 0, "c_decode 失败");
-    let lt = String::from_utf8_lossy(&h.langtype[..h.langtype_len.max(0) as usize]).into_owned();
-    let off = h.body_offset.max(0) as usize;
-    let blen = h.body_len.max(0) as usize;
-    (h.r#ref, h.storetype, lt, data[off..off + blen].to_vec())
+/// 本地解析固定头 → (ref, storetype, body)。
+fn c_peek(data: &[u8]) -> (u8, u8, &[u8]) {
+    assert!(data.len() >= xvalue::HEAD_LEN, "短于 8 字节头");
+    let mut body_len: u64 = 0;
+    for (i, b) in data[..6].iter().enumerate() {
+        body_len |= (*b as u64) << (8 * i);
+    }
+    let storetype = data[6];
+    let ptr = data[7];
+    assert_eq!(xvalue::HEAD_LEN + body_len as usize, data.len(), "总长不匹配");
+    let r#ref = if ptr == xvalue::PTR_PTR {
+        1
+    } else if ptr == xvalue::PTR_EXT {
+        2
+    } else {
+        0
+    };
+    (r#ref, storetype, &data[xvalue::HEAD_LEN..])
 }
 
 struct Checker {
@@ -95,92 +89,85 @@ impl Checker {
 }
 
 #[test]
-fn wrapper_encode_c_decodes() {
+fn wrapper_reads_c_peeks() {
     let mut c = Checker { failures: 0 };
 
     let raw = 42i64.to_le_bytes();
-    let (r, st, lt, body) = c_decode(&xvalue::int64(42));
+    let enc = xvalue::int64(42);
+    let (r, st, body) = c_peek(&enc);
     c.eq("int64.ref", r, 0);
-    c.eq("int64.class", st, 0);
-    c.eq("int64.langtype", lt, "int64".to_string());
-    c.eq("int64.body", body, raw.to_vec());
+    c.eq("int64.storetype", st, 0);
+    c.eq("int64.body", body.to_vec(), raw.to_vec());
 
-    let (r, st, lt, _) = c_decode(&xvalue::float64(1.5));
+    let enc = xvalue::float64(1.5);
+    let (r, st, body) = c_peek(&enc);
     c.eq("float64.ref", r, 0);
-    c.eq("float64.class", st, 0);
-    c.eq("float64.langtype", lt, "float64".to_string());
+    c.eq("float64.storetype", st, 0);
+    c.eq("float64.body", body.to_vec(), 1.5f64.to_le_bytes().to_vec());
 
     let s = "héllo"; // 5 chars, 6 bytes
-    let (r, st, lt, body) = c_decode(&xvalue::string(s));
+    let enc = xvalue::string(s);
+    let (r, st, body) = c_peek(&enc);
     c.eq("str.ref", r, 0);
-    c.eq("str.class", st, 1); // slack
-    c.eq("str.langtype", lt, "[5]char/utf8".to_string());
-    c.eq("str.body", body, s.as_bytes().to_vec());
+    c.eq("str.storetype", st, 1); // slack
+    c.eq("str.body", body.to_vec(), s.as_bytes().to_vec());
 
-    let (r, st, lt, body) = c_decode(&xvalue::index());
+    let enc = xvalue::index();
+    let (r, st, body) = c_peek(&enc);
     c.eq("index.ref", r, 0);
-    c.eq("index.class", st, 0);
-    c.eq("index.langtype", lt, "lib".to_string());
-    c.eq("index.body", body, Vec::<u8>::new());
+    c.eq("index.storetype", st, 0);
+    c.eq("index.body", body.to_vec(), Vec::<u8>::new());
 
-    let (r, st, lt, body) = c_decode(&xvalue::link("/t/x"));
+    let enc = xvalue::link("/t/x");
+    let (r, st, body) = c_peek(&enc);
     c.eq("link.ref", r, 1); // ptr
-    c.eq("link.class", st, 1); // slack|ptr
-    c.eq("link.langtype", lt, "lib".to_string());
-    c.eq("link.body", body, b"/t/x".to_vec());
+    c.eq("link.storetype", st, 1); // slack|ptr
+    c.eq("link.body", body.to_vec(), b"/t/x".to_vec());
 
-    let (r, st, lt, body) = c_decode(&xvalue::ext("s3://b/k"));
+    let enc = xvalue::ext("s3://b/k");
+    let (r, st, body) = c_peek(&enc);
     c.eq("ext.ref", r, 2); // ext
-    c.eq("ext.class", st, 3);
-    c.eq("ext.langtype", lt, "lib".to_string());
-    c.eq("ext.body", body, b"s3://b/k".to_vec());
+    c.eq("ext.storetype", st, 3);
+    c.eq("ext.body", body.to_vec(), b"s3://b/k".to_vec());
 
     assert_eq!(c.failures, 0, "{} 项失败", c.failures);
 }
 
 #[test]
-fn c_encode_wrapper_decodes() {
+fn c_new_wrapper_reads() {
     let mut c = Checker { failures: 0 };
 
     let raw = 7i64.to_le_bytes();
-    let enc = c_encode("int64", &raw, &[], 0);
-    let (k, al, body) = xvalue::decode(&enc);
-    c.eq("int64.kind", k.to_string(), "int64".to_string());
-    c.eq("int64.al", al, 1);
+    let enc = c_new(xvalue::ST_SHORT, xvalue::PTR_INLINE, &raw);
+    let (r, st, body) = xvalue::from_wire(&enc);
+    c.eq("int64.ref", r, 0);
+    c.eq("int64.storetype", st, 0);
     c.eq("int64.body", body.to_vec(), raw.to_vec());
 
-    let enc = c_encode("char/utf8", "héllo".as_bytes(), &[], 0);
-    let (k, al, body) = xvalue::decode(&enc);
-    c.eq("str.kind", k.to_string(), "char/utf8".to_string());
-    c.eq("str.al", al, 5);
+    let enc = c_new(xvalue::ST_SLACK, xvalue::PTR_INLINE, "héllo".as_bytes());
+    let (r, st, body) = xvalue::from_wire(&enc);
+    c.eq("str.ref", r, 0);
+    c.eq("str.storetype", st, 1);
     c.eq("str.body", body.to_vec(), "héllo".as_bytes().to_vec());
 
-    // tensor：dims 落形状，class 2。
-    let raw48: Vec<u8> = (0..48u8).collect();
-    let t = c_encode("int64", &raw48, &[2, 3], 0);
-    let (r, st, lt, _) = c_decode(&t);
-    c.eq("tensor.ref", r, 0);
-    c.eq("tensor.class", st, 2);
-    c.eq("tensor.langtype", lt, "[2,3]int64".to_string());
-    let (k, al, body) = xvalue::decode(&t);
-    c.eq("tensor.kind", k.to_string(), "int64".to_string());
-    c.eq("tensor.al", al, 6);
-    c.eq("tensor.body", body.to_vec(), raw48);
-
-    // 指针：C 侧 ref=1。
-    let enc = c_encode("lib", b"/t/x", &[], 1);
-    let (k, _, body) = xvalue::decode(&enc);
-    c.eq("ptr.kind", k.to_string(), "lib".to_string());
+    // 指针：ptr 位 1。
+    let enc = c_new(xvalue::ST_SLACK, xvalue::PTR_PTR, b"/t/x");
+    let (r, _, body) = xvalue::from_wire(&enc);
+    c.eq("ptr.ref", r, 1);
     c.eq("ptr.body", body.to_vec(), b"/t/x".to_vec());
 
-    // kind() 便捷。
-    c.eq("kind()", xvalue::kind(&xvalue::int64(1)), "int64".to_string());
+    // 外部定位符：ptr 位 2。
+    let enc = c_new(xvalue::ST_EXT, xvalue::PTR_EXT, b"s3://b/k");
+    let (r, st, body) = xvalue::from_wire(&enc);
+    c.eq("ext.ref", r, 2);
+    c.eq("ext.storetype", st, 3);
+    c.eq("ext.body", body.to_vec(), b"s3://b/k".to_vec());
 
     // 垃圾输入 → 空。
     let garbage = [0u8, 1, 2, 3];
-    let (k, al, body) = xvalue::decode(&garbage);
-    c.eq("garbage.kind", k.to_string(), String::new());
-    c.eq("garbage.al", al, 0);
+    let (r, st, body) = xvalue::from_wire(&garbage);
+    c.eq("garbage.ref", r, 0);
+    c.eq("garbage.storetype", st, 0);
     c.eq("garbage.body", body.to_vec(), Vec::<u8>::new());
 
     assert_eq!(c.failures, 0, "{} 项失败", c.failures);

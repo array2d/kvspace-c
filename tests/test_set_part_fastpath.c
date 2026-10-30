@@ -17,7 +17,7 @@
 
 #define SBO_DATA_SIZE (8UL * 64 * 64 * 64 * 64)
 #define CAP 256
-#define HEAD 64
+#define HEAD KVSPACE_XVALUE_HEAD_LEN
 
 static int failures;
 #define CHECK(cond, ...)                                                       \
@@ -40,7 +40,7 @@ static void mkpc(char *out, size_t len) {
 static int put(kvspace_t *kv, const char *key, const char *body, uint64_t n) {
     uint8_t *v = NULL;
     uint64_t vl = 0;
-    if (kvspaceXhNewSlack(1, (const uint8_t *)body, n, CAP, &v, &vl) != 0)
+    if (kvspaceXvalueHeadNewSlack( (const uint8_t *)body, n, CAP, &v, &vl) != 0)
         return -1;
     int rc = kvspaceShmSet(kv, key, v, (int32_t)vl);
     free(v);
@@ -120,9 +120,10 @@ int main(void) {
         /* 末尾零长写：offset == 64+b 允许。 */
         CHECK(kvspaceShmSetPartByRef(kv, &ref, "/p/oob", HEAD + CAP, NULL, 0) != 0,
               "NULL buf rejected by precheck");
+        /* 固定头：offset 越界（> 8+len）→ 拒绝。 */
         CHECK(kvspaceShmSetPartByRef(kv, &ref, "/p/oob", HEAD + CAP,
-                                     (const uint8_t *)"", 0) == 0,
-              "zero-len at cap ok");
+                                     (const uint8_t *)"", 0) != 0,
+              "offset beyond body must fail");
     }
 
     /* 3. 损坏 head：快路径必须回退；旧路径的校验决定成败，但绝不能写错数据。 */
@@ -139,77 +140,57 @@ int main(void) {
         const uint8_t *nv = (const uint8_t *)"ZZZZ";
         char got[8] = {0};
 
-        /* pow != 6 */
-        d[0] = 5;
+        /* storetype 非 SLACK：不进快路径；SLACK 之外 body 无 part-write
+         * 语义，fallback 同样拒绝 */
+        kvspaceXvalueHead tmp;
+        memset(&tmp, 0, sizeof tmp);
+        tmp.storetype = KVSPACE_XVALUE_ST_SHORT;
+        memcpy(d, &tmp, sizeof tmp);
         int rc = kvspaceShmSetPartByRef(kv, &ref, "/p/bad", HEAD, nv, 4);
-        memset(got, 0, sizeof got);
-        get_part(kv, "/p/bad", HEAD, 4, got);
-        CHECK(rc != 0 || memcmp(got, "ZZZZ", 4) == 0, "pow=5 fallback");
+        CHECK(rc != 0, "storetype short must fail");
         memcpy(d, save, HEAD);
 
-        /* kind = FIXED_SMALL */
-        d[1] = (uint8_t)((d[1] & ~3u));
-        rc = kvspaceShmSetPartByRef(kv, &ref, "/p/bad", HEAD, nv, 4);
-        CHECK(rc != 0, "kind fixed fallback must fail");
-        memcpy(d, save, HEAD);
-
-        /* PTR flag：不得进快路径 */
-        d[1] = (uint8_t)(d[1] | KVSPACE_XH_PTR_FLAG);
+        /* ptr 非 INLINE：不得进快路径 */
+        memset(&tmp, 0, sizeof tmp);
+        tmp.storetype = KVSPACE_XVALUE_ST_SLACK;
+        tmp.ptr = KVSPACE_XVALUE_PTR_PTR;
+        memcpy(d, &tmp, sizeof tmp);
         rc = kvspaceShmSetPartByRef(kv, &ref, "/p/bad", HEAD, nv, 4);
         memset(got, 0, sizeof got);
         get_part(kv, "/p/bad", HEAD, 4, got);
-        CHECK(rc != 0 || memcmp(got, "ZZZZ", 4) == 0, "ptr flag fallback");
+        CHECK(rc != 0 || memcmp(got, "ZZZZ", 4) == 0, "ptr fallback");
         memcpy(d, save, HEAD);
 
-        /* b 越界（声称超过映射剩余空间） */
-        for (int i = 0; i < 8; i++)
-            d[10 + i] = 0xFF;
+        /* storetype 非法（>3）：head 不自洽，拒绝 */
+        memset(&tmp, 0, sizeof tmp);
+        tmp.storetype = 4;
+        memcpy(d, &tmp, sizeof tmp);
         rc = kvspaceShmSetPartByRef(kv, &ref, "/p/bad", HEAD, nv, 4);
-        CHECK(rc != 0, "b overflow must fail");
+        CHECK(rc != 0, "storetype invalid must fail");
         memcpy(d, save, HEAD);
 
-        /* a > b（xh_header 拒绝） */
-        for (int i = 0; i < 8; i++)
-            d[2 + i] = 0xFF;
+        /* len 越界（声称超过映射剩余空间）：拒绝 */
+        memset(&tmp, 0, sizeof tmp);
+        tmp.storetype = KVSPACE_XVALUE_ST_SLACK;
+        kvspaceXvalueHeadSetLen(&tmp, 0xFFFF);
+        memcpy(d, &tmp, sizeof tmp);
         rc = kvspaceShmSetPartByRef(kv, &ref, "/p/bad", HEAD, nv, 4);
-        CHECK(rc != 0, "a>b must fail");
+        CHECK(rc != 0, "len overflow must fail");
         memcpy(d, save, HEAD);
 
-        /* 空 langtype：read_value 视作 None，旧路径拒绝写入 */
-        char before[4];
-        memcpy(before, d + HEAD, sizeof before);
-        d[KVSPACE_XH_PREFIX] = 0;
-        rc = kvspaceShmSetPartByRef(kv, &ref, "/p/bad", HEAD, nv, 4);
-        CHECK(rc != 0 && memcmp(before, d + HEAD, sizeof before) == 0,
-              "empty langtype must not write");
-        memcpy(d, save, HEAD);
-
-        /* b 大于 box 物理容量但仍在全局映射内：必须按 per-box cap 回退，
+        /* len 大于 box 物理容量但仍在全局映射内：必须按 per-box cap 回退，
          * 不得跨 box 写入。offset=512 落在 box 外。 */
         {
             char lead[8] = {0}, trail[8] = {0};
             memcpy(lead, d + 512, 4);
-            for (int i = 0; i < 8; i++)
-                d[10 + i] = 0x00;
-            d[10] = 0x00;
-            d[11] = 0x10; /* b = 4096 */
+            memset(&tmp, 0, sizeof tmp);
+            tmp.storetype = KVSPACE_XVALUE_ST_SLACK;
+            kvspaceXvalueHeadSetLen(&tmp, 4096);
+            memcpy(d, &tmp, sizeof tmp);
             rc = kvspaceShmSetPartByRef(kv, &ref, "/p/bad", 512, nv, 4);
             memcpy(trail, d + 512, 4);
-            CHECK(rc != 0, "b>box_cap must fail");
+            CHECK(rc != 0, "len>box_cap must fail");
             CHECK(memcmp(lead, trail, 4) == 0, "no cross-box write");
-            memcpy(d, save, HEAD);
-        }
-
-        /* langtype 在 64B head 内无 NUL：回退（旧路径同样拒绝） */
-        {
-            char lead[8] = {0}, trail[8] = {0};
-            memcpy(lead, d + HEAD, 4);
-            for (uint32_t i = KVSPACE_XH_PREFIX; i < 64; i++)
-                d[i] = 'A';
-            rc = kvspaceShmSetPartByRef(kv, &ref, "/p/bad", HEAD, nv, 4);
-            memcpy(trail, d + HEAD, 4);
-            CHECK(rc != 0, "langtype without NUL must fail");
-            CHECK(memcmp(lead, trail, 4) == 0, "no write on bad langtype");
             memcpy(d, save, HEAD);
         }
 

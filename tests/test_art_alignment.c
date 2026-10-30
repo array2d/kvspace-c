@@ -25,7 +25,7 @@
 
 static uint8_t *slack(const char *s, uint64_t *n) {
     uint8_t *v = NULL;
-    if (kvspaceXhNewSlack(KVSPACE_XH_UTF8, (const uint8_t *)s, strlen(s),
+    if (kvspaceXvalueHeadNewSlack( (const uint8_t *)s, strlen(s),
                           strlen(s), &v, n) != 0)
         return NULL;
     return v;

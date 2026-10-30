@@ -21,7 +21,7 @@
 
 static uint8_t *slack(const char *s, uint64_t *n) {
     uint8_t *v = NULL;
-    if (kvspaceXhNewSlack(KVSPACE_XH_UTF8, (const uint8_t *)s, strlen(s),
+    if (kvspaceXvalueHeadNewSlack( (const uint8_t *)s, strlen(s),
                           strlen(s), &v, n) != 0)
         return NULL;
     return v;
@@ -48,9 +48,9 @@ int main(void) {
     CHECK(kvspaceShmXvalueBodyView(kv, &r, "/a/s", &view) == 0);
     CHECK(view.head && view.body == view.head + view.headlen);
     CHECK(view.cap >= view.headlen && view.body_cap == view.cap - view.headlen);
-    kvspaceXh xh;
-    CHECK(kvspaceXhDecode(view.head, view.cap, &xh) == 0);
-    CHECK(xh.content_len <= view.body_cap);
+    kvspaceXvalueHead xh;
+    memcpy(&xh, view.head, sizeof xh);
+    CHECK(kvspaceXvalueHeadLen(&xh) <= view.body_cap);
 
     /* key_fallback 必填：NULL → -1。 */
     kvspaceXvalueBodyView_t nv;
@@ -67,7 +67,7 @@ int main(void) {
     CHECK(kvspaceShmXvalueBodyView(kv, &r, sk, &view) == 0);
     uint8_t *head0 = view.head, *body0 = view.body;
     uint64_t cap0 = view.cap;
-    CHECK(view.headlen == (1u << KVSPACE_XH_POW_SLACK));
+    CHECK(view.headlen == KVSPACE_XVALUE_HEAD_LEN);
     CHECK(view.body_cap >= 16);
 
     for (int i = 0; i < 100000; i++) {
@@ -88,30 +88,28 @@ int main(void) {
     CHECK(kvspaceShmSet(kv, sk, v, (int32_t)n) != 0);
     free(v);
     uint8_t raw[8] = {1};
-    CHECK(kvspaceXhNewScalar("int64", raw, 8, &v, &n) == 0);
+    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, &v, &n) == 0);
     CHECK(kvspaceShmSet(kv, sk, v, (int32_t)n) != 0);
     free(v);
 
-    /* 旧小 cap status 槽：view -1，写入硬错。 */
+    /* status 槽（固定头 SLACK）：创建即 view 成功（类型在 attr key，不在 head）。 */
     const char *lk = "/vthread/8/\xE2\x80\xA5status";
     uint8_t *lbody = NULL;
-    CHECK(kvspaceShmWriteNewPlace(kv, lk, 0, KVSPACE_XH_SLACK, 0, 0,
-                                  "[3]char/utf8", 0, 0, &lbody) == 0);
+    CHECK(kvspaceShmWriteNewPlace(kv, lk, 0, KVSPACE_XVALUE_ST_SLACK, 0, 0, &lbody) == 0);
     kvspaceRef_t lr;
     memset(&lr, 0, sizeof lr);
     CHECK(kvspaceShmResolveRef(kv, lk, &lr) == 0);
     kvspaceXvalueBodyView_t lv;
-    CHECK(kvspaceShmXvalueBodyView(kv, &lr, lk, &lv) == -1);
+    CHECK(kvspaceShmXvalueBodyView(kv, &lr, lk, &lv) == 0);
     v = slack("init", &n);
     CHECK(v != NULL);
-    CHECK(kvspaceShmSet(kv, lk, v, (int32_t)n) != 0);
+    CHECK(kvspaceShmSet(kv, lk, v, (int32_t)n) == 0);
     free(v);
 
-    /* 旧槽同 headlen 但 langtype 非 [n]char/utf8：view -1、写入硬错。 */
+    /* 非 SLACK 形态（SHORT）作 status：view -1、写入硬错。 */
     const char *wk = "/vthread/9/\xE2\x80\xA5status";
     uint8_t *wbody = NULL;
-    CHECK(kvspaceShmWriteNewPlace(kv, wk, 0, KVSPACE_XH_SLACK, 0, 0,
-                                  "[3]char/ascii", 0, 16, &wbody) == 0);
+    CHECK(kvspaceShmWriteNewPlace(kv, wk, 0, KVSPACE_XVALUE_ST_SHORT, 0, 0, &wbody) == 0);
     kvspaceRef_t wr;
     memset(&wr, 0, sizeof wr);
     CHECK(kvspaceShmResolveRef(kv, wk, &wr) == 0);
@@ -126,22 +124,28 @@ int main(void) {
     kvspaceRef_t s17;
     memset(&s17, 0, sizeof s17);
     CHECK(kvspaceShmResolveRef(kv, sk, &s17) == 0);
-    uint8_t a17[8] = {17, 0, 0, 0, 0, 0, 0, 0};
-    CHECK(kvspaceShmSetPartByRef(kv, &s17, sk, 2, a17, 8) == 0);
+    kvspaceXvalueHead h17;
+    memset(&h17, 0, sizeof h17);
+    kvspaceXvalueHeadSetLen(&h17, 17);
+    CHECK(kvspaceShmSetPartByRef(kv, &s17, sk, 2,
+                                 (const uint8_t *)&h17, sizeof h17) == 0);
     kvspaceXvalueBodyView_t v17;
     CHECK(kvspaceShmXvalueBodyView(kv, &s17, sk, &v17) == -1);
     CHECK(kvspaceShmXvalueBodyView(kv, &s17, NULL, &v17) == -1);
 
-    /* 越界 content（head.a 被改大）：view -1。 */
+    /* 越界 content（head.len 被改大）：view -1。 */
     v = slack("hello", &n);
     CHECK(v != NULL);
     CHECK(kvspaceShmSet(kv, "/a/corrupt", v, (int32_t)n) == 0);
     free(v);
-    uint8_t big[8] = {0x40, 0x42, 0x0f, 0, 0, 0, 0, 0};
+    kvspaceXvalueHead big;
+    memset(&big, 0, sizeof big);
+    kvspaceXvalueHeadSetLen(&big, 0xF4240); /* 1,000,000 ≫ box 物理容量 */
     kvspaceRef_t xr;
     memset(&xr, 0, sizeof xr);
     CHECK(kvspaceShmResolveRef(kv, "/a/corrupt", &xr) == 0);
-    CHECK(kvspaceShmSetPartByRef(kv, &xr, "/a/corrupt", 2, big, 8) == 0);
+    CHECK(kvspaceShmSetPartByRef(kv, &xr, "/a/corrupt", 2,
+                                 (const uint8_t *)&big, sizeof big) == 0);
     kvspaceRef_t cr;
     memset(&cr, 0, sizeof cr);
     CHECK(kvspaceShmResolveRef(kv, "/a/corrupt", &cr) == 0);

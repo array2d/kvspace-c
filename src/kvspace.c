@@ -12,7 +12,6 @@
 #include "slotsboxmalloc/slotsboxobj.h"
 #include "kvspace_shm.h"
 #include "xvalue_head.h"
-#include "xvalue_meta.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -164,7 +163,6 @@ typedef struct {
     uint64_t garb_freeing;
     uint64_t round_ok, round_aborted, leak_boxes;
     uint32_t claim_seq;        /* 30 位发号；耗尽 open 硬失败 */
-    uint32_t meta_used;        /* set once any ro/vid sidecar is written; never cleared */
     p2_slot_t slots[P2_SLOT_N];
 } kvspace_hdr_t;
 
@@ -657,6 +655,20 @@ static void p2_atfork_install(void) {
     ((kv)->fork_gen != __atomic_load_n(&g_fork_gen, __ATOMIC_ACQUIRE))
 #define P2_VIEW_GUARD(kv) ((kv)->quiesced || P2_FORK_GUARD(kv))
 
+/* 固定头直读辅助：校验 value 是合法 8 字节头 + body 长度自洽；产出头。 */
+static int head_of(const uint8_t *val, int32_t val_len, kvspaceXvalueHead *out) {
+    if (!val || val_len < KVSPACE_XVALUE_HEAD_LEN)
+        return -1;
+    memcpy(out, val, sizeof *out);
+    uint64_t l = kvspaceXvalueHeadLen(out);
+    if (out->storetype > KVSPACE_XVALUE_ST_EXT ||
+        out->ptr > KVSPACE_XVALUE_PTR_EXT)
+        return -1;
+    if ((uint64_t)KVSPACE_XVALUE_HEAD_LEN + l > (uint64_t)val_len)
+        return -1;
+    return 0;
+}
+
 int kvspaceShmViewFromRef(kvspace_t *kv, const kvspaceRef_t *ref,
                            const char *key_fallback, kvspaceViewToken_t *tok) {
     (void)key_fallback;
@@ -673,20 +685,20 @@ int kvspaceShmViewFromRef(kvspace_t *kv, const kvspaceRef_t *ref,
     if (cap < 1)
         return -1;
     uint8_t *raw = kv->sbo_data + AV_OFF(hv);
-    kvspaceXh w;
-    if (kvspaceXhHeadView(raw, cap, &w) != 0 || w.total > cap ||
-        w.kind == KVSPACE_XH_EXT || (w.kind & KVSPACE_XH_PTR_FLAG))
+    kvspaceXvalueHead w;
+    if (head_of(raw, (int32_t)cap, &w) != 0 ||
+        w.ptr != KVSPACE_XVALUE_PTR_INLINE)
         return -1;
     kv_gens_t *g = gens_at(kv, id);
     if (!g)
         return -1;
     uint32_t gen = __atomic_load_n(&g->struct_gen, __ATOMIC_ACQUIRE);
     tok->head = raw;
-    tok->body = raw + w.headlen;
-    tok->headlen = w.headlen;
-    tok->value_len = (uint32_t)w.content_len;
+    tok->body = raw + KVSPACE_XVALUE_HEAD_LEN;
+    tok->headlen = KVSPACE_XVALUE_HEAD_LEN;
+    tok->value_len = (uint32_t)kvspaceXvalueHeadLen(&w);
     tok->cap = cap;
-    tok->body_cap = cap - w.headlen;
+    tok->body_cap = cap - KVSPACE_XVALUE_HEAD_LEN;
     tok->struct_gen = gen;
     tok->value_gen = __atomic_load_n(&g->value_gen, __ATOMIC_ACQUIRE);
     tok->store_id = kv->store_id;
@@ -2519,15 +2531,14 @@ void kvspaceShmClose(kvspace_t *kv) {
 static int read_value(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
     uint8_t *s = kv->sbo_data + off;
     size_t sz = sbo_allocated_size(kv->sbo_meta, off);
-    kvspaceXh wire;
-    if (kvspaceXhView(s, sz, &wire) == 0) {
-        if (wire.total > INT32_MAX)
+    kvspaceXvalueHead wire;
+    if (head_of(s, (int32_t)sz, &wire) == 0) {
+        uint64_t l = kvspaceXvalueHeadLen(&wire);
+        if (l > INT32_MAX)
             return -1;
         *out = s;
-        /* 空 langtype 只在 Ptr/Ext 上是合法值（“目标不约束”）；其余空 langtype = None。 */
-        bool ref = wire.kind == KVSPACE_XH_EXT ||
-                   wire.kind == (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG);
-        *ol = (wire.langtype_len || ref) ? (int32_t)wire.total : 0;
+        /* None = 空 body（len 0）；ptr/ext 由 ptr 字段判定（值恒为叶子）。 */
+        *ol = (int32_t)(KVSPACE_XVALUE_HEAD_LEN + l);
         return 0;
     }
     return -1;
@@ -2552,13 +2563,13 @@ static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
         int32_t rl;
         if (read_value(kv, AV_OFF(hv), &raw, &rl) < 0)
             return;
-        kvspaceXh wire;
-        if (rl > 0 && kvspaceXhView(raw, (uint64_t)rl, &wire) == 0) {
-            if (wire.kind != (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG) ||
-                wire.content_len >= (uint64_t)osz)
+        kvspaceXvalueHead wire;
+        if (head_of(raw, rl, &wire) == 0) {
+            uint64_t l2 = kvspaceXvalueHeadLen(&wire);
+            if (wire.ptr != KVSPACE_XVALUE_PTR_PTR || l2 >= (uint64_t)osz)
                 return;
-            memcpy(out, wire.body, (size_t)wire.content_len);
-            out[wire.content_len] = 0;
+            memcpy(out, raw + KVSPACE_XVALUE_HEAD_LEN, (size_t)l2);
+            out[l2] = 0;
             continue;
         }
         return;
@@ -2566,7 +2577,7 @@ static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
 }
 
 /* resolve_path 的融合版：解析 link 链的同时把终端叶子的值一并取出，令调用方省掉
- * 「解析后再 art_search + read_value」的整套重复下降。每跳只解一次 head（ref 判定与
+ * 「解析后再 art_search + read_value」的整套重复下降。每跳只取一次 head（ref 判定与
  * 值长度共用），命中带值节点即返 fetched=1（*raw/*rl 就位）。语义与
  * resolve_path + art_search + read_value 逐字等价：未命中/无值 → 返回该节点、fetched=0，
  * 交调用方走 extindex/dir 兜底。 */
@@ -2585,21 +2596,17 @@ static art_hdr_t *resolve_fetch(kvspace_t *kv, const char *path, char *out, int 
             return h;
         uint8_t *s = kv->sbo_data + AV_OFF(hv);
         size_t sz = sbo_allocated_size(kv->sbo_meta, AV_OFF(hv));
-        kvspaceXh wire;
-        if (kvspaceXhView(s, sz, &wire) == 0) {
-            if (wire.total > INT32_MAX)
-                return NULL;
-            if (wire.kind != (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG) ||
-                wire.content_len >= (uint64_t)osz) {
+        kvspaceXvalueHead wire;
+        if (head_of(s, (int32_t)sz, &wire) == 0) {
+            uint64_t l3 = kvspaceXvalueHeadLen(&wire);
+            if (wire.ptr != KVSPACE_XVALUE_PTR_PTR || l3 >= (uint64_t)osz) {
                 *raw = s;
-                bool ref = wire.kind == KVSPACE_XH_EXT ||
-                           wire.kind == (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG);
-                *rl = (wire.langtype_len || ref) ? (int32_t)wire.total : 0;
+                *rl = (int32_t)(KVSPACE_XVALUE_HEAD_LEN + l3);
                 *fetched = 1;
                 return h;
             }
-            memcpy(out, wire.body, (size_t)wire.content_len);
-            out[wire.content_len] = 0;
+            memcpy(out, s + KVSPACE_XVALUE_HEAD_LEN, (size_t)l3);
+            out[l3] = 0;
             continue;
         }
         return NULL;
@@ -2621,12 +2628,15 @@ static int dir_ext_path(kvspace_t *kv, const char *dir, char *out, int osz) {
     int32_t rl;
     if (read_value(kv, AV_OFF(hv), &raw, &rl) < 0)
         return 0;
-    kvspaceXh wire;
-    if (rl <= 0 || kvspaceXhDecode(raw, (uint64_t)rl, &wire) != 0 ||
-        wire.kind != KVSPACE_XH_EXT || wire.a == 0 || wire.a >= (uint64_t)osz)
+    kvspaceXvalueHead wire;
+    if (head_of(raw, rl, &wire) != 0 ||
+        wire.ptr != KVSPACE_XVALUE_PTR_EXT)
         return 0;
-    memcpy(out, wire.body, (size_t)wire.a);
-    out[wire.a] = 0;
+    uint64_t l4 = kvspaceXvalueHeadLen(&wire);
+    if (l4 == 0 || l4 >= (uint64_t)osz)
+        return 0;
+    memcpy(out, raw + KVSPACE_XVALUE_HEAD_LEN, (size_t)l4);
+    out[l4] = 0;
     return 1;
 }
 
@@ -2776,50 +2786,36 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
         return -1;
     int32_t id = ref_leaf(kv, ref, key_fallback);
     art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
-    /* SLACK、pow=6（headlen=64）的 part-write 快路径：跳过 xh_view 结构解码，
-     * 只做必要的 head 自洽 + per-box 物理容量校验后写正文。任何不自洽
-     * （gen>0、无值、head 不足 64B、pow/kind/Ptr 不符、langtype 无 NUL、
-     * a>b、b/offset/buf_len 越界、超出 box 物理容量）一律回退现有路径，
-     * 行为不变。不修改 head，不更新 a/b。 */
+    /* SLACK 的 part-write 快路径：固定 8 字节 head 直读 + per-box 物理容量校验后
+     * 写正文。任何不自洽（gen>0、无值、storetype/ptr 不符、offset/buf_len 越界、
+     * 超出 box 物理容量）一律回退现有路径，行为不变。不修改 head。 */
     uint64_t hv = h ? art_val_load(h) : 0;
     if (h && AV_HAS(hv) && ref->gen == 0) {
         uint64_t data_size = kv->hdr->sbo_data_size;
         uint64_t off = AV_OFF(hv);
-        if (off <= data_size && data_size - off >= 64) {
+        if (off <= data_size && data_size - off >= KVSPACE_XVALUE_HEAD_LEN) {
             const uint8_t *hs = kv->sbo_data + off;
-            uint8_t flags = hs[1];
-            if (hs[0] == KVSPACE_XH_POW_SLACK &&
-                (flags & 3u) == KVSPACE_XH_SLACK &&
-                (flags & KVSPACE_XH_PTR_FLAG) == 0) {
-                /* langtype 必须在 64B head 内以 NUL 终止（不能只看首字节非空）。 */
-                bool lt_ok = false;
-                for (uint32_t i = KVSPACE_XH_PREFIX; i < 64; i++)
-                    if (hs[i] == 0) {
-                        lt_ok = i > KVSPACE_XH_PREFIX; /* 非空 */
-                        break;
-                    }
-                uint64_t a = 0, b = 0;
-                for (int i = 0; lt_ok && i < 8; i++) {
-                    a |= (uint64_t)hs[2 + i] << (8 * i);
-                    b |= (uint64_t)hs[10 + i] << (8 * i);
-                }
-                if (lt_ok && a <= b) {
-                    /* per-box 物理容量：损坏 head 的 b 可能大于 box 但仍在全局内，
-                     * 不做这一步会跨 box 写坏相邻值。 */
-                    uint64_t cap = sbo_allocated_size(kv->sbo_meta, off);
-                    if (cap >= 64 && cap <= data_size - off && b <= cap - 64 &&
-                        (uint64_t)offset <= 64 + b &&
-                        (uint64_t)buf_len <= 64 + b - (uint64_t)offset) {
-                        kv_gens_t *g = gens_at(kv, id);
-                        if (g)
-                            __atomic_add_fetch(&g->value_gen, 1u,
-                                               __ATOMIC_ACQ_REL);
-                        memcpy(kv->sbo_data + off + offset, buf, buf_len);
-                        if (g)
-                            __atomic_add_fetch(&g->value_gen, 1u,
-                                               __ATOMIC_ACQ_REL);
-                        return 0;
-                    }
+            kvspaceXvalueHead w;
+            memcpy(&w, hs, sizeof w);
+            if (w.storetype == KVSPACE_XVALUE_ST_SLACK &&
+                w.ptr == KVSPACE_XVALUE_PTR_INLINE) {
+                uint64_t len = kvspaceXvalueHeadLen(&w);
+                /* per-box 物理容量：损坏 head 的 len 可能大于 box 但仍在全局内，
+                 * 不做这一步会跨 box 写坏相邻值。 */
+                uint64_t cap = sbo_allocated_size(kv->sbo_meta, off);
+                if (cap <= data_size - off && len <= cap - KVSPACE_XVALUE_HEAD_LEN &&
+                    (uint64_t)offset <= KVSPACE_XVALUE_HEAD_LEN + len &&
+                    (uint64_t)buf_len <=
+                        KVSPACE_XVALUE_HEAD_LEN + len - (uint64_t)offset) {
+                    kv_gens_t *g = gens_at(kv, id);
+                    if (g)
+                        __atomic_add_fetch(&g->value_gen, 1u,
+                                           __ATOMIC_ACQ_REL);
+                    memcpy(kv->sbo_data + off + offset, buf, buf_len);
+                    if (g)
+                        __atomic_add_fetch(&g->value_gen, 1u,
+                                           __ATOMIC_ACQ_REL);
+                    return 0;
                 }
             }
         }
@@ -2860,23 +2856,6 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
 #define KVSPACE_STATUS_MAX_LEN 16u
 #define KVSPACE_STATUS_MIN_CAP 80u
 
-/* status 的规范形状：SLACK、headlen=64、langtype "[<digits>]char/utf8"。 */
-static int is_status_langtype(const kvspaceXh *w) {
-    if (!w->langtype || w->langtype_len < 12)
-        return 0;
-    const uint8_t *p = w->langtype;
-    uint32_t n = w->langtype_len, i = 0;
-    if (p[i++] != '[')
-        return 0;
-    uint32_t d0 = i;
-    while (i < n && p[i] >= '0' && p[i] <= '9')
-        i++;
-    if (i == d0 || i >= n || p[i++] != ']')
-        return 0;
-    static const char suf[] = "char/utf8";
-    return n - i == sizeof suf - 1 && memcmp(p + i, suf, sizeof suf - 1) == 0;
-}
-
 static int is_vthread_status_key(const char *key) {
     static const char pfx[] = "/vthread/";
     static const char suf[] = "/\xE2\x80\xA5status";
@@ -2908,30 +2887,30 @@ int kvspaceShmXvalueBodyView(kvspace_t *kv, const kvspaceRef_t *ref,
     int32_t rl = 0;
     if (read_value(kv, AV_OFF(hv), &raw, &rl) < 0 || !raw)
         return -1;
-    kvspaceXh wire;
-    if (kvspaceXhDecode(raw, (uint64_t)rl, &wire) != 0)
+    kvspaceXvalueHead wire;
+    if (head_of(raw, rl, &wire) != 0)
         return -1;
     /* ptr/ext 槽不可视：没有稳定的 head/body 语义。 */
-    if (wire.kind == KVSPACE_XH_EXT ||
-        (wire.kind & KVSPACE_XH_PTR_FLAG))
+    if (wire.ptr != KVSPACE_XVALUE_PTR_INLINE)
         return -1;
     uint64_t cap = sbo_allocated_size(kv->sbo_meta, AV_OFF(hv));
-    if (cap < wire.headlen || wire.content_len > cap - wire.headlen)
+    uint64_t l5 = kvspaceXvalueHeadLen(&wire);
+    if (cap < KVSPACE_XVALUE_HEAD_LEN ||
+        l5 > cap - KVSPACE_XVALUE_HEAD_LEN)
         return -1;
-    /* status：只暴露规范形状且物理容量达标的槽；旧小 cap/异型 → -1，
-     * runtime 回退（旧 store 不自动升级）。 */
+    /* status：只暴露规范形状（SLACK、len≤16）且物理容量达标的槽；
+       类型（[n]char/utf8）在 x‥langtype attr key，不在此判。 */
     if (is_vthread_status_key(key_fallback)) {
-        if (wire.kind != KVSPACE_XH_SLACK ||
-            wire.headlen != (1u << KVSPACE_XH_POW_SLACK) ||
-            !is_status_langtype(&wire) || cap < KVSPACE_STATUS_MIN_CAP ||
-            wire.content_len > KVSPACE_STATUS_MAX_LEN)
+        if (wire.storetype != KVSPACE_XVALUE_ST_SLACK ||
+            cap < KVSPACE_STATUS_MIN_CAP ||
+            l5 > KVSPACE_STATUS_MAX_LEN)
             return -1;
     }
     out->head = raw;
-    out->headlen = wire.headlen;
-    out->body = raw + wire.headlen;
+    out->headlen = KVSPACE_XVALUE_HEAD_LEN;
+    out->body = raw + KVSPACE_XVALUE_HEAD_LEN;
     out->cap = cap;
-    out->body_cap = cap - wire.headlen;
+    out->body_cap = cap - KVSPACE_XVALUE_HEAD_LEN;
     return 0;
 }
 
@@ -3042,75 +3021,8 @@ static int shm_set_raw(kvspace_t *kv, const char *key, const uint8_t *val,
     return shm_set_local(kv, key, val, val_len, old);
 }
 
-/* 键上限 1024 → meta key 最长 15 + 2*1023 + 1。 */
-#define META_KEY_MAX (16 + 2 * 1024)
-
-static int sync_metadata(kvspace_t *kv, const char *key, uint8_t ro, uint32_t vid) {
-    char meta[META_KEY_MAX];
-    if (kvspaceMetaKeyInto(key, meta, sizeof meta) != 0)
-        return -1;
-    if (!ro && !vid && !__atomic_load_n(&kv->hdr->meta_used, __ATOMIC_ACQUIRE))
-        return 0;   /* no sidecar was ever written: nothing to clear */
-    if (ro || vid) {
-        uint8_t *value = NULL;
-        uint64_t len = 0;
-        if (kvspaceMetaEncode(ro, vid, &value, &len) != 0)
-            return -1;
-        __atomic_store_n(&kv->hdr->meta_used, 1u, __ATOMIC_RELEASE);
-        int rc = shm_set_raw(kv, meta, value, (int32_t)len);
-        free(value);
-        return rc;
-    }
-    /* ro=0/vid=0 是普通写的常态：没有 meta 就不必进 ART 删除。 */
-    if (!art_search(kv, kv->hdr->art_root, (const uint8_t *)meta,
-                    (int)strlen(meta)))
-        return 0;
-    bool removed = false;
-    int32_t root = art_del(kv, kv->hdr->art_root,
-                           (const uint8_t *)meta, (int)strlen(meta), 0,
-                           &removed);
-    if (root < 0)
-        return -1;                  /* 表满等硬错误：树未变 */
-    kv->hdr->art_root = root;
-    return 0;
-}
-
-int kvspaceShmMetaGetAt(kvspace_t *kv, const char *key, uint8_t *ro,
-                        uint32_t *vid) {
-    if (!kv || !key || !ro || !vid || kv_sync(kv) != 0)
-        return -1;
-    *ro = 0;
-    *vid = 0;
-    char *meta = NULL;
-    if (kvspaceMetaKey(key, &meta) != 0)
-        return -1;
-    art_hdr_t *h = art_search(kv, kv->hdr->art_root,
-                              (const uint8_t *)meta, (int)strlen(meta));
-    free(meta);
-    if (!h)
-        return 0;
-    uint64_t hv = art_val_load(h);
-    if (!AV_HAS(hv))
-        return 0;
-    const uint8_t *data = kv->sbo_data + AV_OFF(hv);
-    uint64_t allocated = sbo_allocated_size(kv->sbo_meta, AV_OFF(hv));
-    kvspaceXh head;
-    if (kvspaceXhDecode(data, allocated, &head) != 0)
-        return -1;
-    return kvspaceMetaDecode(data, head.total, ro, vid);
-}
-
-int kvspaceShmMetaGet(kvspace_t *kv, const char *key, uint8_t *ro,
-                      uint32_t *vid) {
-    if (!kv || !key || kv_sync(kv) != 0)
-        return -1;
-    char resolved[1024];
-    resolve_path(kv, key, resolved, sizeof resolved);
-    return kvspaceShmMetaGetAt(kv, resolved, ro, vid);
-}
-
-static int frame_operand_ptr(const char *key, const kvspaceXh *wire) {
-    if (wire->kind != (KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG) ||
+static int frame_operand_ptr(const char *key, const kvspaceXvalueHead *wire) {
+    if (wire->ptr != KVSPACE_XVALUE_PTR_PTR ||
         strncmp(key, "/vthread/", 9) != 0)
         return 0;
     const char *slot = strrchr(key, '/');
@@ -3126,7 +3038,7 @@ static int frame_operand_ptr(const char *key, const kvspaceXh *wire) {
 
 static int shm_set_validated(kvspace_t *kv, const char *key,
                             const uint8_t *val, int32_t val_len,
-                            const kvspaceXh *wire, uint8_t ro, uint32_t vid) {
+                            const kvspaceXvalueHead *wire) {
     if (kv_sync(kv) != 0)
         return -1;
     char kbuf[1024];
@@ -3159,64 +3071,53 @@ static int shm_set_validated(kvspace_t *kv, const char *key,
         free(nn);
     }
 
-    /* status 固定档：形状固定（SLACK/headlen=64/[n]char/utf8）、内容 ≤16。
-     * 任一不符或现存槽 headlen 不同（旧 store）→ 硬错，不截断、不换 box、
-     * 不自动升级。创建时分配下限 80 字节，保证后续合法写入原地完成。 */
+    /* status 固定档：形状固定（SLACK、len≤16）、物理容量 ≥ 下限。
+     * 类型（[n]char/utf8）在 x‥langtype attr key，不在此判。 */
     if (is_vthread_status_key(kbuf)) {
-        if (wire->content_len > KVSPACE_STATUS_MAX_LEN ||
-            wire->kind != KVSPACE_XH_SLACK ||
-            wire->headlen != (1u << KVSPACE_XH_POW_SLACK) ||
-            !is_status_langtype(wire))
+        if (wire->storetype != KVSPACE_XVALUE_ST_SLACK ||
+            kvspaceXvalueHeadLen(wire) > KVSPACE_STATUS_MAX_LEN)
             return -1;
         if (local && AV_HAS(lhv)) {
             uint8_t *old_raw = kv->sbo_data + AV_OFF(lhv);
             uint64_t old_sz = sbo_allocated_size(kv->sbo_meta, AV_OFF(lhv));
-            kvspaceXh old;
-            /* 旧 store 的不合规 status 槽（形状/尺寸/容量任一不符）：
+            kvspaceXvalueHead old;
+            /* 旧 store 的不合规 status 槽（形状/容量任一不符）：
              * 不自动升级、不 realloc——写入硬错，需重建/重置。 */
-            if (kvspaceXhDecode(old_raw, old_sz, &old) != 0 ||
-                old.headlen != wire->headlen ||
-                old.kind != KVSPACE_XH_SLACK ||
-                old.headlen != (1u << KVSPACE_XH_POW_SLACK) ||
-                !is_status_langtype(&old) ||
-                old.content_len > KVSPACE_STATUS_MAX_LEN ||
+            if (head_of(old_raw, (int32_t)old_sz, &old) != 0 ||
+                old.storetype != KVSPACE_XVALUE_ST_SLACK ||
+                kvspaceXvalueHeadLen(&old) > KVSPACE_STATUS_MAX_LEN ||
                 old_sz < KVSPACE_STATUS_MIN_CAP)
                 return -1;
         }
     }
-    if (shm_set_local(kv, kbuf, val, val_len, local) != 0)
-        return -1;
-    return sync_metadata(kv, kbuf, ro, vid);
+    return shm_set_local(kv, kbuf, val, val_len, local);
 }
 
 int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
                   int32_t val_len) {
     if (!kv || !key || !val || val_len <= 0)
         return -1;
-    kvspaceXh wire;
-    if (kvspaceXhDecode(val, (uint64_t)val_len, &wire) != 0 ||
-        wire.total != (uint64_t)val_len)
+    kvspaceXvalueHead wire;
+    if (head_of(val, val_len, &wire) != 0)
         return -1;
-    return shm_set_validated(kv, key, val, val_len, &wire, 0, 0);
+    return shm_set_validated(kv, key, val, val_len, &wire);
 }
 
 int kvspaceShmSetValue(kvspace_t *kv, const char *key, const uint8_t *val,
-                       int32_t val_len, uint8_t ro, uint32_t vid) {
-    kvspaceXh head;
+                       int32_t val_len) {
+    kvspaceXvalueHead head;
     if (!kv || !key || !val || val_len <= 0 ||
-        kvspaceXhDecode(val, (uint64_t)val_len, &head) != 0 ||
-        head.total != (uint64_t)val_len)
+        head_of(val, val_len, &head) != 0)
         return -2;
-    return shm_set_validated(kv, key, val, val_len, &head, ro, vid);
+    return shm_set_validated(kv, key, val, val_len, &head);
 }
 
 int kvspaceShmSetValueByRef(kvspace_t *kv, kvspaceRef_t *ref,
                             const char *key_fallback, const uint8_t *val,
-                            int32_t val_len, uint8_t ro, uint32_t vid) {
-    kvspaceXh head;
+                            int32_t val_len) {
+    kvspaceXvalueHead head;
     if (!kv || !ref || !key_fallback || !val || val_len <= 0 ||
-        kvspaceXhDecode(val, (uint64_t)val_len, &head) != 0 ||
-        head.total != (uint64_t)val_len)
+        head_of(val, val_len, &head) != 0)
         return -2;
     if (kv_sync(kv) != 0)
         return -1;
@@ -3225,13 +3126,10 @@ int kvspaceShmSetValueByRef(kvspace_t *kv, kvspaceRef_t *ref,
         return -1;
     int32_t id = ref_leaf(kv, ref, key_fallback);
     art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
-    if (h && AV_HAS(art_val_load(h))) {
-        if (shm_set_local(kv, key_fallback, val, val_len, h) != 0)
-            return -1;
-        return sync_metadata(kv, key_fallback, ro, vid);
-    }
+    if (h && AV_HAS(art_val_load(h)))
+        return shm_set_local(kv, key_fallback, val, val_len, h);
     /* ref 过期或尚无值：退回完整按 key 写（含 extindex 检查），成功后重解析。 */
-    int rc = shm_set_validated(kv, key_fallback, val, val_len, &head, ro, vid);
+    int rc = shm_set_validated(kv, key_fallback, val, val_len, &head);
     if (rc == 0)
         kvspaceShmResolveRef(kv, key_fallback, ref);
     return rc;
@@ -3263,22 +3161,21 @@ int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
         return -1;
     if ((!fetched && read_value(kv, AV_OFF(hv), &raw, &rl) < 0) || rl <= 0)
         return -1; /* None 或读失败 → 强制走 NewPlace */
-    kvspaceXh wire;
-    if (kvspaceXhDecode(raw, (uint64_t)rl, &wire) == 0) {
-        if (wire.content_len != (uint64_t)body_len)
+    kvspaceXvalueHead wire;
+    if (head_of(raw, rl, &wire) == 0) {
+        if (kvspaceXvalueHeadLen(&wire) != (uint64_t)body_len)
             return -1;
-        *body = raw + wire.headlen;
+        *body = raw + KVSPACE_XVALUE_HEAD_LEN;
         return 0;
     }
     return -1;
 }
 
 int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
-                            uint8_t storetype, uint8_t ro, uint32_t vid,
-                            const char *langtype, int32_t body_len,
+                            uint8_t storetype, int32_t body_len,
                             uint64_t body_cap,
                             uint8_t **body) {
-    if (!kv || !key || !langtype || !body || body_len < 0)
+    if (!kv || !key || !body || body_len < 0)
         return -1;
     if (body_cap > INT32_MAX - 32)
         return -1;
@@ -3288,28 +3185,28 @@ int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
     size_t key_len = strlen(key);
     if (key_len >= 1024 || strstr(key, "//") || reserved_meta_path(key))
         return -1;
-    uint8_t kind;
-    if (ref == 0 && storetype <= KVSPACE_XH_FIXED_LARGE)
-        kind = storetype;
-    else if (ref == 1 && storetype == KVSPACE_XH_SLACK)
-        kind = KVSPACE_XH_SLACK | KVSPACE_XH_PTR_FLAG;
-    else if (ref == 2 && storetype == KVSPACE_XH_EXT)
-        kind = KVSPACE_XH_EXT;
+    uint8_t ptr;
+    if (ref == 0 && storetype <= KVSPACE_XVALUE_ST_EXT)
+        ptr = KVSPACE_XVALUE_PTR_INLINE;
+    else if (ref == 1 && storetype == KVSPACE_XVALUE_ST_SLACK)
+        ptr = KVSPACE_XVALUE_PTR_PTR;
+    else if (ref == 2 && storetype == KVSPACE_XVALUE_ST_EXT)
+        ptr = KVSPACE_XVALUE_PTR_EXT;
     else
         return -1;
     uint8_t *value = NULL;
     uint64_t total = 0;
-    if (kvspaceXhReserve(kind, langtype, (uint64_t)body_len,
-                         body_cap, &value, &total) != 0)
+    if (kvspaceXvalueHeadReserve(storetype, (uint64_t)body_len,
+                                 body_cap, &value, &total) != 0)
         return -1;
     if (total > INT32_MAX) {
         free(value);
         return -1;
     }
-    uint32_t headlen = 1u << value[0];
-    int rc = sync_metadata(kv, key, ro, vid);
-    if (rc == 0)
-        rc = shm_set_raw(kv, key, value, (int32_t)total);
+    /* 固定头 8 字节：body 偏移恒 = 8。langtype 由调用方写 x‥langtype attr key。 */
+    uint32_t headlen = KVSPACE_XVALUE_HEAD_LEN;
+    (void)ptr;
+    int rc = shm_set_raw(kv, key, value, (int32_t)total);
     free(value);
     if (rc != 0)
         return -1;
@@ -3347,8 +3244,6 @@ int kvspaceShmDel(kvspace_t *kv, const char *key) {
     char kbuf[1024];
     strncpy(kbuf, key, sizeof(kbuf) - 1);
     kbuf[sizeof(kbuf) - 1] = '\0'; /* 删键本身，不穿透 link——显式解引用由 runtime 掌控 */
-    if (sync_metadata(kv, kbuf, 0, 0) != 0)
-        return -1;
     bool d = false;
     int32_t root = art_del(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
                            (int)strlen(kbuf), 0, &d);
@@ -3371,9 +3266,9 @@ int kvspaceShmDeltree(kvspace_t *kv, const char *prefix) {
         uint8_t *raw;
         int32_t rl;
         read_value(kv, AV_OFF(hv), &raw, &rl);
-        kvspaceXh wire;
-        int is_ptr = rl > 0 && kvspaceXhDecode(raw, (uint64_t)rl, &wire) == 0 &&
-                     (wire.kind & KVSPACE_XH_PTR_FLAG) != 0;
+        kvspaceXvalueHead wire;
+        int is_ptr = rl > 0 && head_of(raw, rl, &wire) == 0 &&
+                     wire.ptr == KVSPACE_XVALUE_PTR_PTR;
         if (is_ptr) {
             return kvspaceShmDel(kv, prefix);
         }
@@ -3447,15 +3342,9 @@ int kvspaceShmCp(kvspace_t *kv, const char *src, const char *dst) {
     if (!tmp)
         return -1;
     memcpy(tmp, raw, (size_t)rl);
-    uint8_t ro = 0;
-    uint32_t vid = 0;
-    if (kvspaceShmMetaGetAt(kv, src, &ro, &vid) != 0) {
-        free(tmp);
-        return -1;
-    }
     int rc = kvspaceShmSet(kv, dst, tmp, rl);
     free(tmp);
-    return rc == 0 ? sync_metadata(kv, dst, ro, vid) : rc;
+    return rc;
 }
 
 /* Copy values and physical children recursively. */
@@ -3611,9 +3500,9 @@ int kvspaceShmMkindex(kvspace_t *kv, const char *path, uint32_t capacity) {
     }
     uint8_t *v = NULL;
     uint64_t vl = 0;
-    int r = kvspaceXhNewShort("lib", NULL, 0, &v, &vl);
+    int r = kvspaceXvalueHeadNewNone(&v, &vl);
     if (r == 0)
-        r = kvspaceShmSetValue(kv, d, v, (int32_t)vl, 0, 0);
+        r = kvspaceShmSetValue(kv, d, v, (int32_t)vl);
     free(v);
     free(d);
     return r;
@@ -3720,22 +3609,18 @@ int kvspaceShmExtindex(kvspace_t *kv, const char *p, const char *ep,
     }
     int32_t source_len = 0;
     uint8_t *source = kvspaceShmGet(kv, ep, 0, &source_len);
-    kvspaceXh source_head;
-    if (!source || source_len <= 0 ||
-        kvspaceXhDecode(source, (uint64_t)source_len, &source_head) != 0) {
+    if (!source || source_len <= 0) {
         if (err && err_cap)
             snprintf(err, err_cap, "ExtIndex target missing: %s", ep);
         return -1;
     }
-    char *type = strndup((const char *)source_head.langtype, source_head.langtype_len);
-    if (!type)
-        return -1;
+    /* source 类型在 ep‥langtype attr key（明文事实源）；ext 句柄同样侧写。 */
     uint8_t *v = NULL;
     uint64_t vl = 0;
-    int r = kvspaceXhNewExt(type, ep, strlen(ep), &v, &vl);
+    int r = kvspaceXvalueHeadNewExt((const uint8_t *)ep, (uint32_t)strlen(ep),
+                                    &v, &vl);
     if (r == 0)
-        r = kvspaceShmSetValue(kv, p, v, (int32_t)vl, 0, 0);
-    free(type);
+        r = kvspaceShmSetValue(kv, p, v, (int32_t)vl);
     free(v);
     return r;
 }

@@ -10,7 +10,6 @@ include(GNUInstallDirs)
 add_library(kvspace-c SHARED
     src/coord.c
     src/xvalue_head.c
-    src/xvalue_meta.c
     src/kvspace.c
     src/durable_abi.c
 )
@@ -59,9 +58,13 @@ if(KVSPACE_BUILD_TESTS)
     target_link_libraries(test_handle_cache PRIVATE kvspace-c)
     add_test(NAME handle_cache COMMAND test_handle_cache)
 
-    add_executable(test_xvalue_head tests/test_xvalue_head.c src/xvalue_head.c src/xvalue_meta.c)
+    add_executable(test_xvalue_head tests/test_xvalue_head.c src/xvalue_head.c)
     target_include_directories(test_xvalue_head PRIVATE src)
     add_test(NAME xvalue_head COMMAND test_xvalue_head)
+    add_executable(test_codec_abi tests/test_codec_abi.c)
+    target_include_directories(test_codec_abi PRIVATE src)
+    target_link_libraries(test_codec_abi PRIVATE kvspace-c)
+    add_test(NAME codec_abi COMMAND test_codec_abi)
     add_executable(test_set_part_fastpath tests/test_set_part_fastpath.c)
     target_include_directories(test_set_part_fastpath PRIVATE src)
     target_link_libraries(test_set_part_fastpath PRIVATE kvspace-c)
