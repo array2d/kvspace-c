@@ -1,4 +1,5 @@
 build/
+build-test/
 cmake-build-*/
 *.o
 *.a

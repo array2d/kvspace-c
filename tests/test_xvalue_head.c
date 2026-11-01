@@ -168,6 +168,44 @@ static void test_reserve_code(void) {
           "code cap<len");
 }
 
+/* Failure contract (kvspace fix/review-v0.3.23): return -1 and clear *out on
+   failure; Reserve validates storetype via build; bounded langtype reader never
+   reads past wire_len. */
+static void test_fail_contract(void) {
+    uint8_t sentinel = 0;
+    uint8_t *buf = &sentinel;
+    uint64_t n = 0;
+    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, NULL, 3, "", &buf,
+                                     &n) != 0,
+          "NewScalar(NULL, 3) rejected");
+    CHECK(buf == NULL, "NewScalar(NULL, 3) clears *out");
+    buf = &sentinel;
+    CHECK(kvspaceXvalueHeadNewSlack(NULL, 4, 4, "", &buf, &n) != 0 && buf == NULL,
+          "NewSlack(NULL, 4) rejected, *out cleared");
+    buf = &sentinel;
+    CHECK(kvspaceXvalueHeadReserve(9, 4, 4, "", &buf, &n) != 0,
+          "Reserve(storetype=9) rejected");
+    CHECK(buf == NULL, "Reserve(storetype=9) clears *out");
+    buf = &sentinel;
+    CHECK(kvspaceXvalueHeadReserve(KVSPACE_XVALUE_ST_SLACK, 8, 4, "", &buf, &n) != 0 &&
+              buf == NULL,
+          "Reserve(cap < len) rejected, *out cleared");
+    buf = NULL;
+    CHECK(kvspaceXvalueHeadReserve(KVSPACE_XVALUE_ST_SLACK, 4, 4, "int32", &buf, &n) ==
+                  0 && buf,
+          "Reserve(SLACK) ok");
+    if (buf) {
+        const uint8_t *lt = NULL;
+        CHECK(kvspaceXvalueHeadLangtypeBounded(buf, n, &lt) == 5 && lt &&
+                  memcmp(lt, "int32", 5) == 0,
+              "bounded langtype reads full value");
+        CHECK(kvspaceXvalueHeadLangtypeBounded(buf, n - 1, &lt) == 0 && lt == NULL,
+              "bounded langtype rejects truncated value");
+        CHECK(kvspaceXvalueHeadLangtypeBounded(buf, KVSPACE_XVALUE_HEAD_LEN + 4, &lt) == 0,
+              "bounded langtype rejects value without attr");
+        free(buf);
+    }
+}
 int main(void) {
     test_none();
     test_scalar();
@@ -175,6 +213,7 @@ int main(void) {
     test_tensor();
     test_ptr_ext();
     test_reserve_code();
+    test_fail_contract();
     if (failures) {
         fprintf(stderr, "%d failed\n", failures);
         return 1;

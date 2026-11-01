@@ -10,3 +10,7 @@ jobs:
         run: ./ci/deps.sh
       - name: 构建
         run: make
+      - name: Run C tests
+        run: make test
+      - name: Run Python wrapper tests
+        run: KVSPACE_C_SO=build/libkvspace-c.so python3 py/tests/test_wire.py

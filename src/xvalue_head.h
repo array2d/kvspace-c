@@ -26,8 +26,8 @@ extern "C" {
 #define KVSPACE_XVALUE_PTR_PTR    1u
 #define KVSPACE_XVALUE_PTR_EXT    2u
 
-/* 固定 8 字节布局（直接 memcpy struct + body）。
-   wire：len:u48@0-5（小端）、storetype@6、ptr@7、body@8、langtype@8+len。 */
+/* Fixed 8-byte layout (direct memcpy struct + body).
+   wire: len:u48@0-5 (little-endian), storetype@6, ptr@7, body@8. */
 typedef struct kvspaceXvalueHead {
     uint8_t        len[6];        /* u48 小端（offset 0-5） */
     uint8_t        storetype;
@@ -51,14 +51,18 @@ static inline void kvspaceXvalueHeadSetLen(kvspaceXvalueHead *h, uint64_t v) {
 /* attr 区常量：record tag 1 = langtype；2+ 预留扩展（ro/vid 等，未实现）。 */
 #define KVSPACE_XVALUE_ATTR_TAG_LANGTYPE 1u
 
-/* 读 attr 总长（含自身 2 字节；空 attr = 2）。 */
+/* Read total attr length (including its own 2-byte length prefix; empty attr = 2).
+   Unbounded: caller must ensure wire has at least 8+body_len+2 bytes; use
+   kvspaceXvalueHeadLangtypeBounded for untrusted or backend-borrowed inputs. */
 static inline uint16_t kvspaceXvalueHeadAttrLen(const uint8_t *wire,
                                                 uint64_t body_len) {
     const uint8_t *p = wire + KVSPACE_XVALUE_HEAD_LEN + body_len;
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
 
-/* 扫 attr records 取 tag=1（langtype）记录 data；未找到/坏 attr → 返回 0。 */
+/* Scan attr records for tag=1 (langtype) data; returns 0 if missing or malformed.
+   Unbounded: caller must ensure wire has at least 8+body_len+attr_len bytes; use
+   kvspaceXvalueHeadLangtypeBounded when bounds are not yet verified. */
 static inline uint16_t kvspaceXvalueHeadLangtype(const uint8_t *wire,
                                                  uint64_t body_len,
                                                  const uint8_t **out) {
@@ -82,8 +86,31 @@ static inline uint16_t kvspaceXvalueHeadLangtype(const uint8_t *wire,
     return 0;
 }
 
-/* 构造（固定头 + body + attr 区，单 key 整体）。langtype 空/NULL = 无 langtype
-   记录（空 attr = [attr_len:2]）。0 on success. -1 and *out cleared on failure. */
+/* Bounded variant: verifies 8+len+2 <= wire_len and 8+len+attr_len <= wire_len
+   before scanning records. Returns 0 and sets *out=NULL on missing/malformed/truncated values. */
+static inline uint16_t kvspaceXvalueHeadLangtypeBounded(const uint8_t *wire,
+                                                        uint64_t wire_len,
+                                                        const uint8_t **out) {
+    *out = NULL;
+    if (!wire || wire_len < KVSPACE_XVALUE_HEAD_LEN + 2u)
+        return 0;
+    uint64_t body_len = 0;
+    for (int i = 5; i >= 0; i--)
+        body_len = (body_len << 8) | wire[i];
+    const uint64_t room = wire_len - KVSPACE_XVALUE_HEAD_LEN;
+    if (body_len > room - 2u)
+        return 0;
+    if (kvspaceXvalueHeadAttrLen(wire, body_len) > room - body_len)
+        return 0;
+    return kvspaceXvalueHeadLangtype(wire, body_len, out);
+}
+
+/* Constructors (fixed 8-byte header + body + attr region in a single value).
+   Empty/NULL langtype omits the langtype record (empty attr = [attr_len:2]).
+   Returns 0 on success, -1 and clears *out on failure (when out is non-NULL).
+   Fixed header has no capacity/shape fields: cap only checks cap >= len, and
+   dims/ndim only check non-empty (shape lives in leading [dims] of langtype).
+   NewCode is an alias of NewSlack (SLACK/INLINE) kept for ABI compatibility. */
 int kvspaceXvalueHeadNewNone(uint8_t **out, uint64_t *out_len);
 int kvspaceXvalueHeadNewScalar(uint8_t storetype, const uint8_t *raw,
                                uint32_t raw_len, const char *langtype,

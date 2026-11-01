@@ -1,0 +1,20 @@
+[ 10%] Built target test_xvalue_head
+[ 26%] Built target kvspace-c
+[ 33%] Built target test_shm_split
+[ 40%] Built target test_handle_cache
+[ 43%] Building C object CMakeFiles/test_inplace_body_only.dir/tests/test_inplace_body_only.c.o
+[ 50%] Built target test_art_scan
+[ 56%] Built target test_abi_contract
+[ 63%] Built target test_set_part_fastpath
+[ 70%] Built target test_codec_abi
+[ 76%] Built target test_slot_view
+[ 86%] Built target test_art_alignment
+[ 90%] Built target test_new_wire_shm
+[ 96%] Built target test_shm_resize
+/tmp/resolve_kvc/prside/tests/test_inplace_body_only.c: In function 'run':
+/tmp/resolve_kvc/prside/tests/test_inplace_body_only.c:46:18: warning: implicit declaration of function 'mkdtemp' [-Wimplicit-function-declaration]
+   46 |     char *made = mkdtemp(dir);
+      |                  ^~~~~~~
+/tmp/resolve_kvc/prside/tests/test_inplace_body_only.c:46:18: warning: initialization of 'char *' from 'int' makes pointer from integer without a cast [-Wint-conversion]
+[100%] Linking C executable test_inplace_body_only
+[100%] Built target test_inplace_body_only

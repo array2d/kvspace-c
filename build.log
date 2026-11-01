@@ -1,0 +1,48 @@
+[  3%] Building C object CMakeFiles/test_xvalue_head.dir/tests/test_xvalue_head.c.o
+[  6%] Building C object CMakeFiles/test_xvalue_head.dir/src/xvalue_head.c.o
+[ 13%] Building C object CMakeFiles/kvspace-c.dir/src/xvalue_head.c.o
+[ 13%] Building C object CMakeFiles/kvspace-c.dir/src/coord.c.o
+[ 16%] Building C object CMakeFiles/kvspace-c.dir/src/kvspace.c.o
+[ 20%] Building C object CMakeFiles/kvspace-c.dir/src/durable_abi.c.o
+[ 23%] Linking C executable test_xvalue_head
+[ 23%] Built target test_xvalue_head
+[ 26%] Linking C shared library libkvspace-c.so
+[ 26%] Built target kvspace-c
+[ 30%] Building C object CMakeFiles/test_shm_split.dir/tests/test_shm_split.c.o
+[ 33%] Building C object CMakeFiles/test_shm_resize.dir/tests/test_shm_resize.c.o
+[ 43%] Building C object CMakeFiles/test_codec_abi.dir/tests/test_codec_abi.c.o
+[ 43%] Building C object CMakeFiles/test_handle_cache.dir/tests/test_handle_cache.c.o
+[ 43%] Building C object CMakeFiles/test_art_scan.dir/tests/test_art_scan.c.o
+[ 46%] Building C object CMakeFiles/test_abi_contract.dir/tests/test_abi_contract.c.o
+[ 50%] Building C object CMakeFiles/test_inplace_body_only.dir/tests/test_inplace_body_only.c.o
+[ 56%] Building C object CMakeFiles/test_set_part_fastpath.dir/tests/test_set_part_fastpath.c.o
+[ 56%] Building C object CMakeFiles/test_new_wire_shm.dir/tests/test_new_wire_shm.c.o
+[ 63%] Building C object CMakeFiles/test_art_alignment.dir/tests/test_art_alignment.c.o
+[ 63%] Building C object CMakeFiles/test_slot_view.dir/tests/test_slot_view.c.o
+/tmp/resolve_kvc/prside/tests/test_inplace_body_only.c: In function 'run':
+/tmp/resolve_kvc/prside/tests/test_inplace_body_only.c:46:18: warning: implicit declaration of function 'mkdtemp' [-Wimplicit-function-declaration]
+   46 |     char *made = mkdtemp(dir);
+      |                  ^~~~~~~
+/tmp/resolve_kvc/prside/tests/test_inplace_body_only.c:46:18: warning: initialization of 'char *' from 'int' makes pointer from integer without a cast [-Wint-conversion]
+[ 66%] Linking C executable test_art_alignment
+[ 70%] Linking C executable test_slot_view
+[ 73%] Linking C executable test_new_wire_shm
+[ 76%] Linking C executable test_codec_abi
+[ 80%] Linking C executable test_inplace_body_only
+[ 83%] Linking C executable test_handle_cache
+[ 86%] Linking C executable test_shm_split
+[ 90%] Linking C executable test_set_part_fastpath
+[ 93%] Linking C executable test_shm_resize
+[ 96%] Linking C executable test_art_scan
+[100%] Linking C executable test_abi_contract
+[100%] Built target test_art_alignment
+[100%] Built target test_codec_abi
+[100%] Built target test_new_wire_shm
+[100%] Built target test_slot_view
+[100%] Built target test_inplace_body_only
+[100%] Built target test_handle_cache
+[100%] Built target test_set_part_fastpath
+[100%] Built target test_shm_split
+[100%] Built target test_shm_resize
+[100%] Built target test_art_scan
+[100%] Built target test_abi_contract

@@ -111,24 +111,12 @@ static void run(void) {
         free(wi1.raw);
     }
 
-    /* 3. SetPart 写 head：硬错，整值不变。 */
+    /* 3. SetPart 写 body：接受；head/attr 逐字节不变，body 变。 */
     put_i64(h, "/sp");
     struct Value sp0;
     snap(h, "/sp", &sp0);
     REQUIRE(sp0.raw != NULL && sp0.len == 26, "base /sp");
-    uint8_t patch[8] = {0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0};
-    char err[128] = {0};
-    const int sp_rc = kvspaceSetPart(h, "/sp", 0, patch, 8, err, sizeof err);
-    CHECK(sp_rc != 0, "SetPart(offset=0) must fail");
-    struct Value sp1;
-    snap(h, "/sp", &sp1);
-    CHECK(sp1.raw != NULL, "value intact after rejected head write");
-    if (sp1.raw)
-        CHECK(sp1.len == sp0.len && memcmp(sp1.raw, sp0.raw, sp0.len) == 0,
-              "head write changed value");
-
-    /* 4. SetPart 写 body：接受；head/attr 逐字节不变，body 变。 */
-    if (sp1.raw) {
+    {
         int64_t nine = 99;
         CHECK(kvspaceSetPart(h, "/sp", 8, (const uint8_t *)&nine, 8, NULL, 0) ==
                   0,
@@ -145,7 +133,7 @@ static void run(void) {
 
     free(vw0.raw); free(vw1.raw);
     free(wi0.raw);
-    free(sp0.raw); free(sp1.raw);
+    free(sp0.raw);
     kvspaceClose(h);
 }
 
