@@ -30,8 +30,10 @@ jobs:
           v="${RELEASE_TAG:-${GITHUB_REF_NAME}}"
           d="kvspace-c-abi-$v-linux-x86_64"
           mkdir -p "$d/include" "$d/lib"
-          # 头：本仓无公共头（内部头在 src/），权威 ABI 头在 kvspace 仓 → 递归整目录
-          git clone --depth 1 https://github.com/array2d/kvspace.git /tmp/kvspace-hdr
+          # Copy authoritative ABI headers from the pinned kvspace tag in deps.json.
+          kvspace_ver=$(jq -r '.kvspace' deps.json)
+          test -n "$kvspace_ver" && test "$kvspace_ver" != null
+          git clone --depth 1 --branch "$kvspace_ver" https://github.com/array2d/kvspace.git /tmp/kvspace-hdr
           cp -R /tmp/kvspace-hdr/include/. "$d/include/"
           # 库：扫构建目录的所有 .so*/.dylib（-P 保符号链接）
           find build -maxdepth 3 \( -name 'lib*.so*' -o -name 'lib*.dylib' \) -exec cp -P {} "$d/lib/" \;

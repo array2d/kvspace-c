@@ -20,6 +20,12 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
           cmake --build /tmp/slotsboxmalloc/build -j
           sudo cmake --install /tmp/slotsboxmalloc/build
+      - name: Install kvspace ABI headers (version from deps.json)
+        run: |
+          ver=$(jq -r '.kvspace' deps.json)
+          git clone --depth 1 --branch "$ver" https://github.com/array2d/kvspace.git /tmp/kvspace
+          sudo mkdir -p /usr/local/include
+          sudo cp -R /tmp/kvspace/include/. /usr/local/include/
       - name: 构建
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \

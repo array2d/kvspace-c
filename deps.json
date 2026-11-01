@@ -1,4 +1,5 @@
 {
   "blockmalloc": "v0.1.5",
+  "kvspace": "v0.3.23",
   "slotsboxmalloc": "v0.1.7"
 }
