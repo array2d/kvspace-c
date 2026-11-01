@@ -127,8 +127,10 @@ int main(void) {
     kvspaceXvalueHead h17;
     memset(&h17, 0, sizeof h17);
     kvspaceXvalueHeadSetLen(&h17, 17);
-    CHECK(kvspaceShmSetPartByRef(kv, &s17, sk, 2,
-                                 (const uint8_t *)&h17, sizeof h17) == 0);
+    int32_t s17len = 0;
+    uint8_t *s17raw = kvspaceShmGet(kv, sk, 0, &s17len);
+    CHECK(s17raw != NULL && s17len >= (int32_t)(2 + sizeof h17));
+    memcpy(s17raw + 2, &h17, sizeof h17);
     kvspaceXvalueBodyView_t v17;
     CHECK(kvspaceShmXvalueBodyView(kv, &s17, sk, &v17) == -1);
     CHECK(kvspaceShmXvalueBodyView(kv, &s17, NULL, &v17) == -1);
@@ -144,8 +146,10 @@ int main(void) {
     kvspaceRef_t xr;
     memset(&xr, 0, sizeof xr);
     CHECK(kvspaceShmResolveRef(kv, "/a/corrupt", &xr) == 0);
-    CHECK(kvspaceShmSetPartByRef(kv, &xr, "/a/corrupt", 2,
-                                 (const uint8_t *)&big, sizeof big) == 0);
+    int32_t xrlen = 0;
+    uint8_t *xrraw = kvspaceShmGet(kv, "/a/corrupt", 0, &xrlen);
+    CHECK(xrraw != NULL && xrlen >= (int32_t)(2 + sizeof big));
+    memcpy(xrraw + 2, &big, sizeof big);
     kvspaceRef_t cr;
     memset(&cr, 0, sizeof cr);
     CHECK(kvspaceShmResolveRef(kv, "/a/corrupt", &cr) == 0);
