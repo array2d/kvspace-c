@@ -3,7 +3,8 @@
  * 1) 每个 ART 块的数据起点 8 字节对齐，且 art_hdr_t.val（偏移 16）不跨 64B
  *    cache line。否则 8 字节原子字在 x86 上退化为 split lock，在 AArch64 上
  *    可能直接陷入（LSE/LLSC 要求自然对齐）——这是正确性前提，不只是性能。
- * 2) format_version 不是当前版本的 store 必须 open 失败（不迁移、不兼容）。
+ * 2) Opening a store whose format_version != current version must fail (no
+ *    migration or backward compatibility) and print a rebuild hint to stderr.
  */
 
 #define _GNU_SOURCE
@@ -13,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define CHECK(x)                                                               \
@@ -53,10 +55,38 @@ int main(void) {
 
     CHECK(kvspaceShmArtAlignCheck(kv) == -1);
 
-    /* 旧格式版本（任何非当前版本）：close 后 open 必须失败。 */
+    /* Older format version (any non-current version): reopen after close must fail
+     * and print a rebuild hint to stderr (checked before mapping full current header). */
     kvspaceShmTestSetFormatVersion(kv, KVSPACE_FORMAT_VERSION - 1);
     kvspaceShmClose(kv);
-    CHECK(kvspaceShmOpen(path, 8UL * 64 * 64 * 64 * 64) == NULL);
+    /* A real format-5 store header had no list_gen (8 bytes shorter), making the
+     * ART file 8 bytes shorter as well; mapping the current header first would fail
+     * inside region_attach before reaching a post-mmap version check. */
+    struct stat st;
+    CHECK(stat(path, &st) == 0 && truncate(path, st.st_size - 8) == 0);
+    char errpath[160];
+    snprintf(errpath, sizeof errpath, "%s/stderr", dir);
+    fflush(stderr);
+    int saved = dup(STDERR_FILENO);
+    FILE *ef = fopen(errpath, "w+");
+    CHECK(saved >= 0 && ef != NULL);
+    dup2(fileno(ef), STDERR_FILENO);
+    kvspace_t *old = kvspaceShmOpen(path, 8UL * 64 * 64 * 64 * 64);
+    fflush(stderr);
+    dup2(saved, STDERR_FILENO);
+    close(saved);
+    CHECK(old == NULL);
+    char msg[512] = {0};
+    rewind(ef);
+    size_t ml = fread(msg, 1, sizeof msg - 1, ef);
+    fclose(ef);
+    msg[ml] = 0;
+    char want[64];
+    snprintf(want, sizeof want, "version=%u", (unsigned)(KVSPACE_FORMAT_VERSION - 1));
+    if (!strstr(msg, "rebuild") || !strstr(msg, want))
+        fprintf(stderr, "open stderr: [%s]\n", msg);
+    CHECK(strstr(msg, "rebuild") != NULL);
+    CHECK(strstr(msg, want) != NULL);
 
     printf("PASS art_alignment\n");
     return 0;

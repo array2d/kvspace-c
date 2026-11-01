@@ -34,7 +34,7 @@ typedef struct {
     uint64_t body_cap;
 } kvspaceHead_t;
 
-/* 固定 8 字节 head → 元数据（langtype 在 body 尾 @8+len，见 kvspaceGetHead）。 */
+/* Decode fixed 8-byte header into metadata (langtype is in attr at 8+len; see kvspaceGetHead). */
 static int from_wire_head(const uint8_t *d, uint32_t total, kvspaceHead_t *out) {
     if (!out || !d || total < KVSPACE_XVALUE_HEAD_LEN)
         return 1;
@@ -56,11 +56,14 @@ static int from_wire_head(const uint8_t *d, uint32_t total, kvspaceHead_t *out) 
 }
 
 static int parse_shm_path(const char *dsn, char *out, size_t osz) {
-    const char *sep = strstr(dsn, "://");
-    if (!sep || strncmp(dsn, "shm", (size_t)(sep - dsn)) != 0)
+    if (!dsn)
         return -1;
-    snprintf(out, osz, "%s", sep + 3);
-    return 0;
+    const char *sep = strstr(dsn, "://");
+    /* Scheme must be exactly "shm" (prefix matching would accept "s://" or "://"). */
+    if (!sep || sep - dsn != 3 || strncmp(dsn, "shm", 3) != 0)
+        return -1;
+    int n = snprintf(out, osz, "%s", sep + 3);
+    return n > 0 && (size_t)n < osz ? 0 : -1;  /* reject empty or truncated path */
 }
 
 void *kvspaceConnect(const char *dsn) {
@@ -185,14 +188,12 @@ int kvspaceGetPart(void *h, const char *key, uint32_t offset, uint32_t len,
 int kvspaceSetPart(void *h, const char *key, uint32_t offset,
                     const uint8_t *buf, uint32_t buf_len, char *err,
                     uint32_t err_cap) {
-    int32_t total = 0;
-    uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 1, &total);
-    if (!d || total < 0 || offset + buf_len > (uint32_t)total) {
+    if (kvspaceShmSetPart((kvspace_t *)h, key, offset, buf, buf_len) != 0) {
         if (err && err_cap)
-            snprintf(err, err_cap, "kvspace: set-part out of range at %s", key);
+            snprintf(err, err_cap, "kvspace: set-part out of range at %s",
+                     key ? key : "");
         return 1;
     }
-    memcpy(d + offset, buf, buf_len);
     return 0;
 }
 
@@ -264,85 +265,95 @@ int kvspaceListLen(void *h, const char *prefix, int expand_ext, int resolve,
 int kvspaceListAt(void *h, const char *prefix, int expand_ext, int resolve,
                   int32_t idx, uint8_t *buf, uint32_t buf_cap,
                   uint32_t *out_len) {
-    *out_len = 0;
-    char **names = NULL;
-    int32_t count = 0;
-    if (kvspaceShmList((kvspace_t *)h, prefix, expand_ext != 0, resolve, &names,
-                       &count) != 0)
-        return -1;
-    int rc = -1;
-    if (idx >= 0 && idx < count) {
-        size_t l = strlen(names[idx]);
-        *out_len = (uint32_t)l;
-        if (buf && l <= buf_cap) {
-            memcpy(buf, names[idx], l);
-            rc = 0;
-        }
-    }
-    for (int32_t i = 0; i < count; i++)
-        free(names[i]);
-    free(names);
-    return rc;
+    return kvspaceShmListAt((kvspace_t *)h, prefix, expand_ext != 0, resolve,
+                            idx, buf, buf_cap, out_len);
 }
 
 int kvspaceDel(void *h, const char *const *keys, uint32_t nkeys, char *err,
                uint32_t err_cap) {
-    (void)err;
-    (void)err_cap;
-    for (uint32_t i = 0; i < nkeys; i++)
+    if (!h || (!keys && nkeys > 0)) {
+        if (err && err_cap)
+            snprintf(err, err_cap, "kvspace: invalid arguments to del");
+        return 1;
+    }
+    for (uint32_t i = 0; i < nkeys; i++) {
+        if (!keys[i]) {
+            if (err && err_cap)
+                snprintf(err, err_cap, "kvspace: null key in del at index %u", i);
+            return 1;
+        }
+        /* Missing keys and >=1024-byte keys are idempotent no-ops in KV del. */
         kvspaceShmDel((kvspace_t *)h, keys[i]);
+    }
     return 0;
 }
 
 int kvspaceDelTree(void *h, const char *prefix, char *err, uint32_t err_cap) {
-    (void)err;
-    (void)err_cap;
-    return kvspaceShmDeltree((kvspace_t *)h, prefix);
+    int rc = kvspaceShmDeltree((kvspace_t *)h, prefix);
+    if (rc != 0 && err && err_cap)
+        snprintf(err, err_cap, "kvspace: deltree failed at %s",
+                 prefix ? prefix : "(null)");
+    return rc;
 }
 
 int kvspaceCp(void *h, const char *src, const char *dst, char *err,
               uint32_t err_cap) {
-    (void)err;
-    (void)err_cap;
-    return kvspaceShmCp((kvspace_t *)h, src, dst);
+    int rc = kvspaceShmCp((kvspace_t *)h, src, dst);
+    if (rc != 0 && err && err_cap)
+        snprintf(err, err_cap, "kvspace: cp failed from %s to %s",
+                 src ? src : "(null)", dst ? dst : "(null)");
+    return rc;
 }
 
 int kvspaceCpTree(void *h, const char *src, const char *dst, char *err,
-                  uint32_t err_cap) {
-    (void)err;
-    (void)err_cap;
-    return kvspaceShmCptree((kvspace_t *)h, src, dst);
+                   uint32_t err_cap) {
+    int rc = kvspaceShmCptree((kvspace_t *)h, src, dst);
+    if (rc != 0 && err && err_cap)
+        snprintf(err, err_cap, "kvspace: cptree failed from %s to %s",
+                 src ? src : "(null)", dst ? dst : "(null)");
+    return rc;
 }
 
 int kvspaceCpList(void *h, const char *src, const char *dst, char *err,
-                  uint32_t err_cap) {
-    (void)err;
-    (void)err_cap;
-    return kvspaceShmCplist((kvspace_t *)h, src, dst);
+                   uint32_t err_cap) {
+    int rc = kvspaceShmCplist((kvspace_t *)h, src, dst);
+    if (rc != 0 && err && err_cap)
+        snprintf(err, err_cap, "kvspace: cplist failed from %s to %s",
+                 src ? src : "(null)", dst ? dst : "(null)");
+    return rc;
 }
 
 int kvspaceMkindex(void *h, const char *path, uint32_t capacity, char *err,
                    uint32_t err_cap) {
-    (void)err;
-    (void)err_cap;
-    return kvspaceShmMkindex((kvspace_t *)h, path, capacity);
+    int rc = kvspaceShmMkindex((kvspace_t *)h, path, capacity);
+    if (rc != 0 && err && err_cap)
+        snprintf(err, err_cap, "kvspace: mkindex failed at %s",
+                 path ? path : "(null)");
+    return rc;
 }
 
 int kvspaceMkindexExt(void *h, const char *path, const char *ext_path,
                       char *err, uint32_t err_cap) {
-    return kvspaceShmExtindex((kvspace_t *)h, path, ext_path, err, err_cap);
+    int rc = kvspaceShmExtindex((kvspace_t *)h, path, ext_path, err, err_cap);
+    if (rc != 0 && err && err_cap && err[0] == '\0')
+        snprintf(err, err_cap, "kvspace: mkindex-ext failed at %s -> %s",
+                 path ? path : "(null)", ext_path ? ext_path : "(null)");
+    return rc;
 }
 
 int kvspaceRmindexExt(void *h, const char *path, char *err, uint32_t err_cap) {
-    (void)err;
-    (void)err_cap;
-    return kvspaceShmDelextindex((kvspace_t *)h, path);
+    int rc = kvspaceShmDelextindex((kvspace_t *)h, path);
+    if (rc != 0 && err && err_cap)
+        snprintf(err, err_cap, "kvspace: rmindex-ext failed at %s",
+                 path ? path : "(null)");
+    return rc;
 }
 
 int kvspaceClear(void *h, char *err, uint32_t err_cap) {
-    (void)err;
-    (void)err_cap;
-    return kvspaceShmDeltree((kvspace_t *)h, "/");
+    int rc = kvspaceShmDeltree((kvspace_t *)h, "/");
+    if (rc != 0 && err && err_cap)
+        snprintf(err, err_cap, "kvspace: clear failed");
+    return rc;
 }
 
 /* New* 统一收口：New* 构造 head+body（malloc），total 超 u32 上限即失败。 */
@@ -416,6 +427,21 @@ int kvspaceNewFloat64(double v, const char *langtype,
     return rc == 0 ? finish(value, total, out, out_len) : 1;
 }
 
+static int wire_is_none(const uint8_t *d, uint32_t len) {
+    if (!d || len == 0)
+        return 1;
+    if (len < KVSPACE_XVALUE_HEAD_LEN)
+        return 0;
+    const kvspaceXvalueHead *xh = (const kvspaceXvalueHead *)d;
+    if (xh->storetype != KVSPACE_XVALUE_ST_SHORT ||
+        xh->ptr != KVSPACE_XVALUE_PTR_INLINE ||
+        kvspaceXvalueHeadLen(xh) != 0)
+        return 0;
+    const uint8_t *lt = NULL;
+    uint16_t ltn = kvspaceXvalueHeadLangtypeBounded(d, len, &lt);
+    return ltn == 0 || (ltn == 4 && memcmp(lt, "None", 4) == 0);
+}
+
 int kvspaceWatch(void *h, const char *key, const uint8_t *target,
                  uint32_t target_len, uint64_t tick_ns, uint8_t **out,
                  uint32_t *out_len) {
@@ -423,13 +449,20 @@ int kvspaceWatch(void *h, const char *key, const uint8_t *target,
         return 1;
     *out = NULL;
     *out_len = 0;
+    const int target_is_none = wire_is_none(target, target_len);
     struct timespec t0, tn;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (;;) {
         int32_t len = 0;
         uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 1, &len);
-        if (d && (uint32_t)len == target_len &&
-            memcmp(d, target, target_len) == 0) {
+        if (target_is_none) {
+            if (!d || len <= 0 || wire_is_none(d, (uint32_t)len)) {
+                *out = d;
+                *out_len = (d && len > 0) ? (uint32_t)len : 0;
+                return 0;
+            }
+        } else if (d && (uint32_t)len == target_len &&
+                   memcmp(d, target, target_len) == 0) {
             *out = d;
             *out_len = (uint32_t)len;
             return 0;
