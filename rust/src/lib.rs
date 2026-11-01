@@ -50,13 +50,16 @@ mod ffi {
             kv: *mut std::ffi::c_void,
             path: *const c_char,
             extpath: *const c_char,
+            err: *mut c_char,
+            err_cap: u32,
         ) -> i32;
-        // Head 构造（#566：head 固定 8 字节 [len:u48][storetype][ptr]，直接 memcpy
-        // struct + body——构造器输出 frontend malloc，由调用方 free）。
+        // Header constructors (#566/#571: fixed 8-byte header + body + attr region;
+        // empty string = untyped; malloc-allocated output freed by caller).
         pub fn kvspaceXvalueHeadNewScalar(
             storetype: u8,
             raw: *const u8,
             raw_len: u32,
+            langtype: *const c_char,
             out: *mut *mut u8,
             out_len: *mut u64,
         ) -> i32;
@@ -64,18 +67,21 @@ mod ffi {
             data: *const u8,
             data_len: u64,
             cap: u64,
+            langtype: *const c_char,
             out: *mut *mut u8,
             out_len: *mut u64,
         ) -> i32;
         pub fn kvspaceXvalueHeadNewPtr(
             path: *const u8,
             path_len: u32,
+            langtype: *const c_char,
             out: *mut *mut u8,
             out_len: *mut u64,
         ) -> i32;
         pub fn kvspaceXvalueHeadNewExt(
             locator: *const u8,
             locator_len: u32,
+            langtype: *const c_char,
             out: *mut *mut u8,
             out_len: *mut u64,
         ) -> i32;
@@ -86,9 +92,9 @@ mod ffi {
 
 // ── xvalue helpers ─────────────────────────────────────────────
 //
-// #566：head 固定 8 字节 [len:u48][storetype][ptr]，body 偏移恒 8。直接 memcpy
-// struct + body——构造走 C 构造器 kvspaceXvalueHeadNew*，读取本地 memcpy 固定头 + 字段访问。
-// langtype 不在 head（x‥langtype attr key），固定头读取只给存储元数据。
+// #566/#571: Fixed 8-byte header [len:u48][storetype][ptr], body at offset 8, attr at 8+len
+// ([attr_len:u16][records], tag 1 = langtype), total = 8 + len + attr_len. Constructed via C
+// kvspaceXvalueHeadNew*; helpers here write untyped values (empty attr).
 
 pub mod xvalue {
     use super::ffi;
@@ -101,8 +107,10 @@ pub mod xvalue {
     pub const PTR_PTR: u8 = 1;
     pub const PTR_EXT: u8 = 2;
     pub const HEAD_LEN: usize = 8;
+    /// Empty langtype (untyped, empty attr).
+    const NO_TYPE: *const c_char = b"\0".as_ptr() as *const c_char;
 
-    /// 取 C 构造器 malloc 输出（to_vec 后 free）。
+    /// Copy and free malloc buffer returned by C constructor.
     fn take(out: *mut u8, total: u64) -> Vec<u8> {
         let bytes = unsafe { std::slice::from_raw_parts(out, total as usize).to_vec() };
         unsafe { ffi::free(out as *mut std::ffi::c_void) };
@@ -114,7 +122,7 @@ pub mod xvalue {
         let mut total: u64 = 0;
         let raw = v.to_le_bytes();
         let rc = unsafe {
-            ffi::kvspaceXvalueHeadNewScalar(ST_SHORT, raw.as_ptr(), 8, &mut out, &mut total)
+            ffi::kvspaceXvalueHeadNewScalar(ST_SHORT, raw.as_ptr(), 8, NO_TYPE, &mut out, &mut total)
         };
         if rc != 0 {
             return Vec::new();
@@ -126,7 +134,7 @@ pub mod xvalue {
         let mut total: u64 = 0;
         let raw = v.to_le_bytes();
         let rc = unsafe {
-            ffi::kvspaceXvalueHeadNewScalar(ST_SHORT, raw.as_ptr(), 8, &mut out, &mut total)
+            ffi::kvspaceXvalueHeadNewScalar(ST_SHORT, raw.as_ptr(), 8, NO_TYPE, &mut out, &mut total)
         };
         if rc != 0 {
             return Vec::new();
@@ -141,6 +149,7 @@ pub mod xvalue {
                 s.as_ptr(),
                 s.len() as u64,
                 s.len() as u64,
+                NO_TYPE,
                 &mut out,
                 &mut total,
             )
@@ -150,31 +159,31 @@ pub mod xvalue {
         }
         take(out, total)
     }
-    /// 目录值（空 body 的 SHORT 头）。
+    /// Directory value (empty-body SHORT header).
     pub fn index() -> Vec<u8> {
         let mut out: *mut u8 = ptr::null_mut();
         let mut total: u64 = 0;
         let rc = unsafe {
-            ffi::kvspaceXvalueHeadNewScalar(ST_SHORT, ptr::null(), 0, &mut out, &mut total)
+            ffi::kvspaceXvalueHeadNewScalar(ST_SHORT, ptr::null(), 0, NO_TYPE, &mut out, &mut total)
         };
         if rc != 0 {
             return Vec::new();
         }
         take(out, total)
     }
-    /// 指针值（ptr 位）：body = 目标 key。langtype 由调用方写 x‥langtype attr key。
+    /// Pointer value (ptr=PTR): body = target key.
     pub fn link(target: &str) -> Vec<u8> {
         let mut out: *mut u8 = ptr::null_mut();
         let mut total: u64 = 0;
         let rc = unsafe {
-            ffi::kvspaceXvalueHeadNewPtr(target.as_ptr(), target.len() as u32, &mut out, &mut total)
+            ffi::kvspaceXvalueHeadNewPtr(target.as_ptr(), target.len() as u32, NO_TYPE, &mut out, &mut total)
         };
         if rc != 0 {
             return Vec::new();
         }
         take(out, total)
     }
-    /// 外部定位符（EXT class）：body = locator。langtype 由调用方写 x‥langtype attr key。
+    /// External locator (EXT class): body = locator.
     pub fn ext(locator: &str) -> Vec<u8> {
         let mut out: *mut u8 = ptr::null_mut();
         let mut total: u64 = 0;
@@ -182,6 +191,7 @@ pub mod xvalue {
             ffi::kvspaceXvalueHeadNewExt(
                 locator.as_ptr(),
                 locator.len() as u32,
+                NO_TYPE,
                 &mut out,
                 &mut total,
             )
@@ -192,20 +202,28 @@ pub mod xvalue {
         take(out, total)
     }
 
-    /// 读固定头 → (ref, storetype, body)。ref 由 ptr 位推导；body 借用 data。
-    /// langtype 不在 head，kind 无从解析（读 x‥langtype attr key 是调用方的事）。
+    /// Read fixed header -> (ref, storetype, body) excluding attr; returns (0, 0, &[]) if invalid.
     pub fn from_wire(data: &[u8]) -> (u8, u8, &[u8]) {
-        if data.len() < HEAD_LEN {
+        if data.len() < HEAD_LEN + 2 {
             return (0, 0, &[]);
         }
-        let len6 = &data[..6];
         let mut body_len: u64 = 0;
-        for (i, b) in len6.iter().enumerate() {
+        for (i, b) in data[..6].iter().enumerate() {
             body_len |= (*b as u64) << (8 * i);
         }
         let storetype = data[6];
         let ptr = data[7];
-        if storetype > ST_EXT || ptr > PTR_EXT || HEAD_LEN + body_len as usize > data.len() {
+        let Ok(blen) = usize::try_from(body_len) else {
+            return (0, 0, &[]);
+        };
+        let Some(a) = HEAD_LEN.checked_add(blen) else {
+            return (0, 0, &[]);
+        };
+        if storetype > ST_EXT || ptr > PTR_EXT || a + 2 > data.len() {
+            return (0, 0, &[]);
+        }
+        let attr_len = u16::from_le_bytes([data[a], data[a + 1]]) as usize;
+        if attr_len < 2 || a + attr_len != data.len() {
             return (0, 0, &[]);
         }
         let r#ref = if ptr == PTR_PTR {
@@ -215,7 +233,7 @@ pub mod xvalue {
         } else {
             0
         };
-        (r#ref, storetype, &data[HEAD_LEN..])
+        (r#ref, storetype, &data[HEAD_LEN..a])
     }
 }
 
@@ -301,7 +319,7 @@ impl KVSpace {
         let cp = CString::new(path).unwrap();
         let ce = CString::new(extpath).unwrap();
         unsafe {
-            ffi::kvspaceShmExtindex(self.ptr, cp.as_ptr(), ce.as_ptr());
+            ffi::kvspaceShmExtindex(self.ptr, cp.as_ptr(), ce.as_ptr(), ptr::null_mut(), 0);
         }
     }
 }

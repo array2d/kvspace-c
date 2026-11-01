@@ -12,15 +12,18 @@ Backend: `shm://` — single file-backed mmap block (ART-tree key index + slotsb
 
 ```bash
 make            # → build/libkvspace-c.so
+make test       # → build-test/, runs ctest (needs the kvspace ABI headers)
 ```
 
-Dependencies: [`blockmalloc`](../blockmalloc), [`slotsboxmalloc`](../slotsboxmalloc) (header-only + `.so` dual-mode libraries).
+Dependencies: [`blockmalloc`](../blockmalloc), [`slotsboxmalloc`](../slotsboxmalloc) (header-only, compiled into this library).
+Tests additionally include the authoritative ABI header `<kvspace/kvspace.h>` from [`kvspace`](../kvspace) (`include/`).
+`ci/deps.sh` installs all three at the versions pinned in `deps.json`.
 
 ## API
 
 Two surfaces:
 
-1. **Native C API** (`kvspaceShm*`) — `include/kvspace/kvspace.h`:
+1. **Native C API** (`kvspaceShm*`) — `src/kvspace_shm.h` (internal header):
    `kvspaceShmOpen/Close`, `kvspaceShmGet/Set`, `kvspaceShmList`, `kvspaceShmDel/Deltree`, `kvspaceShmMkindex`, `kvspaceShmExtindex/Delextindex`, `kvspaceShmNotify/Watch`.
 
 2. **durable C ABI** — byte-compatible with `kvspace-durable` (`src/durable_abi.c`):
@@ -33,24 +36,30 @@ Two surfaces:
 
 ## XValue
 
-Fixed 8-byte head wire format (`#566`), read/written by direct `memcpy` of the
-`kvspaceXvalueHead` struct:
+Fixed 8-byte head (`#566`) followed by the body and an attr region (`#571`), stored as one value under one key:
 
 ```
-[len:u48 le @0-5][storetype:u8 @6][ptr:u8 @7][body @8]
+[len:u48 le @0-5][storetype:u8 @6][ptr:u8 @7][body @8][attr @8+len]
+attr = [attr_len:u16 le][records]      attr_len includes itself; empty attr = 2
+record = [tag:u8][len:u16 le][data]    tag 1 = langtype (kindexpr); 2+ reserved
+total = 8 + len + attr_len
 ```
 
 - storetype selects short, slack, large, or extension storage; ptr marks pointer/ext.
-- langtype (kindexpr) is not in the head — it lives in the `x‥langtype` attr key.
-- The head is built with `kvspaceXvalueHeadNew*` constructors.
+- langtype (kindexpr) is the tag-1 record of the attr region; no record = untyped.
+- Values are built with the `kvspaceXvalueHeadNew*` constructors. `kvspaceSetValue`
+  rejects values whose attr region is missing or runs past the value.
+- Store format version 6 (this wire). Stores written by older versions are refused at open; rebuild them.
 
-## Tutorial
+## Tests
 
 ```bash
-python3 tutorial/test.py
+make test                                                  # C tests (ctest)
+KVSPACE_C_SO=build/libkvspace-c.so python3 py/tests/test_wire.py
+(cd rust && cargo test)                                    # links ../build
 ```
 
-Cases: `01_basic.c`, `02_cpp.cpp`, `03_python.py`, `04_rust.rs`, `05_integrity.c`, `06_multiprocess.c`.
+Cross-language tutorials live in the [`kvspace`](../kvspace) repo (`tutorial-c/`).
 
 ## Language wrappers
 
