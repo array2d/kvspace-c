@@ -58,6 +58,9 @@ uint8_t *kvspaceShmGetByRef(kvspace_t *kv, kvspaceRef_t *ref,
 /* shm slot view：返回映射内 head/body 与整 box 物理容量。0=成功，-1=不可视槽。 */
 int kvspaceShmXvalueBodyView(kvspace_t *kv, const kvspaceRef_t *ref,
                        const char *key_fallback, kvspaceXvalueBodyView_t *out);
+/* 定位写的前置条件：只允许改 body [8, 8+len)，head 与 attr 一律不可写。 */
+int kvspaceShmPartInBody(const uint8_t *raw, int32_t total, uint32_t offset,
+                         uint32_t buf_len);
 int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
                            const char *key_fallback, uint32_t offset,
                            const uint8_t *buf, uint32_t buf_len);

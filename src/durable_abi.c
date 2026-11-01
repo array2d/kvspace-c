@@ -187,7 +187,7 @@ int kvspaceSetPart(void *h, const char *key, uint32_t offset,
                     uint32_t err_cap) {
     int32_t total = 0;
     uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 1, &total);
-    if (!d || total < 0 || offset + buf_len > (uint32_t)total) {
+    if (!d || total < 0 || !kvspaceShmPartInBody(d, total, offset, buf_len)) {
         if (err && err_cap)
             snprintf(err, err_cap, "kvspace: set-part out of range at %s", key);
         return 1;

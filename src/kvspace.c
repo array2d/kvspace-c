@@ -809,7 +809,7 @@ int kvspaceShmViewWrite(kvspace_t *kv, kvspaceViewToken_t *tok,
         return -1;
     if (kvspaceShmViewCheck(kv, tok) != 0)
         return 1;
-    if (len > tok->body_cap)
+    if (len > tok->body_cap || len != tok->value_len)
         return 1;
     kv_gens_t *g = gens_at(kv, (int32_t)tok->node_id);
     if (!g)
@@ -2788,6 +2788,22 @@ uint8_t *kvspaceShmGetByRef(kvspace_t *kv, kvspaceRef_t *ref,
     return raw;
 }
 
+/* 定位写的前置条件：只允许改 body [8, 8+len)，head 与 attr 一律不可写。 */
+int kvspaceShmPartInBody(const uint8_t *raw, int32_t total, uint32_t offset,
+                         uint32_t buf_len) {
+    if (!raw || total < (int32_t)KVSPACE_XVALUE_HEAD_LEN)
+        return 0;
+    kvspaceXvalueHead h;
+    memcpy(&h, raw, sizeof h);
+    const uint64_t len = kvspaceXvalueHeadLen(&h);
+    if (len > (uint64_t)total - KVSPACE_XVALUE_HEAD_LEN)
+        return 0;
+    if (offset < KVSPACE_XVALUE_HEAD_LEN)
+        return 0;
+    const uint64_t rel = (uint64_t)offset - KVSPACE_XVALUE_HEAD_LEN;
+    return rel <= len && (uint64_t)buf_len <= len - rel;
+}
+
 int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
                            const char *key_fallback, uint32_t offset,
                            const uint8_t *buf, uint32_t buf_len) {
@@ -2814,10 +2830,12 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
                 /* per-box 物理容量：损坏 head 的 len 可能大于 box 但仍在全局内，
                  * 不做这一步会跨 box 写坏相邻值。 */
                 uint64_t cap = sbo_allocated_size(kv->sbo_meta, off);
+                const uint64_t rel =
+                    offset >= KVSPACE_XVALUE_HEAD_LEN
+                        ? (uint64_t)offset - KVSPACE_XVALUE_HEAD_LEN
+                        : UINT64_MAX;
                 if (cap <= data_size - off && len <= cap - KVSPACE_XVALUE_HEAD_LEN &&
-                    (uint64_t)offset <= KVSPACE_XVALUE_HEAD_LEN + len &&
-                    (uint64_t)buf_len <=
-                        KVSPACE_XVALUE_HEAD_LEN + len - (uint64_t)offset) {
+                    rel <= len && (uint64_t)buf_len <= len - rel) {
                     kv_gens_t *g = gens_at(kv, id);
                     if (g)
                         __atomic_add_fetch(&g->value_gen, 1u,
@@ -2838,7 +2856,7 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
             return -1;
         int32_t rl = 0;
         uint8_t *d = kvspaceShmGet(kv, key_fallback, 0, &rl);
-        if (!d || offset + buf_len > (uint32_t)rl)
+        if (!d || !kvspaceShmPartInBody(d, rl, offset, buf_len))
             return -1;
         kvspaceShmResolveRef(kv, key_fallback, ref);
         kv_gens_t *g = gens_at(kv, (int32_t)ref->block_id);
@@ -2852,7 +2870,7 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
     uint8_t *raw;
     int32_t rl;
     if (read_value(kv, AV_OFF(hv), &raw, &rl) < 0 ||
-        offset + buf_len > (uint32_t)rl)
+        !kvspaceShmPartInBody(raw, rl, offset, buf_len))
         return -1;
     kv_gens_t *g2 = gens_at(kv, id);
     if (g2)

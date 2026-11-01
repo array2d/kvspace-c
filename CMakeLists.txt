@@ -80,6 +80,11 @@ if(KVSPACE_BUILD_TESTS)
     target_link_libraries(test_slot_view PRIVATE kvspace-c)
     add_test(NAME slot_view COMMAND test_slot_view)
 
+    add_executable(test_inplace_body_only tests/test_inplace_body_only.c)
+    target_include_directories(test_inplace_body_only PRIVATE src)
+    target_link_libraries(test_inplace_body_only PRIVATE kvspace-c)
+    add_test(NAME inplace_body_only COMMAND test_inplace_body_only)
+
     add_executable(test_art_alignment tests/test_art_alignment.c)
     target_include_directories(test_art_alignment PRIVATE src)
     target_compile_definitions(test_art_alignment PRIVATE P2_TEST_HOOKS)
