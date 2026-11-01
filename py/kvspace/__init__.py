@@ -28,29 +28,31 @@ _bind(_lib.kvspaceShmGet, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctype
 _bind(_lib.kvspaceShmSet, [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_int32], ctypes.c_int)
 _bind(_lib.kvspaceShmDel, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
 _bind(_lib.kvspaceShmDeltree, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
-_bind(_lib.kvspaceShmMkindex, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
+_bind(_lib.kvspaceShmMkindex, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
 _bind(_lib.kvspaceShmList, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_bool, ctypes.c_int,
                            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_int32)], ctypes.c_int)
-_bind(_lib.kvspaceShmExtindex, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p], ctypes.c_int)
+_bind(_lib.kvspaceShmExtindex, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+                               ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
 _bind(_lib.kvspaceShmDelextindex, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
 _bind(_lib.kvspaceShmNotify, [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_int32], ctypes.c_int)
 _bind(_lib.kvspaceShmWatch, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32)], ctypes.POINTER(ctypes.c_uint8))
 
 # ── 权威 head 构造器绑定（kvspace ABI，无 handle）──────────────────
-# #566：head 固定 8 字节 [len:u48][storetype][ptr]，body 偏移恒 8。直接 memcpy
-# struct + body——构造走 C 构造器 kvspaceXvalueHeadNew*，读取本地 memcpy 固定头 + 字段访问。
+# #566/#571: Fixed 8-byte header [len:u48][storetype][ptr], body at offset 8, attr at
+# 8+len ([attr_len:u16][records], record = [tag:u8][len:u16][data], tag 1 = langtype).
+# Constructed via C kvspaceXvalueHeadNew*; parsed locally on read.
 
 _U8P = ctypes.POINTER(ctypes.c_uint8)
 _U8PP = ctypes.POINTER(_U8P)
 _U64P = ctypes.POINTER(ctypes.c_uint64)
 _bind(_lib.kvspaceXvalueHeadNewScalar,
-      [ctypes.c_uint8, _U8P, ctypes.c_uint32, _U8PP, _U64P], ctypes.c_int)
+      [ctypes.c_uint8, _U8P, ctypes.c_uint32, ctypes.c_char_p, _U8PP, _U64P], ctypes.c_int)
 _bind(_lib.kvspaceXvalueHeadNewSlack,
-      [_U8P, ctypes.c_uint64, ctypes.c_uint64, _U8PP, _U64P], ctypes.c_int)
+      [_U8P, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_char_p, _U8PP, _U64P], ctypes.c_int)
 _bind(_lib.kvspaceXvalueHeadNewPtr,
-      [_U8P, ctypes.c_uint32, _U8PP, _U64P], ctypes.c_int)
+      [_U8P, ctypes.c_uint32, ctypes.c_char_p, _U8PP, _U64P], ctypes.c_int)
 _bind(_lib.kvspaceXvalueHeadNewExt,
-      [_U8P, ctypes.c_uint32, _U8PP, _U64P], ctypes.c_int)
+      [_U8P, ctypes.c_uint32, ctypes.c_char_p, _U8PP, _U64P], ctypes.c_int)
 
 ST_SHORT, ST_SLACK, ST_LARGE, ST_EXT = 0, 1, 2, 3
 PTR_INLINE, PTR_PTR, PTR_EXT = 0, 1, 2
@@ -61,8 +63,11 @@ REF_INLINE, REF_PTR, REF_EXT = 0, 1, 2
 
 
 # ── XValue helpers ────────────────────────────────────────────────
-# 构造走 C 构造器（输出 frontend malloc，_take 拷出后 free）；读取本地
-# memcpy 固定头 + 字段访问。
+# Construct via C constructors (_take copies and frees malloc buffer); parse header + attr locally.
+# Empty langtype = untyped (empty attr).
+
+ATTR_TAG_LANGTYPE = 1
+
 
 def _take(out, total: ctypes.c_uint64) -> bytes:
     data = ctypes.string_at(out, total.value)
@@ -74,61 +79,95 @@ def _new(fn, *args) -> bytes:
     out = _U8P()
     total = ctypes.c_uint64()
     if fn(*args, ctypes.byref(out), ctypes.byref(total)):
-        raise ValueError(f"{fn.__name__} 构造失败")
+        raise ValueError(f"{fn.__name__} failed")
     return _take(out, total)
 
 
-def _xv_scalar(raw: bytes) -> bytes:
-    buf = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw) if raw else None
-    return _new(_lib.kvspaceXvalueHeadNewScalar, ST_SHORT,
-                ctypes.cast(buf, _U8P) if buf is not None else None, len(raw))
+def _u8buf(raw: bytes):
+    if not raw:
+        return None
+    return ctypes.cast((ctypes.c_uint8 * len(raw)).from_buffer_copy(raw), _U8P)
 
 
-def _xv_slack(raw: bytes) -> bytes:
-    buf = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw) if raw else None
-    return _new(_lib.kvspaceXvalueHeadNewSlack,
-                ctypes.cast(buf, _U8P) if buf is not None else None, len(raw), len(raw))
+def _xv_scalar(raw: bytes, langtype: str) -> bytes:
+    return _new(_lib.kvspaceXvalueHeadNewScalar, ST_SHORT, _u8buf(raw), len(raw),
+                langtype.encode())
+
+
+def _xv_slack(raw: bytes, langtype: str) -> bytes:
+    return _new(_lib.kvspaceXvalueHeadNewSlack, _u8buf(raw), len(raw), len(raw),
+                langtype.encode())
+
+
+def _split_wire(data: Optional[bytes]):
+    """Validate and split wire into (storetype, ptr, body, attr); returns None if malformed."""
+    if not data or len(data) < HEAD_LEN + 2:
+        return None
+    body_len = int.from_bytes(data[:6], "little")
+    storetype, ptr = data[6], data[7]
+    if storetype > ST_EXT or ptr > PTR_EXT or HEAD_LEN + body_len + 2 > len(data):
+        return None
+    a = HEAD_LEN + body_len
+    attr_len = int.from_bytes(data[a:a + 2], "little")
+    if attr_len < 2 or a + attr_len != len(data):
+        return None
+    return storetype, ptr, data[HEAD_LEN:a], data[a:a + attr_len]
 
 
 def _xv_from_wire(data: Optional[bytes]) -> tuple[int, int, bytes]:
-    """读固定头 → (ref, storetype, body)。langtype 不在 head，kind 无从解析。"""
-    if not data or len(data) < HEAD_LEN:
+    """Read fixed header -> (ref, storetype, body) excluding attr; returns (0, 0, b"") if invalid."""
+    parts = _split_wire(data)
+    if parts is None:
         return (0, 0, b"")
-    body_len = int.from_bytes(data[:6], "little")
-    storetype, ptr = data[6], data[7]
-    if storetype > ST_EXT or ptr > PTR_EXT or HEAD_LEN + body_len != len(data):
-        return (0, 0, b"")
+    storetype, ptr, body, _ = parts
     ref = REF_PTR if ptr == PTR_PTR else REF_EXT if ptr == PTR_EXT else REF_INLINE
-    return (ref, storetype, data[HEAD_LEN:])
+    return (ref, storetype, body)
 
 
-def xv_int(v: int) -> bytes:
-    return _xv_scalar(struct.pack("<q", v))
+def xv_langtype(data: Optional[bytes]) -> str:
+    """Read attr tag=1 (langtype) record; returns "" if untyped or invalid."""
+    parts = _split_wire(data)
+    if parts is None:
+        return ""
+    attr = parts[3]
+    p = 2
+    while p + 3 <= len(attr):
+        tag, rlen = attr[p], int.from_bytes(attr[p + 1:p + 3], "little")
+        if p + 3 + rlen > len(attr):
+            return ""
+        if tag == ATTR_TAG_LANGTYPE:
+            return attr[p + 3:p + 3 + rlen].decode()
+        p += 3 + rlen
+    return ""
 
 
-def xv_float(v: float) -> bytes:
-    return _xv_scalar(struct.pack("<d", v))
+def xv_int(v: int, langtype: str = "") -> bytes:
+    return _xv_scalar(struct.pack("<q", v), langtype)
 
 
-def xv_str(s: str) -> bytes:
-    return _xv_slack(s.encode())
+def xv_float(v: float, langtype: str = "") -> bytes:
+    return _xv_scalar(struct.pack("<d", v), langtype)
+
+
+def xv_str(s: str, langtype: str = "") -> bytes:
+    return _xv_slack(s.encode(), langtype)
 
 
 def xv_index() -> bytes:
-    """目录值（空 body 的 SHORT 头）。"""
-    return _xv_scalar(b"")
+    """Directory value (empty-body SHORT header, untyped)."""
+    return _xv_scalar(b"", "")
 
 
-def xv_link(target: str) -> bytes:
-    """指针值（ptr 位）：body=目标 key。langtype 由调用方写 x‥langtype attr key。"""
-    buf = (ctypes.c_uint8 * len(target)).from_buffer_copy(target.encode())
-    return _new(_lib.kvspaceXvalueHeadNewPtr, buf, len(target))
+def xv_link(target: str, langtype: str = "") -> bytes:
+    """Pointer value (ptr=PTR): body=target key, langtype=target constraint ("" = unconstrained)."""
+    t = target.encode()
+    return _new(_lib.kvspaceXvalueHeadNewPtr, _u8buf(t), len(t), langtype.encode())
 
 
-def xv_ext(locator: str) -> bytes:
-    """外部定位符（EXT class）：body=locator。langtype 由调用方写 x‥langtype attr key。"""
-    buf = (ctypes.c_uint8 * len(locator)).from_buffer_copy(locator.encode())
-    return _new(_lib.kvspaceXvalueHeadNewExt, buf, len(locator))
+def xv_ext(locator: str, langtype: str = "") -> bytes:
+    """External locator (EXT class): body=locator."""
+    loc = locator.encode()
+    return _new(_lib.kvspaceXvalueHeadNewExt, _u8buf(loc), len(loc), langtype.encode())
 
 
 # ── KVSpace ─────────────────────────────────────────────────────
@@ -177,22 +216,29 @@ class KVSpace:
 
     # ── Directory ────────────────────────────────────────────
 
-    def mkindex(self, path: str):
-        _lib.kvspaceShmMkindex(self._kv, path.encode())
+    def mkindex(self, path: str, capacity: int = 0):
+        _lib.kvspaceShmMkindex(self._kv, path.encode(), capacity)
 
     def list(self, prefix: str, resolve: bool = True) -> list[str]:
         out = ctypes.c_void_p()
         oc = ctypes.c_int32(0)
         _lib.kvspaceShmList(self._kv, prefix.encode(), False, 1 if resolve else 0, ctypes.byref(out), ctypes.byref(oc))
-        if oc.value == 0:
+        if not out.value:
             return []
-        ptrs = ctypes.cast(out, ctypes.POINTER(ctypes.c_char_p))
-        return [ptrs[i].decode() for i in range(oc.value)]
+        # Copy and free the C-allocated name array.
+        ptrs = ctypes.cast(out, ctypes.POINTER(ctypes.c_void_p))
+        names = [ctypes.string_at(ptrs[i]).decode() for i in range(oc.value)]
+        for i in range(oc.value):
+            _libc.free(ptrs[i])
+        _libc.free(out)
+        return names
 
     # ── Link / ExtIndex ──────────────────────────────────────
 
     def extindex(self, path: str, extpath: str):
-        _lib.kvspaceShmExtindex(self._kv, path.encode(), extpath.encode())
+        err = ctypes.create_string_buffer(256)
+        if _lib.kvspaceShmExtindex(self._kv, path.encode(), extpath.encode(), err, len(err)):
+            raise RuntimeError(err.value.decode() or f"extindex({path}, {extpath}) failed")
 
     def delextindex(self, path: str):
         _lib.kvspaceShmDelextindex(self._kv, path.encode())
