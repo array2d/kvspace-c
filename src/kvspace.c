@@ -162,6 +162,9 @@ typedef struct {
     uint64_t freed_bytes;      /* 只由 leader 改 */
     uint64_t garb_freeing;
     uint64_t round_ok, round_aborted, leak_boxes;
+    /* v6: Key-set generation. Incremented (release) whenever a key appears (insert/revive)
+     * or disappears (delete/tombstone) to invalidate per-handle List caches across processes. */
+    uint64_t list_gen;
     uint32_t claim_seq;        /* 30 位发号；耗尽 open 硬失败 */
     p2_slot_t slots[P2_SLOT_N];
 } kvspace_hdr_t;
@@ -233,7 +236,23 @@ struct kvspace {
     uint8_t *sbo_data;
     watch_t watches[WATCH_TABLE_SZ];
     pthread_mutex_t wlock;
+    /* Per-handle List cache (see list_cached): ListLen + indexed ListAt scans only once.
+     * Hits when (prefix, ex, resolve), resolved target, extindex mount, and hdr->list_gen
+     * all match, producing identical results to a fresh scan. */
+    pthread_mutex_t lc_mtx;
+    char *lc_prefix;
+    char *lc_target;    /* resolved target directory (equals prefix when resolve=0) */
+    char *lc_ext;       /* extindex mount source when ex=1; "" if unmounted */
+    char **lc_names;
+    int32_t lc_count;
+    uint8_t lc_ex, lc_res;
+    uint64_t lc_gen;
 };
+/* Bump after key-set changes (insert/revive/delete) to invalidate List caches across processes.
+ * Ptr/@ext value changes do not bump this since list_cached re-checks target and mount each call. */
+static inline void list_gen_bump(kvspace_t *kv) {
+    __atomic_add_fetch(&kv->hdr->list_gen, 1ull, __ATOMIC_RELEASE);
+}
 
 /* ---- shm region ---- */
 static int region_map(shm_region_t *r, size_t size) {
@@ -264,8 +283,6 @@ static int region_attach(shm_region_t *r, bool create, size_t size,
     return region_map(r, size);
 }
 
-static void region_close(shm_region_t *r); /* fwd */
-
 static void region_close(shm_region_t *r) {
     if (r->base)
         munmap(r->base, r->reserve);
@@ -273,11 +290,8 @@ static void region_close(shm_region_t *r) {
         close(r->fd);
 }
 
-/* Pick up growth done by another process (mid-op growth: kvspace#11). */
-
 /* ── P2: 旁路 gen 表（node id → {struct_gen, value_gen}）──────────── */
 static void kv_sbo_free(kvspace_t *kv, uint64_t off);
-static void p2_setstats_dump(void);
 static art_hdr_t *art_hdr(kvspace_t *kv, int32_t id);
 static int32_t art_child(kvspace_t *kv, void *n, uint8_t b);
 static int pfx_shared(const uint8_t *a, int al, const uint8_t *b, int bl);
@@ -333,6 +347,7 @@ static int64_t gen_alloc_epoch(kvspace_t *kv) {
 static int p2_maint_start(kvspace_t *kv);   /* 懒启动（阈值触发） */
 static bool p2_claim_alive(kvspace_t *kv, uint32_t claim);
 static int kv_sync(kvspace_t *kv);
+static void list_cache_drop(kvspace_t *kv);
 
 /* 阈值：生产固定 64MiB；测试构建可用 P2_TEST_GARB_THRESHOLD_MB 调低。 */
 static uint64_t p2_garb_threshold(void) {
@@ -430,17 +445,13 @@ static int32_t p2_node_at(kvspace_t *kv, const char *key) {
     int32_t nid = kv->hdr->art_root;
     while (nid >= 0) {
         art_hdr_t *h = art_hdr(kv, nid);
-        if (!h || h->type == ART_MOVED) {
-            if (getenv("P2_DEBUG")) { fprintf(stderr, "DBG node_at FAIL key=%s nid=%d type=%d d=%d/%d\n", key, nid, h ? (int)h->type : -1, d, klen); }
+        if (!h || h->type == ART_MOVED)
             return -1;
-        }
         if (h->prefix_len) {
             int s = pfx_shared(h->prefix, h->prefix_len,
                                (const uint8_t *)key + d, klen - d);
-            if (s != h->prefix_len && d + s != klen) {
-                if (getenv("P2_DEBUG")) { fprintf(stderr, "DBG node_at PFX key=%s nid=%d d=%d s=%d plen=%d klen=%d\n", key, nid, d, s, (int)h->prefix_len, klen); }
+            if (s != h->prefix_len && d + s != klen)
                 return -1;
-            }
             d += s;
         }
         /* 键可能正好结束在 prefix_len==0 的分支节点上（如 k1 落在根 N4 的子叶），
@@ -450,7 +461,6 @@ static int32_t p2_node_at(kvspace_t *kv, const char *key) {
         nid = art_child(kv, h, (uint8_t)key[d]);
         d++;
     }
-    if (getenv("P2_DEBUG")) { fprintf(stderr, "DBG node_at EOF key=%s d=%d/%d\n", key, d, klen); }
     return -1;
 }
 
@@ -533,16 +543,6 @@ static int p2_reg_claim(kvspace_t *kv) {
             __atomic_compare_exchange_n(&s->state, &v, P2_SLOT_FREE, false,
                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
     }
-    if (getenv("P2_DEBUG")) {
-        int nf = 0, nm = 0;
-        for (int i = 0; i < P2_SLOT_N; i++) {
-            uint32_t v = __atomic_load_n(&kv->hdr->slots[i].state, __ATOMIC_ACQUIRE);
-            if (v == P2_SLOT_FREE) nf++;
-            else if (v == P2_SLOT_MINE) nm++;
-        }
-        fprintf(stderr, "DBG claim pid=%u start=%llu free=%d mine=%d\n", me,
-                (unsigned long long)st, nf, nm);
-    }
     for (int i = 0; i < P2_SLOT_N; i++) {
         p2_slot_t *s = &kv->hdr->slots[i];
         uint32_t expect = P2_SLOT_FREE;
@@ -624,21 +624,6 @@ static int gens_grow(kvspace_t *kv) {
     return 0;
 }
 
-
-/* ── P2: tombstone 延迟释放（粗粒度 epoch：队满或显式 flush 时统一 free）── */
-
-
-int kvspaceShmXvalueBodyView(kvspace_t *kv, const kvspaceRef_t *ref,
-                       const char *key_fallback, kvspaceXvalueBodyView_t *out);
-static int32_t art_id_of(kvspace_t *kv, const void *p);
-static art_hdr_t *art_hdr(kvspace_t *kv, int32_t id);
-static int32_t art_follow(kvspace_t *kv, int32_t id);
-static int32_t ref_leaf(kvspace_t *kv, kvspaceRef_t *ref, const char *key);
-static int32_t art_walk(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
-                        int d, int32_t *par, int *pard);
-static int32_t art_child(kvspace_t *kv, void *n, uint8_t b);
-static int pfx_shared(const uint8_t *a, int al, const uint8_t *b, int bl);
-
 /* ── P2: 版本化 view token ─────────────────────────────────────── */
 /* fork 检测不能每 op 调 getpid()（本机 glibc 不缓存，一次 ~150ns）。
  * 用 pthread_atfork 的子进程钩子把全局世代 +1；热路径只比两个 u32。 */
@@ -665,6 +650,22 @@ static int head_of(const uint8_t *val, int32_t val_len, kvspaceXvalueHead *out) 
         out->ptr > KVSPACE_XVALUE_PTR_EXT)
         return -1;
     if ((uint64_t)KVSPACE_XVALUE_HEAD_LEN + l > (uint64_t)val_len)
+        return -1;
+    return 0;
+}
+
+/* Write validation: head_of + complete attr region (attr_len >= 2 and within val_len).
+ * read_value derives total length from 8+len+attr_len without storing val_len, so
+ * values with an incomplete attr region would be unreadable if accepted. */
+static int value_ok(const uint8_t *val, int32_t val_len,
+                    kvspaceXvalueHead *out) {
+    if (head_of(val, val_len, out) != 0)
+        return -1;
+    uint64_t l = kvspaceXvalueHeadLen(out);
+    if ((uint64_t)val_len < KVSPACE_XVALUE_HEAD_LEN + l + 2)
+        return -1;
+    uint64_t alen = kvspaceXvalueHeadAttrLen(val, l);
+    if (alen < 2 || alen > (uint64_t)val_len - KVSPACE_XVALUE_HEAD_LEN - l)
         return -1;
     return 0;
 }
@@ -728,17 +729,20 @@ int kvspaceShmResolvePrefix(kvspace_t *kv, const char *path, kvspaceRef_t *ref) 
         art_hdr_t *h = art_hdr(kv, nid);
         if (!h || h->type == ART_MOVED)
             return -1;
+        int s = 0;
         if (h->prefix_len) {
-            int s = pfx_shared(h->prefix, h->prefix_len,
-                               (const uint8_t *)path + d, klen - d);
+            s = pfx_shared(h->prefix, h->prefix_len,
+                           (const uint8_t *)path + d, klen - d);
             if (s != h->prefix_len && d + s != klen)
                 return -1;
             d += s;
-            if (d == klen) {
-                ref->block_id = (uint32_t)nid;
-                ref->depth = (uint32_t)s;   /* 该节点前缀里被 path 覆盖的字节数 */
-                return 0;
-            }
+        }
+        /* path may end at a node with prefix_len == 0 (e.g. "/vthread/1/" next to
+         * "/vthread/10/"); return here before reading path[klen]. */
+        if (d == klen) {
+            ref->block_id = (uint32_t)nid;
+            ref->depth = (uint32_t)s;       /* bytes of this node's prefix covered by path */
+            return 0;
         }
         nid = art_child(kv, h, (uint8_t)path[d]);
         d++;
@@ -802,14 +806,18 @@ int kvspaceShmViewCheck(kvspace_t *kv, const kvspaceViewToken_t *tok) {
     return 0;
 }
 
-/* 热路径写：同尺寸就地写（8B inline 情形）。0=成功；1=需要回落（尺寸/版本不符）。 */
+/* Hot-path write: in-place same-length body write. Returns 0 on success, 1 to fall back.
+ * The attr region immediately follows body (at 8+len), so only writes matching the current
+ * header len are accepted; variable-length writes fall back to full-value write. */
 int kvspaceShmViewWrite(kvspace_t *kv, kvspaceViewToken_t *tok,
                         const uint8_t *data, uint32_t len) {
     if (!kv || P2_VIEW_GUARD(kv))
         return -1;
     if (kvspaceShmViewCheck(kv, tok) != 0)
         return 1;
-    if (len > tok->body_cap || len != tok->value_len)
+    kvspaceXvalueHead cur;
+    memcpy(&cur, tok->head, sizeof cur);
+    if ((uint64_t)len != kvspaceXvalueHeadLen(&cur) || len > tok->body_cap)
         return 1;
     kv_gens_t *g = gens_at(kv, (int32_t)tok->node_id);
     if (!g)
@@ -851,6 +859,7 @@ int kvspaceShmViewDel(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key) {
     }
     __atomic_add_fetch(&g->value_gen, 2u, __ATOMIC_ACQ_REL); /* 静止态保持偶数 */
     garb_commit(kv, gidx, AV_OFF(hv), tok->cap);
+    list_gen_bump(kv);                  /* bump after key removal */
     (void)key;
     return 0;
 }
@@ -1240,10 +1249,6 @@ int kvspaceShmViewSweep(kvspace_t *kv) {
     return p2_round(kv);
 }
 
-int kvspaceShmViewFlushTomb(kvspace_t *kv) {
-    return kvspaceShmViewSweep(kv);
-}
-
 int kvspaceShmViewRefresh(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key) {
     kvspaceViewToken_t t;
     if (kvspaceShmViewResolve(kv, key, &t) != 0)
@@ -1280,12 +1285,19 @@ static int art_slab_grow(kvspace_t *kv) {
    sbo_plock, which excludes sbo_alloc/free/allocated_size in every process. */
 
 /* Free list empty and no room to append. Unlocked calls are a hint only. */
+#ifdef BLOCKMALLOC_COUNT_MASK
+#define BM_MALLOC_BLOCKS(m) blocks_malloc_count(m)
+#define BM_HEAD_SIZE(m)     blocks_head_size(m)
+#else
+#define BM_MALLOC_BLOCKS(m) ((uint64_t)(m)->malloc_blocks)
+#define BM_HEAD_SIZE(m)     ((uint64_t)(m)->sizeof_block_head)
+#endif
 static bool sbo_pool_full(sbo_meta_t *m) {
     blocks_meta_t *p = sbo_pool(m);
     if (p->free_next_id != -1)
         return false;
-    uint64_t next_end = (uint64_t)block_offset(p, p->malloc_blocks) +
-                        p->sizeof_block_head + p->block_size;
+    uint64_t next_end = (uint64_t)block_offset(p, BM_MALLOC_BLOCKS(p)) +
+                        BM_HEAD_SIZE(p) + p->block_size;
     return next_end > p->total_size;
 }
 
@@ -1411,9 +1423,6 @@ static void kv_sbo_free(kvspace_t *kv, uint64_t off) {
     sbo_free(kv->sbo_meta, off);
 }
 
-/* P2: tombstone —— 有界 ring（L1 内）+ 后台 flush 线程。
- * 前台只做：ring[tail & MASK] = off; tail++（release）; 唤醒后台。
- * 队列满时前台等待（backpressure），绝不在调用线程里 sbo_free。 */
 /* ---- helpers ---- */
 static void *art_blk(kvspace_t *kv, int32_t id) {
     if (id < 0)
@@ -1421,25 +1430,66 @@ static void *art_blk(kvspace_t *kv, int32_t id) {
     return kv->art_data + blockdata_offset(kv->art_meta, (uint64_t)id);
 }
 /* Bump-allocate k consecutive blocks; the node spans them (interior heads unused). */
+/* blockmalloc packs sizeof_block_head:4 and malloc_blocks:60 into a single u64 word
+ * between block_size and used_blocks. Lock-free readers (art_blk / art_id_of) read this
+ * word concurrently, so writers holding meta->lock must update the whole word atomically
+ * (via blocks_set_malloc_count when available, or whole-word atomic store fallback). */
+_Static_assert(offsetof(blocks_meta_t, used_blocks) ==
+                   offsetof(blocks_meta_t, block_size) + 2 * sizeof(uint64_t),
+               "blockmalloc: sizeof_block_head/malloc_blocks must share one u64 word");
+#ifdef BLOCKMALLOC_COUNT_MASK
+static inline void bm_set_malloc_blocks(blocks_meta_t *m, uint64_t n) {
+    blocks_set_malloc_count(m, n);
+}
+#else
+#define BM_WORD_OFF (offsetof(blocks_meta_t, block_size) + sizeof(uint64_t))
+static unsigned bm_count_shift(void) {
+    blocks_meta_t t;
+    memset(&t, 0, sizeof t);
+    t.malloc_blocks = 1;
+    uint64_t w;
+    memcpy(&w, (const char *)&t + BM_WORD_OFF, sizeof w);
+    return w ? (unsigned)__builtin_ctzll(w) : 64u;
+}
+/* Caller holds m->lock. */
+static void bm_set_malloc_blocks(blocks_meta_t *m, uint64_t n) {
+    uint64_t *w = (uint64_t *)((char *)m + BM_WORD_OFF);
+    const unsigned sh = bm_count_shift();
+    const uint64_t mask = ((1ULL << 60) - 1) << sh;
+    uint64_t old = __atomic_load_n(w, __ATOMIC_RELAXED);
+    __atomic_store_n(w, (old & ~mask) | ((n << sh) & mask), __ATOMIC_RELEASE);
+}
+#endif
+/* Verify whole-word bitfield layout at open time. */
+static bool bm_layout_ok(void) {
+    blocks_meta_t t;
+    memset(&t, 0, sizeof t);
+    t.sizeof_block_head = 8;
+    t.malloc_blocks = 5;
+    t.used_blocks = 7;
+    bm_set_malloc_blocks(&t, 0x0123456789ABCDEull);
+    return t.sizeof_block_head == 8 && t.malloc_blocks == 0x0123456789ABCDEull &&
+           t.block_size == 0 && t.used_blocks == 7;
+}
 static int64_t art_bump(kvspace_t *kv, uint32_t k) {
     blocks_meta_t *m = kv->art_meta;
     spin_lock(&m->lock);
-    uint64_t id = m->malloc_blocks;
+    uint64_t id = BM_MALLOC_BLOCKS(m);
     if ((uint64_t)block_offset(m, id + k) > m->total_size) {
         spin_unlock(&m->lock);
         return -1;
     }
-    m->malloc_blocks += k;
-    m->used_blocks += k;
     setblock_t(m, kv->art_data + block_offset(m, id), 1, -1);
+    bm_set_malloc_blocks(m, id + k);
+    m->used_blocks += k;
     spin_unlock(&m->lock);
     return (int64_t)id;
 }
 static int32_t art_balloc(kvspace_t *kv, int t) {
-    const uint64_t stride = (uint64_t)kv->art_meta->sizeof_block_head +
-                            kv->art_meta->block_size;
+    const uint64_t head = BM_HEAD_SIZE(kv->art_meta);
+    const uint64_t stride = head + kv->art_meta->block_size;
     const uint32_t k = (uint32_t)(((uint64_t)art_node_sz(t) +
-                                   kv->art_meta->sizeof_block_head + stride - 1) /
+                                   head + stride - 1) /
                                   stride);
     int64_t id = art_bump(kv, k);
     while (id < 0) {
@@ -1517,16 +1567,11 @@ static int32_t art_walk(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen
         if (!h || h->type == ART_MOVED)
             return -1;
         if (h->prefix_len) {
-            int s = pfx_shared(h->prefix, h->prefix_len, key + d, klen - d);
-            if (s != h->prefix_len) {
-                if (d + s < klen)
-                    return -1;
-                if (s < h->prefix_len)
-                    return -1;
-            }
-            d += h->prefix_len;
-            if (d > klen)
+            /* s == prefix_len implies d + prefix_len <= klen */
+            if (pfx_shared(h->prefix, h->prefix_len, key + d, klen - d) !=
+                h->prefix_len)
                 return -1;
+            d += h->prefix_len;
         }
         if (d == klen)
             return AV_HAS(art_val_load(h)) ? nid : -1;
@@ -1750,7 +1795,6 @@ static int32_t art_grow(kvspace_t *kv, void *on) {
     }
     {   /* P2: 搬迁 —— 新节点 struct_gen = 旧 +1；旧节点也动一次 */
         int32_t oid = art_id_of(kv, oh);
-        (void)gens_at;
         gen_bump_struct(kv, nid);   /* 新节点 gen 先抬一代 */
         gen_bump_struct(kv, oid);   /* 旧节点也失效 */
     }
@@ -1994,8 +2038,8 @@ static int32_t art_del(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
     if (!h)
         return -1;
     if (h->prefix_len) {
-        int s = pfx_shared(h->prefix, h->prefix_len, key + d, klen - d);
-        if (s != h->prefix_len || d + h->prefix_len > klen)
+        if (pfx_shared(h->prefix, h->prefix_len, key + d, klen - d) !=
+            h->prefix_len)
             return nid;
         d += h->prefix_len;
     }
@@ -2294,6 +2338,88 @@ static int art_scan_pfx(kvspace_t *kv, const char *pfx, int plen, char *buf,
     return art_scan_children(kv, nid, buf, bpos, bcap, plen, scan);
 }
 
+/* Collect all full keys with values under nid (buf[0, bpos) holds the reconstructed prefix).
+ * Unlike art_scan_children, does not truncate at child boundaries or hide system names (used by DelTree). */
+static int art_collect_keys(kvspace_t *kv, int32_t nid, char *buf, int bpos,
+                            int bcap, keyscan_t *scan) {
+    if (nid < 0)
+        return 0;
+    art_hdr_t *h = art_hdr(kv, nid);
+    if (!h || h->prefix_len > bcap - bpos - 1)
+        return -1;
+    for (int i = 0; i < h->prefix_len; i++)
+        buf[bpos++] = h->prefix[i];
+    if (AV_HAS(art_val_load(h)) && keyscan_add_n(scan, buf, (size_t)bpos) != 0)
+        return -1;
+    const uint8_t *keys = NULL;
+    const int32_t *children = NULL;
+    int n = 0;
+    switch (h->type) {
+    case ART_N4:
+        keys = ((art_n4_t *)h)->keys;
+        children = ((art_n4_t *)h)->children;
+        n = h->count;
+        break;
+    case ART_N16:
+        keys = ((art_n16_t *)h)->keys;
+        children = ((art_n16_t *)h)->children;
+        n = h->count;
+        break;
+    case ART_N48: {
+        art_n48_t *x = (art_n48_t *)h;
+        for (int i = 0; i < 256; i++) {
+            if (x->index[i] == 255)
+                continue;
+            if (bpos + 1 >= bcap)
+                return -1;
+            buf[bpos] = (char)i;
+            if (art_collect_keys(kv, x->children[x->index[i]], buf, bpos + 1,
+                                 bcap, scan) != 0)
+                return -1;
+        }
+        return 0;
+    }
+    case ART_N256: {
+        art_n256_t *x = (art_n256_t *)h;
+        for (int i = 0; i < 256; i++) {
+            if (x->children[i] < 0)
+                continue;
+            if (bpos + 1 >= bcap)
+                return -1;
+            buf[bpos] = (char)i;
+            if (art_collect_keys(kv, x->children[i], buf, bpos + 1, bcap,
+                                 scan) != 0)
+                return -1;
+        }
+        return 0;
+    }
+    default:
+        return 0;
+    }
+    for (int i = 0; i < n; i++) {
+        if (bpos + 1 >= bcap)
+            return -1;
+        buf[bpos] = (char)keys[i];
+        if (art_collect_keys(kv, children[i], buf, bpos + 1, bcap, scan) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+/* Collect all keys with values starting with pfx (including system variables). */
+static int art_scan_keys(kvspace_t *kv, const char *pfx, int plen,
+                         keyscan_t *scan) {
+    char buf[4096];
+    if (plen >= (int)sizeof buf)
+        return -1;
+    int bpos = 0;
+    int32_t nid = art_cover(kv, kv->hdr->art_root, (const uint8_t *)pfx, plen,
+                            buf, (int)sizeof buf, &bpos);
+    if (nid < 0)
+        return 0;
+    return art_collect_keys(kv, nid, buf, bpos, (int)sizeof buf, scan);
+}
+
 /* ============ lifecycle ============ */
 /* 8 * 64^k; s wraps to 0. */
 static bool sbo_data_size_ok(size_t n) {
@@ -2306,6 +2432,10 @@ static bool sbo_data_size_ok(size_t n) {
 kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
     if (!path)
         return NULL;
+    if (!bm_layout_ok()) {
+        fprintf(stderr, "kvspace: unexpected blockmalloc blocks_meta_t layout\n");
+        return NULL;
+    }
     char head_path[PATH_MAX], data_path[PATH_MAX], gen_path[PATH_MAX],
         garb_path[PATH_MAX];
     if (snprintf(head_path, sizeof head_path, "%s.sbo.head", path) >=
@@ -2346,6 +2476,14 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
         if (pread(kv->r_art.fd, &tmp, sizeof tmp, 0) != (ssize_t)sizeof tmp ||
             memcmp(tmp.magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1) != 0)
             goto fail;
+        /* Check format_version before region_attach: header size changes across versions,
+         * so an older store would otherwise fail in region_attach without printing a diagnostic. */
+        if (tmp.format_version != KVSPACE_FORMAT_VERSION) {
+            fprintf(stderr, "kvspace: unsupported store format (version=%u, "
+                            "expected %u): %s; rebuild the shm store\n",
+                    tmp.format_version, KVSPACE_FORMAT_VERSION, path);
+            goto fail;
+        }
         art_slab = (size_t)tmp.art_slab_size;
         sbo_head = (size_t)tmp.sbo_head_size;
         data_size = (size_t)tmp.sbo_data_size;
@@ -2441,6 +2579,7 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
         goto fail;                  /* 已有大量垃圾且建不了线程：open 硬失败 */
 
     pthread_mutex_init(&kv->wlock, NULL);
+    pthread_mutex_init(&kv->lc_mtx, NULL);
     for (int i = 0; i < WATCH_TABLE_SZ; i++) {
         pthread_cond_init(&kv->watches[i].cond, NULL);
         pthread_mutex_init(&kv->watches[i].mtx, NULL);
@@ -2483,7 +2622,6 @@ static bool p2_other_alive(kvspace_t *kv) {
 void kvspaceShmClose(kvspace_t *kv) {
     if (!kv)
         return;
-    p2_setstats_dump();
     /* 最后一个存活进程负责清场：Linux 跑一次机会性 round；macOS 直接清环。 */
     if (kv->pid == (uint32_t)getpid() && kv->p2_slot >= 0 &&
         !p2_other_alive(kv)) {
@@ -2519,6 +2657,8 @@ void kvspaceShmClose(kvspace_t *kv) {
         free(kv->watches[i].val);
     }
     pthread_mutex_destroy(&kv->wlock);
+    list_cache_drop(kv);
+    pthread_mutex_destroy(&kv->lc_mtx);
     region_close(&kv->r_art);
     region_close(&kv->r_head);
     region_close(&kv->r_data);
@@ -2528,64 +2668,46 @@ void kvspaceShmClose(kvspace_t *kv) {
 }
 
 /* ---- link resolve helpers ---- */
-static int read_value(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
-    uint8_t *s = kv->sbo_data + off;
-    size_t sz = sbo_allocated_size(kv->sbo_meta, off);
+/* Parse full value length = head + body + attr within [s, s+bound) (empty attr = 2). */
+static int parse_value(const uint8_t *s, uint64_t bound, int32_t *ol) {
+    if (bound > INT32_MAX)
+        bound = INT32_MAX;
     kvspaceXvalueHead wire;
-    if (head_of(s, (int32_t)sz, &wire) == 0) {
-        uint64_t l = kvspaceXvalueHeadLen(&wire);
-        if (l > INT32_MAX)
-            return -1;
-        *out = s;
-        /* 完整值长 = head + body + attr（attr_len:u16 @8+len 自描述；空 attr=2）。 */
-        if ((uint64_t)sz < KVSPACE_XVALUE_HEAD_LEN + l + 2)
-            return -1;
-        uint64_t alen = kvspaceXvalueHeadAttrLen(s, l);
-        if (alen < 2 || alen > (uint64_t)sz - KVSPACE_XVALUE_HEAD_LEN - l)
-            return -1;
-        *ol = (int32_t)(KVSPACE_XVALUE_HEAD_LEN + l + alen);
-        return 0;
-    }
-    return -1;
-}
-/* link 解析：ptr（ref=1）与 @ext（ref=2）的 XValue 恒为叶子（spec 硬规则——指针/扩展键
- * 之后不可能再有成员，成员只挂在 target 上），故路径中任何 `/` 分隔的容器前缀都绝不会是
- * link；唯一可能是 ptr 的只有整键叶子本身。因此只需查整键一次：非 ptr 即完成，ptr 则顺链
- * 到 target（本身又是一个完整叶子键）再查，最多追 16 跳。叶子不存在→非链，原样返回（调用
- * 方另做 extindex/dir 兜底）。取代旧的「逐前缀 1~3 次 art_search + 追加 rest」全下降探测。 */
-static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
-    strncpy(out, path, osz - 1);
-    out[osz - 1] = '\0';
-    for (int depth = 0; depth < 16; depth++) {
-        art_hdr_t *h =
-            art_search(kv, kv->hdr->art_root, (const uint8_t *)out, (int)strlen(out));
-        if (!h)
-            return;
-        uint64_t hv = art_val_load(h);
-        if (!AV_HAS(hv))
-            return;
-        uint8_t *raw;
-        int32_t rl;
-        if (read_value(kv, AV_OFF(hv), &raw, &rl) < 0)
-            return;
-        kvspaceXvalueHead wire;
-        if (head_of(raw, rl, &wire) == 0) {
-            uint64_t l2 = kvspaceXvalueHeadLen(&wire);
-            if (wire.ptr != KVSPACE_XVALUE_PTR_PTR || l2 >= (uint64_t)osz)
-                return;
-            memcpy(out, raw + KVSPACE_XVALUE_HEAD_LEN, (size_t)l2);
-            out[l2] = 0;
-            continue;
-        }
-        return;
-    }
+    if (head_of(s, (int32_t)bound, &wire) != 0)
+        return -1;
+    uint64_t l = kvspaceXvalueHeadLen(&wire);
+    if (bound < KVSPACE_XVALUE_HEAD_LEN + l + 2)
+        return -1;
+    uint64_t alen = kvspaceXvalueHeadAttrLen(s, l);
+    if (alen < 2 || alen > bound - KVSPACE_XVALUE_HEAD_LEN - l)
+        return -1;
+    *ol = (int32_t)(KVSPACE_XVALUE_HEAD_LEN + l + alen);
+    return 0;
 }
 
-/* resolve_path 的融合版：解析 link 链的同时把终端叶子的值一并取出，令调用方省掉
- * 「解析后再 art_search + read_value」的整套重复下降。每跳只取一次 head（ref 判定与
- * 值长度共用），命中带值节点即返 fetched=1（*raw/*rl 就位）。语义与
- * resolve_path + art_search + read_value 逐字等价：未命中/无值 → 返回该节点、fetched=0，
- * 交调用方走 extindex/dir 兜底。 */
+/* Write path: bound by physical box capacity (takes allocator lock) so a corrupted
+ * header cannot cause caller writes to overflow into adjacent boxes. */
+static int read_value(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
+    *out = kv->sbo_data + off;
+    return parse_value(*out, sbo_allocated_size(kv->sbo_meta, off), ol);
+}
+
+/* Read-only path: bound by mapped data region without taking the allocator lock.
+ * sbo_allocated_size contends on the cross-process spinlock on every read; since value_ok
+ * already ensures 8+len+attr_len fits in the box at write time, both bounds agree on valid values. */
+static uint64_t ro_bound(const kvspace_t *kv, uint64_t off) {
+    uint64_t m = kv->r_data.mapped;
+    return off < m ? m - off : 0;
+}
+static int read_value_ro(kvspace_t *kv, uint64_t off, uint8_t **out,
+                         int32_t *ol) {
+    *out = kv->sbo_data + off;
+    return parse_value(*out, ro_bound(kv, off), ol);
+}
+/* Link resolution: ptr (ref=1) and @ext (ref=2) XValues are always leaves (never intermediate
+ * `/` prefixes), so only the full leaf key can be a link. Follow at most 16 hops, fetching
+ * the terminal leaf value at the same time (fetched=1) to avoid a second art_search + read_value.
+ * Missing/valueless leaf returns fetched=0 for extindex/dir fallback. Caller ensures strlen(path) < osz. */
 static art_hdr_t *resolve_fetch(kvspace_t *kv, const char *path, char *out, int osz,
                                 uint8_t **raw, int32_t *rl, int *fetched) {
     *fetched = 0;
@@ -2600,19 +2722,14 @@ static art_hdr_t *resolve_fetch(kvspace_t *kv, const char *path, char *out, int 
         if (!AV_HAS(hv))
             return h;
         uint8_t *s = kv->sbo_data + AV_OFF(hv);
-        size_t sz = sbo_allocated_size(kv->sbo_meta, AV_OFF(hv));
+        uint64_t sz = ro_bound(kv, AV_OFF(hv));
         kvspaceXvalueHead wire;
-        if (head_of(s, (int32_t)sz, &wire) == 0) {
+        if (head_of(s, sz > INT32_MAX ? INT32_MAX : (int32_t)sz, &wire) == 0) {
             uint64_t l3 = kvspaceXvalueHeadLen(&wire);
             if (wire.ptr != KVSPACE_XVALUE_PTR_PTR || l3 >= (uint64_t)osz) {
-                /* 完整值长 = head + body + attr（attr_len @8+len 自描述）。 */
-                if ((uint64_t)sz < KVSPACE_XVALUE_HEAD_LEN + l3 + 2)
-                    return NULL;
-                uint64_t alen = kvspaceXvalueHeadAttrLen(s, l3);
-                if (alen < 2 || alen > (uint64_t)sz - KVSPACE_XVALUE_HEAD_LEN - l3)
+                if (parse_value(s, sz, rl) != 0)
                     return NULL;
                 *raw = s;
-                *rl = (int32_t)(KVSPACE_XVALUE_HEAD_LEN + l3 + alen);
                 *fetched = 1;
                 return h;
             }
@@ -2623,6 +2740,14 @@ static art_hdr_t *resolve_fetch(kvspace_t *kv, const char *path, char *out, int 
         return NULL;
     }
     return NULL;
+}
+
+/* Resolve path only (used by List). */
+static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
+    uint8_t *raw;
+    int32_t rl;
+    int fetched;
+    (void)resolve_fetch(kv, path, out, osz, &raw, &rl, &fetched);
 }
 
 /* Read the extension locator stored at a directory key. */
@@ -2637,7 +2762,7 @@ static int dir_ext_path(kvspace_t *kv, const char *dir, char *out, int osz) {
         return 0;
     uint8_t *raw;
     int32_t rl;
-    if (read_value(kv, AV_OFF(hv), &raw, &rl) < 0)
+    if (read_value_ro(kv, AV_OFF(hv), &raw, &rl) < 0)
         return 0;
     kvspaceXvalueHead wire;
     if (head_of(raw, rl, &wire) != 0 ||
@@ -2662,6 +2787,9 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
     if (kv_sync(kv) != 0)
         return NULL;
     char kbuf[1024];
+    /* Set rejects >= 1024-byte keys; do not truncate and look up a shorter key. */
+    if (strlen(key) >= sizeof kbuf)
+        return NULL;
     uint8_t *raw;
     int32_t rl;
     int fetched = 0;
@@ -2689,7 +2817,7 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
             if (eh && AV_HAS(ehv)) {
                 uint8_t *raw;
                 int32_t rl;
-                if (read_value(kv, AV_OFF(ehv), &raw, &rl) == 0) {
+                if (read_value_ro(kv, AV_OFF(ehv), &raw, &rl) == 0) {
                     *ol = rl;
                     free(parent);
                     free(name);
@@ -2701,7 +2829,7 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
         free(name);
         return NULL;
     }
-    if (!fetched && read_value(kv, AV_OFF(hv), &raw, &rl) < 0)
+    if (!fetched && read_value_ro(kv, AV_OFF(hv), &raw, &rl) < 0)
         return NULL;
     *ol = rl;
     return raw;
@@ -2772,7 +2900,7 @@ uint8_t *kvspaceShmGetByRef(kvspace_t *kv, kvspaceRef_t *ref,
     if (h && AV_HAS(hv)) {
         uint8_t *raw;
         int32_t rl;
-        if (read_value(kv, AV_OFF(hv), &raw, &rl) == 0) {
+        if (read_value_ro(kv, AV_OFF(hv), &raw, &rl) == 0) {
             *ol = rl;
             return raw;
         }
@@ -2786,22 +2914,6 @@ uint8_t *kvspaceShmGetByRef(kvspace_t *kv, kvspaceRef_t *ref,
     if (raw)
         kvspaceShmResolveRef(kv, key_fallback, ref);
     return raw;
-}
-
-/* 定位写的前置条件：只允许改 body [8, 8+len)，head 与 attr 一律不可写。 */
-int kvspaceShmPartInBody(const uint8_t *raw, int32_t total, uint32_t offset,
-                         uint32_t buf_len) {
-    if (!raw || total < (int32_t)KVSPACE_XVALUE_HEAD_LEN)
-        return 0;
-    kvspaceXvalueHead h;
-    memcpy(&h, raw, sizeof h);
-    const uint64_t len = kvspaceXvalueHeadLen(&h);
-    if (len > (uint64_t)total - KVSPACE_XVALUE_HEAD_LEN)
-        return 0;
-    if (offset < KVSPACE_XVALUE_HEAD_LEN)
-        return 0;
-    const uint64_t rel = (uint64_t)offset - KVSPACE_XVALUE_HEAD_LEN;
-    return rel <= len && (uint64_t)buf_len <= len - rel;
 }
 
 int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
@@ -2830,12 +2942,10 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
                 /* per-box 物理容量：损坏 head 的 len 可能大于 box 但仍在全局内，
                  * 不做这一步会跨 box 写坏相邻值。 */
                 uint64_t cap = sbo_allocated_size(kv->sbo_meta, off);
-                const uint64_t rel =
-                    offset >= KVSPACE_XVALUE_HEAD_LEN
-                        ? (uint64_t)offset - KVSPACE_XVALUE_HEAD_LEN
-                        : UINT64_MAX;
                 if (cap <= data_size - off && len <= cap - KVSPACE_XVALUE_HEAD_LEN &&
-                    rel <= len && (uint64_t)buf_len <= len - rel) {
+                    (uint64_t)offset <= KVSPACE_XVALUE_HEAD_LEN + len &&
+                    (uint64_t)buf_len <=
+                        KVSPACE_XVALUE_HEAD_LEN + len - (uint64_t)offset) {
                     kv_gens_t *g = gens_at(kv, id);
                     if (g)
                         __atomic_add_fetch(&g->value_gen, 1u,
@@ -2856,7 +2966,9 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
             return -1;
         int32_t rl = 0;
         uint8_t *d = kvspaceShmGet(kv, key_fallback, 0, &rl);
-        if (!d || !kvspaceShmPartInBody(d, rl, offset, buf_len))
+        /* Re-bound by physical box capacity before writing; use u64 to prevent u32 wraparound. */
+        if (!d || read_value(kv, (uint64_t)(d - kv->sbo_data), &d, &rl) != 0 ||
+            (uint64_t)offset + buf_len > (uint64_t)rl)
             return -1;
         kvspaceShmResolveRef(kv, key_fallback, ref);
         kv_gens_t *g = gens_at(kv, (int32_t)ref->block_id);
@@ -2870,7 +2982,7 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
     uint8_t *raw;
     int32_t rl;
     if (read_value(kv, AV_OFF(hv), &raw, &rl) < 0 ||
-        !kvspaceShmPartInBody(raw, rl, offset, buf_len))
+        (uint64_t)offset + buf_len > (uint64_t)rl)
         return -1;
     kv_gens_t *g2 = gens_at(kv, id);
     if (g2)
@@ -2878,6 +2990,21 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
     memcpy(raw + offset, buf, buf_len);
     if (g2)
         __atomic_add_fetch(&g2->value_gen, 1u, __ATOMIC_ACQ_REL);
+    return 0;
+}
+
+/* Partial write by key (follows links and extindex fallback like Get with resolve=1).
+ * Locates via lock-free read, then re-bounds by physical box capacity before writing. */
+int kvspaceShmSetPart(kvspace_t *kv, const char *key, uint32_t offset,
+                      const uint8_t *buf, uint32_t buf_len) {
+    if (!kv || !key || (buf_len && !buf))
+        return -1;
+    int32_t rl = 0;
+    uint8_t *d = kvspaceShmGet(kv, key, 1, &rl);
+    if (!d || read_value(kv, (uint64_t)(d - kv->sbo_data), &d, &rl) != 0 ||
+        (uint64_t)offset + buf_len > (uint64_t)rl)
+        return -1;
+    memcpy(d + offset, buf, buf_len);
     return 0;
 }
 
@@ -2927,8 +3054,8 @@ int kvspaceShmXvalueBodyView(kvspace_t *kv, const kvspaceRef_t *ref,
     if (cap < KVSPACE_XVALUE_HEAD_LEN ||
         l5 > cap - KVSPACE_XVALUE_HEAD_LEN)
         return -1;
-    /* status：只暴露规范形状（SLACK、len≤16）且物理容量达标的槽；
-       类型（[n]char/utf8）在 x‥langtype attr key，不在此判。 */
+    /* status: only expose canonical slots (SLACK, len <= 16) with sufficient physical capacity;
+       langtype ([n]char/utf8) lives in the inline attr region and is not checked here. */
     if (is_vthread_status_key(key_fallback)) {
         if (wire.storetype != KVSPACE_XVALUE_ST_SLACK ||
             cap < KVSPACE_STATUS_MIN_CAP ||
@@ -2943,45 +3070,29 @@ int kvspaceShmXvalueBodyView(kvspace_t *kv, const kvspaceRef_t *ref,
     return 0;
 }
 
-/* 临时探针（P2_SETSTATS=<file>）：统计写入形态，用于静默屏障可行性评估。 */
-static struct { uint64_t same, realloc_, fresh, retired_bytes; } g_setstats;
-static void p2_setstats_dump(void) {
-    const char *f = getenv("P2_SETSTATS");
-    if (!f || !f[0])
-        return;
-    FILE *fp = fopen(f, "a");
-    if (!fp)
-        return;
-    fprintf(fp, "pid=%d same=%llu realloc=%llu fresh=%llu retired_bytes=%llu\n",
-            (int)getpid(), (unsigned long long)g_setstats.same,
-            (unsigned long long)g_setstats.realloc_,
-            (unsigned long long)g_setstats.fresh,
-            (unsigned long long)g_setstats.retired_bytes);
-    fclose(fp);
-}
-
-/* 原始落盘（不处理容器/member 语义，供内部调用，避免递归）。 */
+/* Raw local write (internal helper without container/member semantics).
+ * reserve: minimum physical box capacity (for WriteNewPlace body_cap); 0 uses val_len. */
 static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
-                         int32_t val_len, art_hdr_t *old) {
-    {
-        static bool reg;
-        if (!reg) { reg = true; atexit(p2_setstats_dump); }
-    }
+                         int32_t val_len, art_hdr_t *old, size_t reserve) {
+    size_t alloc_len = (size_t)val_len;
+    if (reserve > alloc_len)
+        alloc_len = reserve;
+    if (is_vthread_status_key(key) && alloc_len < KVSPACE_STATUS_MIN_CAP)
+        alloc_len = KVSPACE_STATUS_MIN_CAP;
     uint64_t ohv = old ? art_val_load(old) : 0;
     bool retiring = old && AV_HAS(ohv);
     uint64_t gidx = 0;
     uint64_t cap = 0;
     if (retiring) {
         cap = sbo_allocated_size(kv->sbo_meta, AV_OFF(ohv));
-        if ((uint64_t)val_len <= cap) {
-            /* 同尺寸就地写：指针不变，value_gen 奇偶保护（一次查表） */
+        if ((uint64_t)alloc_len <= cap) {
+            /* Existing box fits (including reserve): write in place under value_gen seqlock */
             kv_gens_t *g = gens_at(kv, art_id_of(kv, old));
             if (g)
                 __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
             memcpy(kv->sbo_data + AV_OFF(ohv), val, (size_t)val_len);
             if (g)
                 __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
-            g_setstats.same++;
             return 0;
         }
         /* 换 box：reserve 在任何变更之前；失败 = 硬错误、旧值原样 */
@@ -2998,14 +3109,7 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
             return -1;
         }
 #endif
-        g_setstats.realloc_++;
-        g_setstats.retired_bytes += cap;
-    } else {
-        g_setstats.fresh++;
     }
-    size_t alloc_len = (size_t)val_len;
-    if (is_vthread_status_key(key) && alloc_len < KVSPACE_STATUS_MIN_CAP)
-        alloc_len = KVSPACE_STATUS_MIN_CAP;
     uint64_t off = kv_sbo_alloc(kv, alloc_len);
     if (off == (uint64_t)-1) {
         if (retiring)
@@ -3032,7 +3136,6 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
     {   /* 换 box / 墓碑复活：旧 token 全部 STALE */
         int32_t nid = p2_node_at(kv, key);
         kv_gens_t *g = gens_at(kv, nid);
-        if (getenv("P2_DEBUG")) { fprintf(stderr, "DBG reset-lookup key=%s nid=%d g=%p root=%d\n", key, nid, (void *)g, kv->hdr->art_root); }
         if (g) {
             gen_bump_struct(kv, nid);
             gen_bump_value(kv, nid);
@@ -3040,14 +3143,16 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
     }
     if (retiring)
         garb_commit(kv, gidx, AV_OFF(ohv), cap);
+    else
+        list_gen_bump(kv);   /* new key or tombstone revive: bump after art_ins */
     return 0;
 }
 
 static int shm_set_raw(kvspace_t *kv, const char *key, const uint8_t *val,
-                       int32_t val_len) {
+                       int32_t val_len, size_t reserve) {
     art_hdr_t *old = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
                                 (int)strlen(key));
-    return shm_set_local(kv, key, val, val_len, old);
+    return shm_set_local(kv, key, val, val_len, old, reserve);
 }
 
 static int frame_operand_ptr(const char *key, const kvspaceXvalueHead *wire) {
@@ -3100,8 +3205,8 @@ static int shm_set_validated(kvspace_t *kv, const char *key,
         free(nn);
     }
 
-    /* status 固定档：形状固定（SLACK、len≤16）、物理容量 ≥ 下限。
-     * 类型（[n]char/utf8）在 x‥langtype attr key，不在此判。 */
+    /* status slot: fixed shape (SLACK, len <= 16) and physical capacity >= minimum.
+     * langtype ([n]char/utf8) lives in the inline attr region and is not checked here. */
     if (is_vthread_status_key(kbuf)) {
         if (wire->storetype != KVSPACE_XVALUE_ST_SLACK ||
             kvspaceXvalueHeadLen(wire) > KVSPACE_STATUS_MAX_LEN)
@@ -3119,7 +3224,7 @@ static int shm_set_validated(kvspace_t *kv, const char *key,
                 return -1;
         }
     }
-    return shm_set_local(kv, kbuf, val, val_len, local);
+    return shm_set_local(kv, kbuf, val, val_len, local, 0);
 }
 
 int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
@@ -3127,7 +3232,7 @@ int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
     if (!kv || !key || !val || val_len <= 0)
         return -1;
     kvspaceXvalueHead wire;
-    if (head_of(val, val_len, &wire) != 0)
+    if (value_ok(val, val_len, &wire) != 0)
         return -1;
     return shm_set_validated(kv, key, val, val_len, &wire);
 }
@@ -3136,7 +3241,7 @@ int kvspaceShmSetValue(kvspace_t *kv, const char *key, const uint8_t *val,
                        int32_t val_len) {
     kvspaceXvalueHead head;
     if (!kv || !key || !val || val_len <= 0 ||
-        head_of(val, val_len, &head) != 0)
+        value_ok(val, val_len, &head) != 0)
         return -2;
     return shm_set_validated(kv, key, val, val_len, &head);
 }
@@ -3146,7 +3251,7 @@ int kvspaceShmSetValueByRef(kvspace_t *kv, kvspaceRef_t *ref,
                             int32_t val_len) {
     kvspaceXvalueHead head;
     if (!kv || !ref || !key_fallback || !val || val_len <= 0 ||
-        head_of(val, val_len, &head) != 0)
+        value_ok(val, val_len, &head) != 0)
         return -2;
     if (kv_sync(kv) != 0)
         return -1;
@@ -3156,7 +3261,7 @@ int kvspaceShmSetValueByRef(kvspace_t *kv, kvspaceRef_t *ref,
     int32_t id = ref_leaf(kv, ref, key_fallback);
     art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
     if (h && AV_HAS(art_val_load(h)))
-        return shm_set_local(kv, key_fallback, val, val_len, h);
+        return shm_set_local(kv, key_fallback, val, val_len, h, 0);
     /* ref 过期或尚无值：退回完整按 key 写（含 extindex 检查），成功后重解析。 */
     int rc = shm_set_validated(kv, key_fallback, val, val_len, &head);
     if (rc == 0)
@@ -3171,6 +3276,8 @@ int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
     if (kv_sync(kv) != 0)
         return -1;
     char kbuf[1024];
+    if (strlen(key) >= sizeof kbuf)
+        return -1;                  /* reject rather than truncating to another key */
     uint8_t *raw;
     int32_t rl;
     int fetched = 0;
@@ -3178,8 +3285,7 @@ int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
     if (resolve)
         h = resolve_fetch(kv, key, kbuf, sizeof(kbuf), &raw, &rl, &fetched);
     else {
-        strncpy(kbuf, key, sizeof(kbuf) - 1);
-        kbuf[sizeof(kbuf) - 1] = '\0';
+        strcpy(kbuf, key);
         h = art_search(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
                        (int)strlen(kbuf));
     }
@@ -3188,8 +3294,10 @@ int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
     uint64_t hv = art_val_load(h);
     if (!AV_HAS(hv))
         return -1;
-    if ((!fetched && read_value(kv, AV_OFF(hv), &raw, &rl) < 0) || rl <= 0)
-        return -1; /* None 或读失败 → 强制走 NewPlace */
+    /* Re-bound by physical box capacity before returning writable pointer. */
+    (void)fetched;
+    if (read_value(kv, AV_OFF(hv), &raw, &rl) < 0 || rl <= 0)
+        return -1; /* None or read failure -> require WriteNewPlace */
     kvspaceXvalueHead wire;
     if (head_of(raw, rl, &wire) == 0) {
         if (kvspaceXvalueHeadLen(&wire) != (uint64_t)body_len)
@@ -3232,10 +3340,16 @@ int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
         free(value);
         return -1;
     }
-    /* 固定头 8 字节：body 偏移恒 = 8；langtype 尾部 @8+body_len 整体单写。 */
-    uint32_t headlen = KVSPACE_XVALUE_HEAD_LEN;
-    (void)ptr;
-    int rc = shm_set_raw(kv, key, value, (int32_t)total);
+    /* Reserve produces an inline header; patch ptr byte for ref=1/2. */
+    kvspaceXvalueHead hd;
+    memcpy(&hd, value, sizeof hd);
+    hd.ptr = ptr;
+    memcpy(value, &hd, sizeof hd);
+    /* Fixed 8-byte header (body offset = 8) + attr at 8+body_len in a single write.
+     * Reserve physical box capacity (8 + body_cap + attr) so body can grow in place. */
+    uint64_t attr_len = total - KVSPACE_XVALUE_HEAD_LEN - (uint64_t)body_len;
+    size_t reserve = (size_t)(KVSPACE_XVALUE_HEAD_LEN + body_cap + attr_len);
+    int rc = shm_set_raw(kv, key, value, (int32_t)total, reserve);
     free(value);
     if (rc != 0)
         return -1;
@@ -3246,23 +3360,21 @@ int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
     uint64_t nv = art_val_load(node);
     if (!AV_HAS(nv))
         return -1;
-    *body = kv->sbo_data + AV_OFF(nv) + headlen;
+    *body = kv->sbo_data + AV_OFF(nv) + KVSPACE_XVALUE_HEAD_LEN;
     return 0;
 }
 
-int kvspaceShmListLen(kvspace_t *kv, const char *prefix, bool ex, int resolve,
-                      int32_t *out_count) {
-    char **names;
-    int32_t count;
-    if (kvspaceShmList(kv, prefix, ex, resolve, &names, &count) != 0) {
-        *out_count = 0;
+/* Delete a single key directly (without following links) and without bumping
+ * list_gen. Returns 1 = deleted, 0 = missing, -1 = hard error (tree unchanged).
+ * Caller has called kv_sync and verified strlen(key) < 1024. */
+static int shm_del_key(kvspace_t *kv, const char *key) {
+    bool d = false;
+    int32_t root = art_del(kv, kv->hdr->art_root, (const uint8_t *)key,
+                           (int)strlen(key), 0, &d);
+    if (root < 0)
         return -1;
-    }
-    for (int32_t i = 0; i < count; i++)
-        free(names[i]);
-    free(names);
-    *out_count = count;
-    return 0;
+    kv->hdr->art_root = root;
+    return d ? 1 : 0;
 }
 
 int kvspaceShmDel(kvspace_t *kv, const char *key) {
@@ -3270,81 +3382,12 @@ int kvspaceShmDel(kvspace_t *kv, const char *key) {
         return -1;
     if (kv_sync(kv) != 0)
         return -1;
-    char kbuf[1024];
-    strncpy(kbuf, key, sizeof(kbuf) - 1);
-    kbuf[sizeof(kbuf) - 1] = '\0'; /* 删键本身，不穿透 link——显式解引用由 runtime 掌控 */
-    bool d = false;
-    int32_t root = art_del(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
-                           (int)strlen(kbuf), 0, &d);
-    if (root < 0)
-        return -1;                  /* 表满等硬错误：树未变 */
-    kv->hdr->art_root = root;
-    return d ? 0 : -1;
-}
-
-int kvspaceShmDeltree(kvspace_t *kv, const char *prefix) {
-    if (!kv || !prefix || reserved_meta_path(prefix))
+    if (strlen(key) >= 1024)
+        return -1;                  /* Reject instead of truncating into another key */
+    /* Delete the key itself without following links; explicit deref belongs to runtime */
+    if (shm_del_key(kv, key) != 1)
         return -1;
-    if (kv_sync(kv) != 0)
-        return -1;
-    // if prefix itself is a link, only delete the link
-    art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)prefix,
-                              (int)strlen(prefix));
-    uint64_t hv = h ? art_val_load(h) : 0;
-    if (h && AV_HAS(hv)) {
-        uint8_t *raw;
-        int32_t rl;
-        read_value(kv, AV_OFF(hv), &raw, &rl);
-        kvspaceXvalueHead wire;
-        int is_ptr = rl > 0 && head_of(raw, rl, &wire) == 0 &&
-                     wire.ptr == KVSPACE_XVALUE_PTR_PTR;
-        if (is_ptr) {
-            return kvspaceShmDel(kv, prefix);
-        }
-    }
-    char *e = edir(prefix); // ensure trailing / for listing children
-    char **ns;
-    int32_t nc;
-    kvspaceShmList(kv, e, false, 1, &ns, &nc);
-    for (int i = 0; i < nc; i++) {
-        char *c = pjoin(e, ns[i]);
-        kvspaceShmDeltree(kv, c);
-        free(c);
-    }
-    for (int i = 0; i < nc; i++)
-        free(ns[i]);
-    free(ns);
-
-    /* 成员目录 marker（prefix·，U+00B7）：成员 key =
-       prefix·<name>，直接拼接后递归删除。 slash 版 e=prefix/ 覆盖不到 ·
-       成员（json 的 stringkeymap 落盘形态）。 */
-    size_t pl = strlen(prefix);
-    char *m = malloc(pl + 3);
-    memcpy(m, prefix, pl);
-    m[pl] = (char)0xC2;
-    m[pl + 1] = (char)0xB7;
-    m[pl + 2] = 0;
-    char **ms;
-    int32_t mc;
-    kvspaceShmList(kv, m, false, 1, &ms, &mc);
-    for (int i = 0; i < mc; i++) {
-        size_t ml = strlen(m), nl = strlen(ms[i]);
-        char *c = malloc(ml + nl + 1);
-        memcpy(c, m, ml);
-        memcpy(c + ml, ms[i], nl + 1);
-        kvspaceShmDeltree(kv, c);
-        free(c);
-    }
-    for (int i = 0; i < mc; i++)
-        free(ms[i]);
-    free(ms);
-    kvspaceShmDel(kv, m);
-    free(m);
-
-    kvspaceShmDel(kv, prefix);
-    if (strcmp(e, prefix) != 0)
-        kvspaceShmDel(kv, e);
-    free(e);
+    list_gen_bump(kv);              /* Key disappeared: bump after CAS */
     return 0;
 }
 
@@ -3357,6 +3400,89 @@ static char *memdir(const char *p) {
     r[l + 1] = (char)0xB7;
     r[l + 2] = 0;
     return r;
+}
+
+/* Whether key belongs to base's subtree: base itself, or base followed by '/'
+ * (hierarchy), U+00B7 (member), or U+2025 (runtime/attr key). Empty base = root
+ * (all keys starting with '/'). Matches kvspace-durable store::is_subtree_key. */
+static int subtree_key(const char *base, size_t bl, const char *key) {
+    if (bl == 0)
+        return key[0] == '/';
+    if (strncmp(key, base, bl) != 0)
+        return 0;
+    const unsigned char *r = (const unsigned char *)key + bl;
+    return r[0] == 0 || r[0] == '/' || (r[0] == 0xC2 && r[1] == 0xB7) ||
+           (r[0] == 0xE2 && r[1] == 0x80 && r[2] == 0xA5);
+}
+
+static int is_ptr_key(kvspace_t *kv, const char *key) {
+    art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
+                              (int)strlen(key));
+    uint64_t hv = h ? art_val_load(h) : 0;
+    if (!h || !AV_HAS(hv))
+        return 0;
+    uint8_t *raw = NULL;
+    int32_t rl = 0;
+    kvspaceXvalueHead wire;
+    return read_value(kv, AV_OFF(hv), &raw, &rl) == 0 && rl > 0 &&
+           head_of(raw, rl, &wire) == 0 && wire.ptr == KVSPACE_XVALUE_PTR_PTR;
+}
+
+/* Delete the entire subtree under prefix. A single trailing '/' or U+00B7 on
+ * prefix normalizes to base ("/d/" and "/d<U+00B7>" both delete "/d"; "/" is root).
+ * Deletes base, base/..., base<U+00B7>..., and base<U+2025>... (including hidden
+ * U+2025 runtime keys). Does not follow links (POSIX rm semantics): if prefix
+ * or base is a pointer, only the pointer is deleted. */
+int kvspaceShmDeltree(kvspace_t *kv, const char *prefix) {
+    if (!kv || !prefix || reserved_meta_path(prefix))
+        return -1;
+    if (kv_sync(kv) != 0)
+        return -1;
+    size_t pl = strlen(prefix);
+    if (pl >= 1024)
+        return -1;                  /* Reject instead of truncating into another prefix */
+    char base[1024];
+    memcpy(base, prefix, pl + 1);
+    size_t bl = pl;
+    if (strcmp(prefix, "/") == 0)
+        bl = 0;
+    else if (bl && base[bl - 1] == '/')
+        bl--;
+    else if (bl >= 2 && (unsigned char)base[bl - 2] == 0xC2 &&
+             (unsigned char)base[bl - 1] == 0xB7)
+        bl -= 2;
+    base[bl] = 0;
+    if (bl && reserved_meta_path(base))
+        return -1;
+    /* prefix itself is a link: delete only the link. */
+    if (pl && is_ptr_key(kv, prefix))
+        return kvspaceShmDel(kv, prefix);
+    if (bl && bl != pl && is_ptr_key(kv, base)) {
+        int rc = kvspaceShmDel(kv, base);
+        kvspaceShmDel(kv, prefix);  /* Companion key such as "/p/", may not exist */
+        return rc;
+    }
+    keyscan_t keys = {0};
+    if (art_scan_keys(kv, bl ? base : "/", bl ? (int)bl : 1, &keys) != 0) {
+        keyscan_free(&keys);
+        return -1;
+    }
+    int rc = 0, any = 0;
+    for (int32_t i = 0; i < keys.count; i++) {
+        const char *k = keys.keys[i];
+        if (!subtree_key(base, bl, k) || reserved_meta_path(k) ||
+            strlen(k) >= 1024)
+            continue;
+        int d = shm_del_key(kv, k);
+        if (d < 0)
+            rc = -1;
+        else if (d)
+            any = 1;
+    }
+    keyscan_free(&keys);
+    if (any)
+        list_gen_bump(kv);          /* Keys disappeared: bump once after batch delete */
+    return rc;
 }
 
 /* Copy one value before Set can move its slab. */
@@ -3556,43 +3682,51 @@ static int same_child(const char *a, const char *b) {
     return na == nb && memcmp(a, b, na) == 0;
 }
 
-int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
-                   char ***on, int32_t *oc) {
-    if (!kv || !prefix || !on || !oc)
-        return -1;
-    *on = NULL;
-    *oc = 0;
+/* Resolve List input: prefix -> target directory (following links when resolve=1)
+ * and mounted extindex source ext (when ex=1 and mounted; "" otherwise).
+ * Returns 0 = scan, 1 = reserved path (empty result), -1 = error.
+ * target buffer >= 4096 bytes, ext buffer >= 1024 bytes. */
+static int list_target(kvspace_t *kv, const char *prefix, bool ex, int resolve,
+                       char *target, size_t tcap, char *ext, size_t ecap) {
+    ext[0] = 0;
     if (reserved_meta_path(prefix))
-        return 0;
+        return 1;
     if (kv_sync(kv) != 0 || bad_dir_prefix(prefix))
         return -1;
-    const char *pfx = prefix;
-    char tbuf[1024];
     if (resolve) {
-        resolve_path(kv, prefix, tbuf, sizeof tbuf);
-        pfx = tbuf;
+        if (strlen(prefix) >= 1024)
+            return -1;              /* Reject instead of truncating into another dir */
+        resolve_path(kv, prefix, target, 1024);
+    } else {
+        size_t l = strlen(prefix);
+        if (l >= tcap)
+            return -1;
+        memcpy(target, prefix, l + 1);
     }
-    if (reserved_meta_path(pfx))
-        return 0;
+    if (reserved_meta_path(target))
+        return 1;
+    if (ex) {
+        char *dir = edir(target);
+        if (!dir)
+            return -1;
+        if (!dir_ext_path(kv, dir, ext, (int)ecap))
+            ext[0] = 0;
+        free(dir);
+    }
+    return 0;
+}
+/* Scan direct children of target (and mounted ext): sort, deduplicate (prefer
+ * directory entry on name collision), and hide runtime entries. */
+static int list_scan(kvspace_t *kv, const char *pfx, const char *ext,
+                     char ***on, int32_t *oc) {
     keyscan_t children = {0};
     char buf[4096];
     if (kv->hdr->art_root >= 0 &&
         art_scan_pfx(kv, pfx, (int)strlen(pfx), buf, (int)sizeof buf, &children) != 0)
         goto fail;
-
-    if (ex) {
-        char extpath[1024];
-        char *dir = edir(pfx);
-        if (!dir)
-            goto fail;
-        int has_ext = dir_ext_path(kv, dir, extpath, sizeof extpath);
-        free(dir);
-        if (has_ext) {
-            if (art_scan_pfx(kv, extpath, (int)strlen(extpath), buf,
-                             (int)sizeof buf, &children) != 0)
-                goto fail;
-        }
-    }
+    if (ext[0] && art_scan_pfx(kv, ext, (int)strlen(ext), buf, (int)sizeof buf,
+                               &children) != 0)
+        goto fail;
     if (children.count > 1)
         qsort(children.keys, (size_t)children.count, sizeof *children.keys,
               child_cmp);
@@ -3603,20 +3737,10 @@ int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
             free(children.keys[i]);
             continue;
         }
-        /* 成员名含 ‥（\xE2\x80\xA5）是系统变量/attr key（`0‥langtype` 等），
-           List 时隐藏——对齐 durable 后端（RUNTIME_MEMBER_SEP 隐藏）。 */
-        {
-            const char *p = children.keys[i];
-            for (; *p; p++) {
-                if ((unsigned char)p[0] == 0xE2 && (unsigned char)p[1] == 0x80 &&
-                    (unsigned char)p[2] == 0xA5) {
-                    free(children.keys[i]);
-                    goto hidden;
-                }
-            }
-        }
-        if (0) {
-hidden:
+        /* Child names containing U+2025 (\xE2\x80\xA5) are runtime system keys
+           (e.g. status, pc); hide from List to match the durable backend. */
+        if (strstr(children.keys[i], "\xE2\x80\xA5")) {
+            free(children.keys[i]);
             continue;
         }
         if (unique && same_child(children.keys[unique - 1], children.keys[i])) {
@@ -3634,17 +3758,126 @@ hidden:
     *on = children.keys;
     *oc = children.count;
     return 0;
-
 fail:
     keyscan_free(&children);
     return -1;
 }
-
+int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
+                   char ***on, int32_t *oc) {
+    if (!kv || !prefix || !on || !oc)
+        return -1;
+    *on = NULL;
+    *oc = 0;
+    char target[4096], ext[1024];
+    int rc = list_target(kv, prefix, ex, resolve, target, sizeof target, ext,
+                         sizeof ext);
+    if (rc != 0)
+        return rc > 0 ? 0 : -1;
+    return list_scan(kv, target, ext, on, oc);
+}
+/* Caller holds lc_mtx (or handle is unshared, e.g. Close). */
+static void list_cache_drop(kvspace_t *kv) {
+    for (int32_t i = 0; i < kv->lc_count; i++)
+        free(kv->lc_names[i]);
+    free(kv->lc_names);
+    free(kv->lc_prefix);
+    free(kv->lc_target);
+    free(kv->lc_ext);
+    kv->lc_names = NULL;
+    kv->lc_prefix = kv->lc_target = kv->lc_ext = NULL;
+    kv->lc_count = 0;
+}
+/* Cached name list for ListLen/ListAt; caller holds lc_mtx. On return 0,
+ * kv->lc_names/lc_count hold the result. A hit requires matching (prefix, ex,
+ * resolve), unchanged resolved target/ext, and unchanged list_gen (read before
+ * resolve/scan so any concurrent key-set mutation forces a rescan next time). */
+static int list_cached(kvspace_t *kv, const char *prefix, bool ex, int resolve) {
+    uint64_t g = __atomic_load_n(&kv->hdr->list_gen, __ATOMIC_ACQUIRE);
+    char target[4096], ext[1024];
+    int rc = list_target(kv, prefix, ex, resolve, target, sizeof target, ext,
+                         sizeof ext);
+    if (rc < 0)
+        return -1;
+    if (rc > 0) {
+        list_cache_drop(kv);
+        return 0;
+    }
+    if (kv->lc_prefix && kv->lc_gen == g && kv->lc_ex == (uint8_t)ex &&
+        kv->lc_res == (uint8_t)(resolve != 0) &&
+        strcmp(kv->lc_prefix, prefix) == 0 &&
+        strcmp(kv->lc_target, target) == 0 && strcmp(kv->lc_ext, ext) == 0)
+        return 0;
+    list_cache_drop(kv);
+    char **names = NULL;
+    int32_t count = 0;
+    if (list_scan(kv, target, ext, &names, &count) != 0)
+        return -1;
+    char *p = strdup(prefix), *t = strdup(target), *e = strdup(ext);
+    if (!p || !t || !e) {
+        free(p);
+        free(t);
+        free(e);
+        for (int32_t i = 0; i < count; i++)
+            free(names[i]);
+        free(names);
+        return -1;
+    }
+    kv->lc_prefix = p;
+    kv->lc_target = t;
+    kv->lc_ext = e;
+    kv->lc_names = names;
+    kv->lc_count = count;
+    kv->lc_ex = (uint8_t)ex;
+    kv->lc_res = (uint8_t)(resolve != 0);
+    kv->lc_gen = g;
+    return 0;
+}
+int kvspaceShmListLen(kvspace_t *kv, const char *prefix, bool ex, int resolve,
+                      int32_t *out_count) {
+    if (!out_count)
+        return -1;
+    *out_count = 0;
+    if (!kv || !prefix)
+        return -1;
+    pthread_mutex_lock(&kv->lc_mtx);
+    int rc = list_cached(kv, prefix, ex, resolve);
+    if (rc == 0)
+        *out_count = kv->lc_count;
+    pthread_mutex_unlock(&kv->lc_mtx);
+    return rc;
+}
+/* Copy the idx-th direct child name into buf (without NUL). *out_len is set to
+ * the name length; returns non-zero if out of range or buf is too small. Shares
+ * cache with ListLen so ListLen + indexed ListAt scans the directory once. */
+int kvspaceShmListAt(kvspace_t *kv, const char *prefix, bool ex, int resolve,
+                     int32_t idx, uint8_t *buf, uint32_t buf_cap,
+                     uint32_t *out_len) {
+    if (!out_len)
+        return -1;
+    *out_len = 0;
+    if (!kv || !prefix)
+        return -1;
+    pthread_mutex_lock(&kv->lc_mtx);
+    int rc = list_cached(kv, prefix, ex, resolve);
+    if (rc == 0) {
+        rc = -1;
+        if (idx >= 0 && idx < kv->lc_count) {
+            size_t l = strlen(kv->lc_names[idx]);
+            *out_len = (uint32_t)l;
+            if (buf && l <= buf_cap) {
+                memcpy(buf, kv->lc_names[idx], l);
+                rc = 0;
+            }
+        }
+    }
+    pthread_mutex_unlock(&kv->lc_mtx);
+    return rc;
+}
 int kvspaceShmExtindex(kvspace_t *kv, const char *p, const char *ep,
                        char *err, uint32_t err_cap) {
     if (!kv || !p || !ep)
         return -1;
-    /* 对齐 durable ext_index：path 与 ext_path 必须是目录形键（/ 或 · 结尾）。 */
+    /* Match durable ext_index: path and ext_path must be directory keys ('/' or U+00B7 suffix). */
     if (bad_dir_prefix(p) || bad_dir_prefix(ep)) {
         if (err && err_cap)
             snprintf(err, err_cap,
@@ -3675,7 +3908,8 @@ int kvspaceShmExtindex(kvspace_t *kv, const char *p, const char *ep,
     }
     if (ltl > (uint16_t)(sizeof lt - 1))
         ltl = (uint16_t)(sizeof lt - 1);
-    memcpy(lt, ltd, ltl);
+    if (ltl)
+        memcpy(lt, ltd, ltl);
     lt[ltl] = 0;
     uint8_t *v = NULL;
     uint64_t vl = 0;

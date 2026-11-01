@@ -5,8 +5,10 @@
  * 对齐 kvspace-go KVSpace 接口.
  */
 
-#ifndef KVSPACE_H
-#define KVSPACE_H
+/* Guard must not be KVSPACE_H: that is the canonical ABI header <kvspace/kvspace.h>
+ * guard, and colliding would silently skip whichever header is included second. */
+#ifndef KVSPACE_SHM_H
+#define KVSPACE_SHM_H
 
 #include "coord.h"
 #include <stdbool.h>
@@ -15,9 +17,13 @@
 
 typedef struct kvspace kvspace_t;
 
-/* shm store 格式版本：4 = ART val 原子字 + 垃圾环 + 单写者降级 + 8B 节点对齐。
- * 不兼容旧版本：open 硬失败并提示重建（不迁移）。 */
-#define KVSPACE_FORMAT_VERSION 5
+/* SHM store format version:
+ *   4 = ART atomic val word + garbage ring + single-writer demotion + 8B node align;
+ *   5 = ART 112-byte block;
+ *   6 = XValue fixed 8-byte header + inline attr region (#566/#571, incompatible
+ *       with format 5) plus header list_gen for cross-process List cache invalidation.
+ * Incompatible older versions fail hard on open with a rebuild hint (no migration). */
+#define KVSPACE_FORMAT_VERSION 6
 
 /* 对齐 kvspace/include/kvspace/kvspace.h：叶子 + 目录祖先。 */
 typedef struct {
@@ -58,9 +64,8 @@ uint8_t *kvspaceShmGetByRef(kvspace_t *kv, kvspaceRef_t *ref,
 /* shm slot view：返回映射内 head/body 与整 box 物理容量。0=成功，-1=不可视槽。 */
 int kvspaceShmXvalueBodyView(kvspace_t *kv, const kvspaceRef_t *ref,
                        const char *key_fallback, kvspaceXvalueBodyView_t *out);
-/* 定位写的前置条件：只允许改 body [8, 8+len)，head 与 attr 一律不可写。 */
-int kvspaceShmPartInBody(const uint8_t *raw, int32_t total, uint32_t offset,
-                         uint32_t buf_len);
+int kvspaceShmSetPart(kvspace_t *kv, const char *key, uint32_t offset,
+                      const uint8_t *buf, uint32_t buf_len);
 int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
                            const char *key_fallback, uint32_t offset,
                            const uint8_t *buf, uint32_t buf_len);
@@ -80,15 +85,21 @@ int kvspaceShmSetValueByRef(kvspace_t *kv, kvspaceRef_t *ref,
 // 覆写）；否则返回非 0。
 int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
                            int32_t body_len, uint8_t **body);
-// WriteNewPlace: 按 (ref, storetype, body_len, langtype) 分配新 box、写固定头 +
-// langtype 尾部（整体单写）、维护父索引，返回 body 指针。
+// WriteNewPlace: allocate a box for (ref, storetype, body_len, body_cap, langtype)
+// with physical capacity >= 8 + body_cap + attr, write fixed header (ptr from ref)
+// and attr region in one atomic store, update parent index, and return body pointer.
 int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
                             uint8_t storetype, int32_t body_len,
                             uint64_t body_cap, const char *langtype,
                             uint8_t **body);
-// ListLen: 只返回前缀下子项计数，无缓冲。
+// ListLen: direct child count under prefix. ListAt: copy idx-th child name into buf.
+// Both share a per-handle cache so ListLen + indexed ListAt scans the directory once,
+// invalidating on key-set, link-target, or extindex changes (including cross-process).
 int kvspaceShmListLen(kvspace_t *kv, const char *prefix, bool expand_ext,
                       int resolve, int32_t *out_count);
+int kvspaceShmListAt(kvspace_t *kv, const char *prefix, bool expand_ext,
+                     int resolve, int32_t idx, uint8_t *buf, uint32_t buf_cap,
+                     uint32_t *out_len);
 
 /* ================================================================
  * 目录操作
@@ -99,6 +110,9 @@ int kvspaceShmList(kvspace_t *kv, const char *prefix, bool expand_ext,
                    int resolve, char ***out_names, int32_t *out_count);
 
 int kvspaceShmDel(kvspace_t *kv, const char *key);
+// Deltree: delete base subtree (normalizing one trailing '/' or U+00B7 on prefix
+// to base; "/" = root): base plus base/..., base<U+00B7>..., and base<U+2025>...
+// (including hidden U+2025 keys). Deletes only the pointer if prefix/base is a link.
 int kvspaceShmDeltree(kvspace_t *kv, const char *prefix);
 int kvspaceShmCp(kvspace_t *kv, const char *src,
                  const char *dst); // 单 key 拷贝
@@ -161,6 +175,5 @@ int64_t kvspaceShmArtAlignCheck(kvspace_t *kv);
 void kvspaceShmTestSetFormatVersion(kvspace_t *kv, uint32_t v);
 #endif
 int kvspaceShmViewSweep(kvspace_t *kv);
-int kvspaceShmViewFlushTomb(kvspace_t *kv);
 
 #endif

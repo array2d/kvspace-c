@@ -1,0 +1,40 @@
+[ 10%] Built target test_xvalue_head
+[ 26%] Built target kvspace-c
+[ 36%] Built target test_shm_resize
+[ 33%] Building C object CMakeFiles/test_inplace_body_only.dir/tests/test_inplace_body_only.c.o
+[ 43%] Built target test_art_scan
+[ 50%] Built target test_handle_cache
+[ 63%] Built target test_codec_abi
+[ 63%] Built target test_shm_split
+[ 70%] Built target test_abi_contract
+[ 76%] Built target test_set_part_fastpath
+[ 83%] Built target test_new_wire_shm
+[ 90%] Built target test_slot_view
+[ 96%] Built target test_art_alignment
+/tmp/resolve_kvc/prside/tests/test_inplace_body_only.c: In function 'run':
+/tmp/resolve_kvc/prside/tests/test_inplace_body_only.c:46:18: warning: implicit declaration of function 'mkdtemp' [-Wimplicit-function-declaration]
+   46 |     char *made = mkdtemp(dir);
+      |                  ^~~~~~~
+/tmp/resolve_kvc/prside/tests/test_inplace_body_only.c:46:18: warning: initialization of 'char *' from 'int' makes pointer from integer without a cast [-Wint-conversion]
+In file included from /tmp/resolve_kvc/prside/tests/test_inplace_body_only.c:5:
+/tmp/resolve_kvc/prside/tests/test_inplace_body_only.c:122:47: error: 'sp0' undeclared (first use in this function); did you mean 'sp2'?
+  122 |         REQUIRE(sp2.raw != NULL && sp2.len == sp0.len, "body write geometry");
+      |                                               ^~~
+/tmp/resolve_kvc/prside/tests/test_util.h:12:11: note: in definition of macro 'CHECK'
+   12 |     if (!(cond)) {                                                             \
+      |           ^~~~
+/tmp/resolve_kvc/prside/tests/test_inplace_body_only.c:122:9: note: in expansion of macro 'REQUIRE'
+  122 |         REQUIRE(sp2.raw != NULL && sp2.len == sp0.len, "body write geometry");
+      |         ^~~~~~~
+/tmp/resolve_kvc/prside/tests/test_inplace_body_only.c:122:47: note: each undeclared identifier is reported only once for each function it appears in
+  122 |         REQUIRE(sp2.raw != NULL && sp2.len == sp0.len, "body write geometry");
+      |                                               ^~~
+/tmp/resolve_kvc/prside/tests/test_util.h:12:11: note: in definition of macro 'CHECK'
+   12 |     if (!(cond)) {                                                             \
+      |           ^~~~
+/tmp/resolve_kvc/prside/tests/test_inplace_body_only.c:122:9: note: in expansion of macro 'REQUIRE'
+  122 |         REQUIRE(sp2.raw != NULL && sp2.len == sp0.len, "body write geometry");
+      |         ^~~~~~~
+gmake[2]: *** [CMakeFiles/test_inplace_body_only.dir/build.make:76: CMakeFiles/test_inplace_body_only.dir/tests/test_inplace_body_only.c.o] Error 1
+gmake[1]: *** [CMakeFiles/Makefile2:315: CMakeFiles/test_inplace_body_only.dir/all] Error 2
+gmake: *** [Makefile:146: all] Error 2
