@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 
 struct Value {
@@ -42,11 +43,18 @@ static int head_attr_same(const struct Value *a, const struct Value *b) {
 }
 
 static void run(void) {
-    char dir[] = "/tmp/kvspace-inplace-XXXXXX";
-    char *made = mkdtemp(dir);
-    REQUIRE(made != NULL, "mkdtemp");
+    /* 唯一前缀用标准库构造（time + 静态计数），不依赖 mkdtemp/开目录。
+     *
+     * 为什么不用 mkdtemp：它在 POSIX/BSD 命名空间，本仓 CMAKE_C_EXTENSIONS OFF
+     * （严格 C11）。Linux 上补 _POSIX_C_SOURCE 即可；macOS 上试过
+     * _POSIX_C_SOURCE / _DARWIN_C_SOURCE / _GNU_SOURCE 三种宏均未生效。
+     * 原因未查明——同目录 test_art_alignment.c 用 _GNU_SOURCE + mkdtemp 在
+     * macOS 上是能编过的，行为不一致。改为只依赖 C 标准库，两平台都不再需要
+     * 特性宏；shm 后端自己创建文件，无需预先建目录。 */
+    static unsigned seq = 0;
     char dsn[256];
-    snprintf(dsn, sizeof dsn, "shm://%s/db", dir);
+    snprintf(dsn, sizeof dsn, "shm:///tmp/kvspace-inplace-%ld-%u.shm",
+             (long)time(NULL), ++seq);
     void *h = kvspaceConnect(dsn);
     REQUIRE(h != NULL, "connect");
 
