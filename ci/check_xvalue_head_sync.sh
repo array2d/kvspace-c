@@ -12,15 +12,26 @@
 #
 # 用法：ci/check_xvalue_head_sync.sh [上游 kvspace 仓库路径]
 #   默认取 ../kvspace（与克隆目录约定 ~/{host}/{owner}/{repo} 一致）。
+#   上游不在默认位置时（git archive 导出的树、隔离 CI、临时工作树），设
+#   KVSPACE_CI_UPSTREAM 指向它的根目录。命令行参数优先级最高。
+#
+#   只指定「上游在哪」，不改变语义：证明不了一致就失败。
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-UPSTREAM="${1:-$ROOT/../kvspace}"
+if [ "$#" -gt 0 ]; then
+    UPSTREAM="$1"
+elif [ -n "${KVSPACE_CI_UPSTREAM:-}" ]; then
+    UPSTREAM="$KVSPACE_CI_UPSTREAM"
+else
+    UPSTREAM="$ROOT/../kvspace"
+fi
 
 if [ ! -d "$UPSTREAM" ]; then
     echo "check_xvalue_head_sync: 找不到上游仓库 $UPSTREAM" >&2
     echo "  （这是硬失败：副本无法证明与上游一致时不得通过）" >&2
+    echo "  用 KVSPACE_CI_UPSTREAM=<上游根目录> 指定位置。" >&2
     exit 1
 fi
 
@@ -43,6 +54,7 @@ check_file() {
     fi
     if ! diff -u "$normalized" <(sed '1s|.*|INCLUDE_LINE|' "$vendor") > /dev/null; then
         echo "check_xvalue_head_sync: 副本与上游不一致：$vendor" >&2
+        echo "  若上游来自旧版本，请先确认两边版本一致再判断是哪一侧旧。" >&2
         diff -u "$normalized" <(sed '1s|.*|INCLUDE_LINE|' "$vendor") >&2 || true
         fail=1
     fi

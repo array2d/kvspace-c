@@ -61,7 +61,11 @@ int main(void) {
     kvspaceShmClose(kv);
     /* A real format-5 store header had no list_gen (8 bytes shorter), making the
      * ART file 8 bytes shorter as well; mapping the current header first would fail
-     * inside region_attach before reaching a post-mmap version check. */
+     * inside region_attach before reaching a post-mmap version check.
+     *
+     * 注意：下面这个 8 是 **store header 的 v4→v5 字段差**（缺一个 list_gen），
+     * 与 XValue head 的长度毫无关系。不要把它换成 KVSPACE_XVALUE_HEAD_LEN 或任何
+     * head 宏——那会把对的改成错的。 */
     struct stat st;
     CHECK(stat(path, &st) == 0 && truncate(path, st.st_size - 8) == 0);
     char errpath[160];

@@ -33,7 +33,8 @@ static int64_t get_i64(const uint8_t *d, int32_t len) {
     return -999;
   kvspaceXvalueHead h;
   memcpy(&h, d, sizeof h);
-  if (kvspaceXvalueHeadLen(&h) != 8 || 0 /* reserved 并入 len */)
+  /* 只解 int64：body 宽度必须是 8。与 head 布局无关。 */
+  if (kvspaceXvalueHeadLen(&h) != 8)
     return -999;
   const uint8_t *b = d + KVSPACE_XVALUE_HEAD_LEN;
   uint64_t v = 0;
