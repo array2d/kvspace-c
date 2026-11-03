@@ -61,6 +61,12 @@ if(KVSPACE_BUILD_TESTS)
     add_executable(test_xvalue_head tests/test_xvalue_head.c src/xvalue_head.c)
     target_include_directories(test_xvalue_head PRIVATE src)
     add_test(NAME xvalue_head COMMAND test_xvalue_head)
+
+    # wire 金标准：把同一批操作的字节打印出来，供三路（前端 / C 后端 / durable）
+    # 逐字节对拍。用例集合与输出格式以 kvspace/tests/xvalue_wire_golden.c 为准。
+    add_executable(xvalue_wire_golden tests/xvalue_wire_golden.c src/xvalue_head.c)
+    target_include_directories(xvalue_wire_golden PRIVATE src)
+    add_test(NAME xvalue_wire_golden COMMAND xvalue_wire_golden)
     add_executable(test_codec_abi tests/test_codec_abi.c)
     target_include_directories(test_codec_abi PRIVATE src)
     target_link_libraries(test_codec_abi PRIVATE kvspace-c)
