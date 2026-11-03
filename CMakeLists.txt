@@ -93,4 +93,10 @@ if(KVSPACE_BUILD_TESTS)
     target_compile_definitions(test_art_alignment PRIVATE P2_TEST_HOOKS)
     target_link_libraries(test_art_alignment PRIVATE kvspace-c)
     add_test(NAME art_alignment COMMAND test_art_alignment)
+
+    # xvalue_head 是跨进程 ABI：自带的临时副本必须与上游逐字节一致，否则后端会按
+    # 错误布局解释前端写下的字节——能编过、能跑、读到错值。上游发 tag 且 deps.json
+    # 升级后删掉副本，这条测试与 ci/check_xvalue_head_sync.sh 一并删除。
+    add_test(NAME xvalue_head_sync
+             COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/ci/check_xvalue_head_sync.sh")
 endif()

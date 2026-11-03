@@ -3,11 +3,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* V2 final layout (#571): fixed 8-byte header [len:u48 LE@0-5][storetype:u8@6][ptr:u8@7],
-   body always at offset 8, self-delimited attr region at 8+len (carrying langtype).
+/* Layout: fixed 16-byte header [bodylen:u64@0][attrslen:u32@8][storetype@12][ptr@13]
+   [padding@14,16), body at offset 16, attr region right after the body with NO length
+   prefix (attrslen is in the head — a second prefix would be a second truth).
    Single-key atomic write — no separate attr key. Empty langtype = empty attr. */
-
-#define UINT48_MAX UINT64_C(0xFFFFFFFFFFFF)
 
 /* Failure helper: clear *out per header contract. */
 static int fail(uint8_t **out) {
@@ -26,11 +25,9 @@ static int build(uint8_t storetype, uint8_t ptr, const uint8_t *body,
     *out = NULL;
     if (storetype > KVSPACE_XVALUE_ST_EXT || ptr > KVSPACE_XVALUE_PTR_EXT)
         return -1;
-    if (len > UINT48_MAX)
-        return -1;
     uint64_t ltl = langtype ? strlen(langtype) : 0;
-    uint64_t alen = 2 + (ltl ? 3 + ltl : 0); /* attr 总长（含自身 2 字节） */
-    if (alen > UINT16_MAX)
+    uint64_t alen = ltl ? 3 + ltl : 0; /* attr 字节数，不含任何前缀 */
+    if (alen > UINT32_MAX)
         return -1;
     uint64_t n = (uint64_t)KVSPACE_XVALUE_HEAD_LEN + len + alen;
     if (n > SIZE_MAX)
@@ -38,19 +35,19 @@ static int build(uint8_t storetype, uint8_t ptr, const uint8_t *body,
     uint8_t *p = (uint8_t *)calloc(1, (size_t)n);
     if (!p)
         return -1;
-    kvspaceXvalueHead h = {.storetype = storetype, .ptr = ptr};
+    kvspaceXvalueHead h = {.storetype = storetype, .ptr = ptr,
+                           .padding = {0u, 0u}};
     kvspaceXvalueHeadSetLen(&h, len);
+    kvspaceXvalueHeadSetAttrsLen(&h, (uint32_t)alen);
     memcpy(p, &h, sizeof h);
     if (len && body)
         memcpy(p + KVSPACE_XVALUE_HEAD_LEN, body, len);
     uint8_t *a = p + KVSPACE_XVALUE_HEAD_LEN + len;
-    a[0] = (uint8_t)alen;
-    a[1] = (uint8_t)(alen >> 8);
     if (ltl) {
-        a[2] = KVSPACE_XVALUE_ATTR_TAG_LANGTYPE;
-        a[3] = (uint8_t)ltl;
-        a[4] = (uint8_t)(ltl >> 8);
-        memcpy(a + 5, langtype, ltl);
+        a[0] = KVSPACE_XVALUE_ATTR_TAG_LANGTYPE;
+        a[1] = (uint8_t)ltl;
+        a[2] = (uint8_t)(ltl >> 8);
+        memcpy(a + 3, langtype, ltl);
     }
     *out = p;
     *out_len = n;

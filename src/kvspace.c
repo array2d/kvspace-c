@@ -640,32 +640,29 @@ static void p2_atfork_install(void) {
     ((kv)->fork_gen != __atomic_load_n(&g_fork_gen, __ATOMIC_ACQUIRE))
 #define P2_VIEW_GUARD(kv) ((kv)->quiesced || P2_FORK_GUARD(kv))
 
-/* 固定头直读辅助：校验 value 是合法 8 字节头 + body 长度自洽；产出头。 */
+/* 固定头直读辅助：校验 value 是合法 16 字节头 + 总长自洽；产出头。
+   padding 非零或总长溢出即失败——旧 8 字节 wire 的 body 首字节会落进 padding
+   或被当成超长 attrslen，因此在这里就被挡住，不做兼容。 */
 static int head_of(const uint8_t *val, int32_t val_len, kvspaceXvalueHead *out) {
-    if (!val || val_len < KVSPACE_XVALUE_HEAD_LEN)
+    if (!val || val_len < (int32_t)KVSPACE_XVALUE_HEAD_LEN)
         return -1;
     memcpy(out, val, sizeof *out);
-    uint64_t l = kvspaceXvalueHeadLen(out);
+    if (!kvspaceXvalueHeadPaddingIsZero(out))
+        return -1;
     if (out->storetype > KVSPACE_XVALUE_ST_EXT ||
         out->ptr > KVSPACE_XVALUE_PTR_EXT)
         return -1;
-    if ((uint64_t)KVSPACE_XVALUE_HEAD_LEN + l > (uint64_t)val_len)
+    const uint64_t total = kvspaceXvalueHeadTotalLen(out);
+    if (total == 0 || total > (uint64_t)val_len)
         return -1;
     return 0;
 }
 
-/* Write validation: head_of + complete attr region (attr_len >= 2 and within val_len).
- * read_value derives total length from 8+len+attr_len without storing val_len, so
- * values with an incomplete attr region would be unreadable if accepted. */
+/* Write validation: head_of 已校验总长，这里只剩容量判定。
+ * 总长只由 head 一处算出（16 + bodylen + attrslen），attr 区没有前缀。 */
 static int value_ok(const uint8_t *val, int32_t val_len,
                     kvspaceXvalueHead *out) {
     if (head_of(val, val_len, out) != 0)
-        return -1;
-    uint64_t l = kvspaceXvalueHeadLen(out);
-    if ((uint64_t)val_len < KVSPACE_XVALUE_HEAD_LEN + l + 2)
-        return -1;
-    uint64_t alen = kvspaceXvalueHeadAttrLen(val, l);
-    if (alen < 2 || alen > (uint64_t)val_len - KVSPACE_XVALUE_HEAD_LEN - l)
         return -1;
     return 0;
 }
@@ -2668,20 +2665,18 @@ void kvspaceShmClose(kvspace_t *kv) {
 }
 
 /* ---- link resolve helpers ---- */
-/* Parse full value length = head + body + attr within [s, s+bound) (empty attr = 2). */
+/* Parse full value length = 16 + bodylen + attrslen within [s, s+bound)。
+   head_of 已校验总长落在 bound 内且 padding 为零，长度不再有第二个来源。 */
 static int parse_value(const uint8_t *s, uint64_t bound, int32_t *ol) {
     if (bound > INT32_MAX)
         bound = INT32_MAX;
     kvspaceXvalueHead wire;
     if (head_of(s, (int32_t)bound, &wire) != 0)
         return -1;
-    uint64_t l = kvspaceXvalueHeadLen(&wire);
-    if (bound < KVSPACE_XVALUE_HEAD_LEN + l + 2)
+    const uint64_t total = kvspaceXvalueHeadTotalLen(&wire);
+    if (total == 0 || total > bound)
         return -1;
-    uint64_t alen = kvspaceXvalueHeadAttrLen(s, l);
-    if (alen < 2 || alen > bound - KVSPACE_XVALUE_HEAD_LEN - l)
-        return -1;
-    *ol = (int32_t)(KVSPACE_XVALUE_HEAD_LEN + l + alen);
+    *ol = (int32_t)total;
     return 0;
 }
 
@@ -3899,11 +3894,12 @@ int kvspaceShmExtindex(kvspace_t *kv, const char *p, const char *ep,
     if (source_len >= (int32_t)KVSPACE_XVALUE_HEAD_LEN) {
         kvspaceXvalueHead sh;
         memcpy(&sh, source, sizeof sh);
-        if (sh.storetype <= KVSPACE_XVALUE_ST_EXT &&
+        if (kvspaceXvalueHeadPaddingIsZero(&sh) &&
+            sh.storetype <= KVSPACE_XVALUE_ST_EXT &&
             sh.ptr <= KVSPACE_XVALUE_PTR_EXT) {
-            uint64_t sbody = kvspaceXvalueHeadLen(&sh);
-            if (sbody <= (uint64_t)source_len - KVSPACE_XVALUE_HEAD_LEN)
-                ltl = kvspaceXvalueHeadLangtype(source, sbody, &ltd);
+            const uint64_t stotal = kvspaceXvalueHeadTotalLen(&sh);
+            if (stotal != 0 && stotal <= (uint64_t)source_len)
+                ltl = kvspaceXvalueHeadLangtype(source, &ltd);
         }
     }
     if (ltl > (uint16_t)(sizeof lt - 1))

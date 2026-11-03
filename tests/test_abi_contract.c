@@ -53,7 +53,7 @@ static uint8_t ptr_byte(void *h, const char *key) {
     uint8_t *out = NULL;
     uint32_t n = 0;
     kvspaceGet(h, key, 0, &out, &n);
-    return out && n >= KVSPACE_XVALUE_HEAD_LEN ? out[7] : 0xFF;
+    return out && n >= KVSPACE_XVALUE_HEAD_LEN ? out[13] : 0xFF;
 }
 
 static void test_writenewplace_ref(void) {
@@ -109,7 +109,8 @@ static void test_writenewplace_body_cap(void) {
     uint8_t *out = NULL;
     uint32_t n = 0;
     kvspaceGet(h, "/pc", 0, &out, &n);
-    CHECK(out && n == 8 + 10 + 2 && memcmp(out + 8, "0123456789", 10) == 0,
+    CHECK(out && n == KVSPACE_XVALUE_HEAD_LEN + 10 &&
+              memcmp(out + KVSPACE_XVALUE_HEAD_LEN, "0123456789", 10) == 0,
           "value reads back (len=%u)", n);
     /* Rewriting within reserved capacity reuses the existing box in place. */
     uint8_t *body2 = NULL;
@@ -187,22 +188,26 @@ static void test_setvalue_attr(void) {
     CHECK(kvspaceSetValue(h, "/a", noattr, sizeof noattr, NULL, 0) != 0,
           "value without attr region rejected");
     /* attr_len points past end of value. */
-    uint8_t badattr[18] = {8, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 0, 0, 0, 0, 50, 0};
+    /* attrslen 声称 50 字节，但 wire 只有 16+8。 */
+    uint8_t badattr[24] = {8, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0,
+                           0, 0, 0, 42, 0, 0, 0, 0, 0, 0, 0};
     CHECK(kvspaceSetValue(h, "/b", badattr, sizeof badattr, NULL, 0) != 0,
-          "attr_len past end rejected");
-    /* attr_len < 2. */
-    uint8_t shortattr[18] = {8, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 0, 0, 0, 0, 1, 0};
-    CHECK(kvspaceSetValue(h, "/c", shortattr, sizeof shortattr, NULL, 0) != 0,
-          "attr_len < 2 rejected");
-    /* Valid value with trailing padding bytes: accepted and trimmed to 8+len+attr. */
-    uint8_t padded[20] = {8, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 0, 0, 0, 0, 2, 0,
-                          0xEE, 0xEE};
+          "attrslen past end rejected");
+    /* padding 非零：ABI 的一部分，必须拒绝。 */
+    uint8_t badpad[24] = {8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                          0, 1, 0, 42, 0, 0, 0, 0, 0, 0, 0};
+    CHECK(kvspaceSetValue(h, "/c", badpad, sizeof badpad, NULL, 0) != 0,
+          "non-zero padding rejected");
+    /* 合法值后面跟着多余的尾部字节：接受，但只落到 16+bodylen+attrslen。 */
+    uint8_t padded[28] = {8, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0,
+                          0, 0, 42, 0, 0, 0, 0, 0, 0, 0, 0xAA, 0xBB, 0xCC, 0xDD};
     CHECK(kvspaceSetValue(h, "/d", padded, sizeof padded, NULL, 0) == 0,
           "valid value with trailing bytes accepted");
     uint8_t *out = NULL;
     uint32_t n = 0;
     kvspaceGet(h, "/d", 0, &out, &n);
-    CHECK(out && n == 18, "trailing bytes not part of the value (len=%u)", n);
+    CHECK(out && n == KVSPACE_XVALUE_HEAD_LEN + 8 + 2,
+          "trailing bytes not part of the value (len=%u)", n);
     kvspaceClose(h);
 }
 
@@ -246,7 +251,8 @@ static void test_viewwrite_len(void) {
     uint8_t *out = NULL;
     uint32_t n = 0;
     kvspaceGet(h, "/s", 0, &out, &n);
-    CHECK(out && memcmp(out + 8, "xy", 2) == 0, "same-length ViewWrite landed");
+    CHECK(out && memcmp(out + KVSPACE_XVALUE_HEAD_LEN, "xy", 2) == 0,
+          "same-length ViewWrite landed");
     CHECK(kvspaceGetHead(h, "/s", &hd) == 0 && strcmp(hd.langtype, "char/utf8") == 0,
           "langtype intact after same-length ViewWrite");
     kvspaceClose(h);

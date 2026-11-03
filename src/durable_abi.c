@@ -205,10 +205,9 @@ int kvspaceGetHead(void *h, const char *key, kvspaceHead_t *out) {
         return 1;
     if (from_wire_head(d, (uint32_t)total, out) != 0)
         return 1;
-    /* langtype 在 attr 区 tag=1 记录（@8+len 自描述）；无记录 = 无类型。 */
-    uint64_t blen = (uint64_t)out->body_len;
+    /* langtype 在 attr 区 tag=1 记录；attr 区长度由 head 给出，没有前缀。 */
     const uint8_t *lt = NULL;
-    uint16_t ltl = kvspaceXvalueHeadLangtype(d, blen, &lt);
+    uint16_t ltl = kvspaceXvalueHeadLangtype(d, &lt);
     if (lt && ltl > 0) {
         size_t take = (size_t)ltl < (uint64_t)sizeof out->langtype - 1
                           ? (size_t)ltl

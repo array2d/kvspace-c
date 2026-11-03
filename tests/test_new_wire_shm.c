@@ -9,14 +9,13 @@
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "failed: %s\n", #x); return 1; } } while (0)
 
-/* 固定 head 8 字节 [len:u48][storetype][ptr]：body 偏移恒 8；
-   类型在 x‥langtype attr key；ro/vid 已删。 */
+/* 固定 head 16 字节 [bodylen:u64][attrslen:u32][storetype][ptr][pad:2]；
+   body 偏移恒 16，attr 区紧随 body 且**没有**长度前缀。 */
 
 static int wire_len_of(const uint8_t *stored) {
     kvspaceXvalueHead h;
     memcpy(&h, stored, sizeof h);
-    uint64_t l = kvspaceXvalueHeadLen(&h);
-    return (int)(KVSPACE_XVALUE_HEAD_LEN + l + kvspaceXvalueHeadAttrLen(stored, l));
+    return (int)kvspaceXvalueHeadTotalLen(&h);
 }
 
 int main(void) {
@@ -31,18 +30,18 @@ int main(void) {
     uint8_t raw[8] = {42};
     CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, "",
                                      &value, &n) == 0);
-    CHECK(n == 18);
+    CHECK(n == 16 + 8);
     CHECK(kvspaceShmSet(kv, "/x", value, (int32_t)n) == 0);
     free(value);
     int32_t got = 0;
     uint8_t *stored = kvspaceShmGet(kv, "/x", 0, &got);
-    CHECK(stored && got == 18 && stored[8] == 42);
+    CHECK(stored && got == 16 + 8 && stored[KVSPACE_XVALUE_HEAD_LEN] == 42);
 
     CHECK(kvspaceXvalueHeadNewPtr((const uint8_t *)"/x", 2, "", &value, &n) == 0);
     CHECK(kvspaceShmSet(kv, "/p", value, (int32_t)n) == 0);
     free(value);
     stored = kvspaceShmGet(kv, "/p", 1, &got);
-    CHECK(stored && got == 18 && stored[8] == 42);
+    CHECK(stored && got == 16 + 8 && stored[KVSPACE_XVALUE_HEAD_LEN] == 42);
 
     CHECK(kvspaceXvalueHeadNewNone(&value, &n) == 0);
     CHECK(kvspaceShmSet(kv, "/m", value, (int32_t)n) == 0);
@@ -68,7 +67,7 @@ int main(void) {
         char member[32];
         snprintf(member, sizeof member, "%s·[0]", base);
         stored = kvspaceShmGet(kv, member, 0, &got);
-        CHECK(stored && stored[8] == 42);
+        CHECK(stored && stored[KVSPACE_XVALUE_HEAD_LEN] == 42);
     }
     CHECK(kvspaceShmGet(kv, "/m-tree·", 0, &got) == NULL);
     CHECK(kvspaceShmGet(kv, "/m-list·", 0, &got) == NULL);
@@ -113,13 +112,13 @@ int main(void) {
     CHECK(kvspaceShmWriteInPlace(kv, "/x", 0, 8, &body) == 0);
     body[0] = 43;
     stored = kvspaceShmGet(kv, "/x", 0, &got);
-    CHECK(stored && stored[8] == 43);
+    CHECK(stored && stored[KVSPACE_XVALUE_HEAD_LEN] == 43);
 
     CHECK(kvspaceShmWriteNewPlace(kv, "/fresh", 0, KVSPACE_XVALUE_ST_SHORT,
                                   8, 8, "", &body) == 0);
     memcpy(body, raw, 8);
     stored = kvspaceShmGet(kv, "/fresh", 0, &got);
-    CHECK(stored && stored[8] == 42);
+    CHECK(stored && stored[KVSPACE_XVALUE_HEAD_LEN] == 42);
     CHECK(kvspaceShmCp(kv, "/fresh", "/fresh-copy") == 0);
     CHECK(kvspaceShmCptree(kv, "/fresh", "/fresh-tree") == 0);
 
@@ -128,7 +127,7 @@ int main(void) {
                                   3, 3, "", &body) == 0);
     memcpy(body, utf8, sizeof utf8);
     stored = kvspaceShmGet(kv, "/text", 0, &got);
-    CHECK(stored && wire_len_of(stored) == 3 + KVSPACE_XVALUE_HEAD_LEN + 2 &&
+    CHECK(stored && wire_len_of(stored) == (int)(KVSPACE_XVALUE_HEAD_LEN + 3) &&
           memcmp(stored + KVSPACE_XVALUE_HEAD_LEN, utf8, sizeof utf8) == 0);
     body[0] = 0xff;
     /* 固定头存储层不校验 UTF-8（码点校验移明文层按 attr 类型做）——可读回。 */

@@ -4,8 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 固定 head 8 字节 [len:u48 LE@0-5][storetype@6][ptr@7]，body 偏移恒 8，
-   attr 区 @8+len（attr_len:u16 自描述，含 langtype 记录）。单 key 整体——无 attr key。 */
+/* 固定 head 16 字节 [bodylen:u64][attrslen:u32@8][storetype@12][ptr@13][pad@14,16)，
+   body 偏移恒 16，attr 区紧随 body 且**没有**长度前缀（attrslen 在 head 里）。
+   单 key 整体——无 attr key。 */
 
 static int failures = 0;
 #define CHECK(cond, ...)                                                       \
@@ -18,34 +19,45 @@ static int failures = 0;
         }                                                                      \
     } while (0)
 
-/* 校验 attr 区：total = 8+body_len+attr_len；langtype 记录存在且与 lt 一致。 */
+/* 校验 attr 区：total = 16+bodylen+attrslen；attr 区没有长度前缀，记录形状仍是
+   [tag:u8][len:u16][data]。 */
 static int attr_ok(const uint8_t *v, uint64_t total, uint64_t body_len,
                    const char *lt) {
     size_t l = strlen(lt);
-    const uint8_t *a = v + KVSPACE_XVALUE_HEAD_LEN + body_len;
-    uint64_t alen = (uint64_t)a[0] | ((uint64_t)a[1] << 8);
-    if (total != KVSPACE_XVALUE_HEAD_LEN + body_len + alen)
+    kvspaceXvalueHead h;
+    memcpy(&h, v, sizeof h);
+    const uint8_t *a = kvspaceXvalueHeadAttrs(v);
+    const uint64_t alen = (uint64_t)h.attrslen;
+    if (total != kvspaceXvalueHeadTotalLen(&h))
         return 0;
     if (l == 0)
-        return alen == 2;
-    if (alen != 2 + 3 + l)
+        return alen == 0;
+    if (alen != 3 + l)
         return 0;
-    return a[2] == KVSPACE_XVALUE_ATTR_TAG_LANGTYPE && a[3] == l && a[4] == 0 &&
-           memcmp(a + 5, lt, l) == 0;
+    return a[0] == KVSPACE_XVALUE_ATTR_TAG_LANGTYPE && a[1] == l && a[2] == 0 &&
+           memcmp(a + 3, lt, l) == 0;
+}
+
+/* padding 必须为零，storetype/ptr 必须落在 wire 的固定偏移上。 */
+static int head_ok(const uint8_t *v, uint8_t storetype, uint8_t ptr) {
+    kvspaceXvalueHead h;
+    memcpy(&h, v, sizeof h);
+    return kvspaceXvalueHeadPaddingIsZero(&h) && h.storetype == storetype &&
+           h.ptr == ptr && v[12] == storetype && v[13] == ptr && v[14] == 0 &&
+           v[15] == 0;
 }
 
 static void test_none(void) {
     uint8_t *buf = NULL;
     uint64_t n = 0;
     CHECK(kvspaceXvalueHeadNewNone(&buf, &n) == 0, "none new");
-    CHECK(n == 10, "none len %llu", (unsigned long long)n);
+    CHECK(n == 16, "none len %llu", (unsigned long long)n);
     kvspaceXvalueHead h;
     memcpy(&h, buf, sizeof h);
     CHECK(h.storetype == KVSPACE_XVALUE_ST_SHORT &&
           h.ptr == KVSPACE_XVALUE_PTR_INLINE && kvspaceXvalueHeadLen(&h) == 0, "none head");
-    /* wire 布局：len:u48@0-5、storetype@6、ptr@7、attr_len@8 */
-    CHECK(buf[0] == 0 && buf[5] == 0 &&
-          buf[6] == KVSPACE_XVALUE_ST_SHORT && buf[7] == KVSPACE_XVALUE_PTR_INLINE,
+    /* wire 布局：bodylen@0-7、attrslen@8-11、storetype@12、ptr@13、pad@14-15 */
+    CHECK(buf[0] == 0 && buf[7] == 0 && buf[8] == 0 && buf[11] == 0,
           "none wire layout");
     CHECK(attr_ok(buf, n, 0, ""), "none empty attr");
     free(buf);
@@ -57,7 +69,7 @@ static void test_scalar(void) {
     uint64_t n = 0;
     CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, "int64",
                                      &buf, &n) == 0, "i64 new");
-    CHECK(n == 26, "i64 len %llu", (unsigned long long)n);
+    CHECK(n == 16 + 8 + 8, "i64 len %llu", (unsigned long long)n);
     kvspaceXvalueHead h;
     memcpy(&h, buf, sizeof h);
     CHECK(kvspaceXvalueHeadLen(&h) == 8 && h.storetype == KVSPACE_XVALUE_ST_SHORT, "i64 head");
@@ -67,7 +79,7 @@ static void test_scalar(void) {
     /* 无类型（空 langtype）：空 attr [attr_len:2]。 */
     CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, "",
                                      &buf, &n) == 0, "scalar no-langtype");
-    CHECK(n == 18, "no-langtype len %llu", (unsigned long long)n);
+    CHECK(n == 16 + 8, "no-langtype len %llu", (unsigned long long)n);
     CHECK(attr_ok(buf, n, 8, ""), "no-langtype empty attr");
     free(buf);
 }
@@ -77,14 +89,14 @@ static void test_slack(void) {
     uint8_t *buf = NULL;
     uint64_t n = 0;
     CHECK(kvspaceXvalueHeadNewSlack(hi, 2, 2, "[]char/utf8", &buf, &n) == 0, "slack new");
-    CHECK(n == 26, "slack len %llu", (unsigned long long)n);
+    CHECK(n == 16 + 8 + 8, "slack len %llu", (unsigned long long)n);
     kvspaceXvalueHead h;
     memcpy(&h, buf, sizeof h);
     CHECK(h.storetype == KVSPACE_XVALUE_ST_SLACK &&
           kvspaceXvalueHeadLen(&h) == 2, "slack head");
-    /* wire：len u48 LE@0-5=2，storetype@6，ptr@7 */
-    CHECK(buf[0] == 2 && buf[1] == 0 && buf[5] == 0 &&
-          buf[6] == KVSPACE_XVALUE_ST_SLACK && buf[7] == KVSPACE_XVALUE_PTR_INLINE,
+    /* wire：bodylen@0=2、attrslen@8=3+10、storetype@12、ptr@13、pad@14-15 */
+    CHECK(buf[0] == 2 && buf[1] == 0 && buf[7] == 0 &&
+          head_ok(buf, KVSPACE_XVALUE_ST_SLACK, KVSPACE_XVALUE_PTR_INLINE),
           "slack wire layout");
     CHECK(memcmp(buf + KVSPACE_XVALUE_HEAD_LEN, hi, 2) == 0, "slack body");
     CHECK(attr_ok(buf, n, 2, "[]char/utf8"), "slack langtype attr");
@@ -100,12 +112,12 @@ static void test_tensor(void) {
     uint64_t n = 0;
     CHECK(kvspaceXvalueHeadNewTensor(dims, 2, raw, sizeof raw, "[2,3]int64",
                                      &buf, &n) == 0, "tensor new");
-    CHECK(n == 8 + 24 + 15, "tensor len %llu", (unsigned long long)n);
+    CHECK(n == 16 + 24 + (3 + 10), "tensor len %llu", (unsigned long long)n);
     kvspaceXvalueHead h;
     memcpy(&h, buf, sizeof h);
     CHECK(h.storetype == KVSPACE_XVALUE_ST_LARGE &&
           kvspaceXvalueHeadLen(&h) == 24, "tensor head");
-    CHECK(memcmp(buf + KVSPACE_XVALUE_HEAD_LEN, raw, 24) == 0, "tensor body@8");
+    CHECK(memcmp(buf + KVSPACE_XVALUE_HEAD_LEN, raw, 24) == 0, "tensor body@16");
     CHECK(attr_ok(buf, n, 24, "[2,3]int64"), "tensor langtype attr");
     free(buf);
     CHECK(kvspaceXvalueHeadNewTensor(NULL, 0, raw, 24, "", &buf, &n) != 0,
@@ -117,7 +129,7 @@ static void test_ptr_ext(void) {
     uint64_t n = 0;
     CHECK(kvspaceXvalueHeadNewPtr((const uint8_t *)"/varx", 5, "int64",
                                   &buf, &n) == 0, "ptr new");
-    CHECK(n == 8 + 5 + 10, "ptr len %llu", (unsigned long long)n);
+    CHECK(n == 16 + 5 + (3 + 5), "ptr len %llu", (unsigned long long)n);
     kvspaceXvalueHead h;
     memcpy(&h, buf, sizeof h);
     CHECK(h.storetype == KVSPACE_XVALUE_ST_SLACK &&
@@ -142,7 +154,7 @@ static void test_reserve_code(void) {
     uint64_t len = 0;
     CHECK(kvspaceXvalueHeadReserve(KVSPACE_XVALUE_ST_SLACK, 7, 10, "[]u8",
                                    &value, &len) == 0, "reserve slack");
-    CHECK(len == 8 + 7 + 9, "reserve len");
+    CHECK(len == 16 + 7 + (3 + 4), "reserve len");
     kvspaceXvalueHead h;
     memcpy(&h, value, sizeof h);
     CHECK(kvspaceXvalueHeadLen(&h) == 7, "reserve head len");

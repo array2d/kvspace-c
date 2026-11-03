@@ -5,7 +5,7 @@
 #include "test_util.h"
 
 #include <kvspace/kvspace.h>
-#include <kvspace/xvalue_head.h>
+#include "xvalue_head.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -37,9 +37,19 @@ static void snap(void *h, const char *key, struct Value *out) {
     memcpy(out->raw, raw, out->len);
 }
 
+/* head 与 attr 区不变；body 本来就是要改的那一段，不参与比较。
+   attr 起点由各自的 bodylen 推出，所以逐字段取 head 后再比 body 之后的字节。 */
 static int head_attr_same(const struct Value *a, const struct Value *b) {
-    return a->len == b->len && memcmp(a->raw, b->raw, 8) == 0 &&
-           memcmp(a->raw + 16, b->raw + 16, a->len - 16) == 0;
+    if (a->len != b->len ||
+        memcmp(a->raw, b->raw, KVSPACE_XVALUE_HEAD_LEN) != 0)
+        return 0;
+    kvspaceXvalueHead ha;
+    memcpy(&ha, a->raw, sizeof ha);
+    const uint64_t body_a = kvspaceXvalueHeadLen(&ha);
+    const uint64_t attrs = ha.attrslen;
+    const uint8_t *attr_a = a->raw + KVSPACE_XVALUE_HEAD_LEN + body_a;
+    const uint8_t *attr_b = b->raw + KVSPACE_XVALUE_HEAD_LEN + body_a;
+    return memcmp(attr_a, attr_b, (size_t)attrs) == 0;
 }
 
 static void run(void) {
@@ -62,7 +72,8 @@ static void run(void) {
     put_i64(h, "/vw");
     struct Value vw0;
     snap(h, "/vw", &vw0);
-    REQUIRE(vw0.raw != NULL && vw0.len == 26, "base /vw");
+    REQUIRE(vw0.raw != NULL && vw0.len == 16 + 8 + (3 + 5),
+            "base /vw");
     const int qrc = kvspaceViewQuiesce(h, 0);
     CHECK(qrc == 0, "quiesce");
     kvspaceViewToken_t tok;
@@ -80,7 +91,8 @@ static void run(void) {
     if (vw1.raw) {
         CHECK(vw1.len == vw0.len && head_attr_same(&vw1, &vw0),
               "rejected ViewWrite changed head/attr");
-        CHECK(memcmp(vw1.raw + 8, vw0.raw + 8, 8) == 0,
+        CHECK(memcmp(vw1.raw + KVSPACE_XVALUE_HEAD_LEN,
+                         vw0.raw + KVSPACE_XVALUE_HEAD_LEN, 8) == 0,
               "rejected ViewWrite changed body");
         int64_t five = 5;
         const int vok = kvspaceViewWrite(h, &tok, (const uint8_t *)&five, 8);
@@ -91,7 +103,8 @@ static void run(void) {
               "ViewWrite geometry");
         if (vw2.raw) {
             CHECK(head_attr_same(&vw2, &vw0), "ViewWrite changed head/attr");
-            CHECK(*(int64_t *)(vw2.raw + 8) == 5, "ViewWrite body value");
+            CHECK(*(int64_t *)(intptr_t)(vw2.raw + KVSPACE_XVALUE_HEAD_LEN) == 5,
+                  "ViewWrite body value");
             free(vw2.raw);
         }
     }
@@ -100,7 +113,7 @@ static void run(void) {
     put_i64(h, "/wi");
     struct Value wi0;
     snap(h, "/wi", &wi0);
-    REQUIRE(wi0.raw != NULL && wi0.len == 26, "base /wi");
+    REQUIRE(wi0.raw != NULL && wi0.len == 16 + 8 + (3 + 5), "base /wi");
     uint8_t *body = NULL;
     const int wshort = kvspaceWriteInPlace(h, "/wi", 0, 4, &body, NULL, 0);
     CHECK(wshort != 0, "WriteInPlace(body_len=4) must fail");
@@ -112,10 +125,11 @@ static void run(void) {
         struct Value wi1;
         snap(h, "/wi", &wi1);
         REQUIRE(wi1.raw != NULL && wi1.len == wi0.len, "in-place geometry");
-        CHECK(memcmp(wi1.raw, wi0.raw, 8) == 0, "WriteInPlace changed head");
-        CHECK(memcmp(wi1.raw + 16, wi0.raw + 16, wi0.len - 16) == 0,
-              "WriteInPlace changed attr");
-        CHECK(*(int64_t *)(wi1.raw + 8) == 7, "WriteInPlace body value");
+        CHECK(memcmp(wi1.raw, wi0.raw, KVSPACE_XVALUE_HEAD_LEN) == 0,
+              "WriteInPlace changed head");
+        CHECK(head_attr_same(&wi1, &wi0), "WriteInPlace changed attr");
+        CHECK(*(int64_t *)(intptr_t)(wi1.raw + KVSPACE_XVALUE_HEAD_LEN) == 7,
+              "WriteInPlace body value");
         free(wi1.raw);
     }
 
@@ -123,19 +137,21 @@ static void run(void) {
     put_i64(h, "/sp");
     struct Value sp0;
     snap(h, "/sp", &sp0);
-    REQUIRE(sp0.raw != NULL && sp0.len == 26, "base /sp");
+    REQUIRE(sp0.raw != NULL && sp0.len == 16 + 8 + (3 + 5), "base /sp");
     {
         int64_t nine = 99;
-        CHECK(kvspaceSetPart(h, "/sp", 8, (const uint8_t *)&nine, 8, NULL, 0) ==
+        CHECK(kvspaceSetPart(h, "/sp", KVSPACE_XVALUE_HEAD_LEN,
+                             (const uint8_t *)&nine, 8, NULL, 0) ==
                   0,
               "SetPart(body) must succeed");
         struct Value sp2;
         snap(h, "/sp", &sp2);
         REQUIRE(sp2.raw != NULL && sp2.len == sp0.len, "body write geometry");
-        CHECK(memcmp(sp2.raw, sp0.raw, 8) == 0, "body write changed head");
-        CHECK(memcmp(sp2.raw + 16, sp0.raw + 16, sp0.len - 16) == 0,
-              "body write changed attr");
-        CHECK(*(int64_t *)(sp2.raw + 8) == 99, "body write body value");
+        CHECK(memcmp(sp2.raw, sp0.raw, KVSPACE_XVALUE_HEAD_LEN) == 0,
+              "body write changed head");
+        CHECK(head_attr_same(&sp2, &sp0), "body write changed attr");
+        CHECK(*(int64_t *)(intptr_t)(sp2.raw + KVSPACE_XVALUE_HEAD_LEN) == 99,
+              "body write body value");
         free(sp2.raw);
     }
 

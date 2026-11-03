@@ -12,8 +12,8 @@
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "failed: %s\n", #x); return 1; } } while (0)
 
-/* #571：head 固定 8 字节 [len:u48][storetype][ptr]，body 偏移恒 8，
-   attr 区 @8+len（attr_len:u16 自描述，含 langtype 记录）。整体单 key——无 attr key。 */
+/* head 固定 16 字节 [bodylen:u64][attrslen:u32][storetype][ptr][pad:2]，body 偏移恒 16，
+   attr 区紧随 body 且没有长度前缀。整体单 key——无 attr key。 */
 
 /* 读固定头：返回 (storetype, ptr, body_len)，并校验总长 ≥ head+body。 */
 static int peek(const uint8_t *v, uint32_t total, uint8_t *st, uint8_t *ptr,
@@ -25,7 +25,8 @@ static int peek(const uint8_t *v, uint32_t total, uint8_t *st, uint8_t *ptr,
     if (h.storetype > KVSPACE_XVALUE_ST_EXT || h.ptr > KVSPACE_XVALUE_PTR_EXT)
         return 1;
     uint64_t l = kvspaceXvalueHeadLen(&h);
-    if ((uint64_t)KVSPACE_XVALUE_HEAD_LEN + l > total)
+    const uint64_t full = kvspaceXvalueHeadTotalLen(&h);
+    if (full == 0 || full > total)
         return 1;
     *st = h.storetype;
     *ptr = h.ptr;
@@ -37,23 +38,25 @@ static int peek(const uint8_t *v, uint32_t total, uint8_t *st, uint8_t *ptr,
 static int attr_ok(const uint8_t *v, uint32_t total, uint64_t body_len,
                    const char *lt) {
     size_t l = strlen(lt);
-    const uint8_t *a = v + KVSPACE_XVALUE_HEAD_LEN + body_len;
-    uint64_t alen = (uint64_t)a[0] | ((uint64_t)a[1] << 8);
-    if ((uint64_t)total != KVSPACE_XVALUE_HEAD_LEN + body_len + alen)
+    kvspaceXvalueHead h;
+    memcpy(&h, v, sizeof h);
+    const uint8_t *a = kvspaceXvalueHeadAttrs(v);
+    const uint64_t alen = (uint64_t)h.attrslen;
+    if ((uint64_t)total != kvspaceXvalueHeadTotalLen(&h))
         return 0;
     if (l == 0)
-        return alen == 2;
-    if (alen != 2 + 3 + l)
+        return alen == 0;
+    if (alen != 3 + l)
         return 0;
-    return a[2] == KVSPACE_XVALUE_ATTR_TAG_LANGTYPE && a[3] == l && a[4] == 0 &&
-           memcmp(a + 5, lt, l) == 0;
+    return a[0] == KVSPACE_XVALUE_ATTR_TAG_LANGTYPE && a[1] == l && a[2] == 0 &&
+           memcmp(a + 3, lt, l) == 0;
 }
 
 static int test_head_constructors(void) {
     /* None：8 字节空体 + 空 attr。 */
     uint8_t *v = NULL;
     uint64_t n = 0;
-    CHECK(kvspaceXvalueHeadNewNone(&v, &n) == 0 && n == 10);
+    CHECK(kvspaceXvalueHeadNewNone(&v, &n) == 0 && n == 16);
     kvspaceXvalueHead h;
     memcpy(&h, v, sizeof h);
     CHECK(h.storetype == KVSPACE_XVALUE_ST_SHORT && h.ptr == KVSPACE_XVALUE_PTR_INLINE &&
@@ -65,7 +68,7 @@ static int test_head_constructors(void) {
     uint8_t raw[8] = {42, 0, 0, 0, 0, 0, 0, 0};
     CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, "int64",
                                      &v, &n) == 0);
-    CHECK(n == 26);
+    CHECK(n == 16 + 8 + (3 + 5));
     memcpy(&h, v, sizeof h);
     CHECK(kvspaceXvalueHeadLen(&h) == 8 && h.storetype == KVSPACE_XVALUE_ST_SHORT);
     CHECK(memcmp(v + KVSPACE_XVALUE_HEAD_LEN, raw, 8) == 0);
@@ -76,7 +79,7 @@ static int test_head_constructors(void) {
     /* 空 langtype：空 attr [attr_len:2]。 */
     CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, "",
                                      &v, &n) == 0);
-    CHECK(n == 18);
+    CHECK(n == 16 + 8);
     CHECK(attr_ok(v, (uint32_t)n, 8, ""));
     free(v);
 
@@ -84,7 +87,7 @@ static int test_head_constructors(void) {
     const uint8_t utf8[] = {0xe4, 0xbd, 0xa0, 0xf0, 0x9f, 0x98, 0x80};
     CHECK(kvspaceXvalueHeadNewSlack(utf8, sizeof utf8, sizeof utf8, "char/utf8",
                                     &v, &n) == 0);
-    CHECK(n == 8 + sizeof utf8 + 14);
+    CHECK(n == 16 + sizeof utf8 + (3 + 9));
     memcpy(&h, v, sizeof h);
     CHECK(kvspaceXvalueHeadLen(&h) == sizeof utf8 && h.storetype == KVSPACE_XVALUE_ST_SLACK);
     CHECK(memcmp(v + KVSPACE_XVALUE_HEAD_LEN, utf8, sizeof utf8) == 0);
@@ -127,34 +130,34 @@ static int test_new_abi(void) {
     uint64_t blen;
 
     CHECK(kvspaceNewInt64(42, "int64", &v, &len) == 0);
-    CHECK(len == 26 && peek(v, len, &st, &ptr, &blen) == 0);
+    CHECK(len == 16 + 8 + (3 + 5) && peek(v, len, &st, &ptr, &blen) == 0);
     CHECK(st == KVSPACE_XVALUE_ST_SHORT && ptr == KVSPACE_XVALUE_PTR_INLINE && blen == 8);
-    CHECK(v[8] == 42 && v[9] == 0); /* 小端 */
+    CHECK(v[KVSPACE_XVALUE_HEAD_LEN] == 42 && v[KVSPACE_XVALUE_HEAD_LEN + 1] == 0); /* 小端 */
     CHECK(attr_ok(v, len, 8, "int64"));
     free(v);
 
     CHECK(kvspaceNewFloat64(1.5, "float64", &v, &len) == 0);
-    CHECK(len == 28 && peek(v, len, &st, &ptr, &blen) == 0);
+    CHECK(len == 16 + 8 + (3 + 7) && peek(v, len, &st, &ptr, &blen) == 0);
     CHECK(st == KVSPACE_XVALUE_ST_SHORT && blen == 8);
     CHECK(attr_ok(v, len, 8, "float64"));
     free(v);
 
     CHECK(kvspaceNewBool(1, "bool", &v, &len) == 0);
-    CHECK(len == 18 && peek(v, len, &st, &ptr, &blen) == 0);
-    CHECK(st == KVSPACE_XVALUE_ST_SHORT && blen == 1 && v[8] == 1);
+    CHECK(len == 16 + 8 && peek(v, len, &st, &ptr, &blen) == 0);
+    CHECK(st == KVSPACE_XVALUE_ST_SHORT && blen == 1 && v[KVSPACE_XVALUE_HEAD_LEN] == 1);
     CHECK(attr_ok(v, len, 1, "bool"));
     free(v);
 
     const uint8_t utf8[] = {0xe4, 0xbd, 0xa0, 0xf0, 0x9f, 0x98, 0x80};
     CHECK(kvspaceNewChar(utf8, sizeof utf8, "char/utf8", &v, &len) == 0);
-    CHECK(len == 8 + sizeof utf8 + 14 && peek(v, len, &st, &ptr, &blen) == 0);
+    CHECK(len == 16 + sizeof utf8 + (3 + 9) && peek(v, len, &st, &ptr, &blen) == 0);
     CHECK(st == KVSPACE_XVALUE_ST_SLACK && blen == sizeof utf8);
     CHECK(memcmp(v + KVSPACE_XVALUE_HEAD_LEN, utf8, sizeof utf8) == 0);
     CHECK(attr_ok(v, len, sizeof utf8, "char/utf8"));
     free(v);
 
     CHECK(kvspaceNewPtr("int64", "/x", &v, &len) == 0);
-    CHECK(len == 20 && peek(v, len, &st, &ptr, &blen) == 0);
+    CHECK(len == 16 + 2 + (3 + 5) && peek(v, len, &st, &ptr, &blen) == 0);
     CHECK(ptr == KVSPACE_XVALUE_PTR_PTR && st == KVSPACE_XVALUE_ST_SLACK && blen == 2);
     CHECK(memcmp(v + KVSPACE_XVALUE_HEAD_LEN, "/x", 2) == 0);
     CHECK(attr_ok(v, len, 2, "int64"));
