@@ -10,6 +10,7 @@
 
 #include "kvspace_shm.h"
 #include "xvalue_head.h"
+#include "xvalue_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,9 +43,21 @@ static int from_wire_head(const uint8_t *d, uint32_t total, kvspaceHead_t *out) 
     kvspaceXvalueHead h;
     memcpy(&h, d, sizeof h);
     uint64_t l = kvspaceXvalueHeadLen(&h);
-    if (h.storetype > KVSPACE_XVALUE_ST_EXT || h.ptr > KVSPACE_XVALUE_PTR_EXT ||
+    if (h.storetype > KVSPACE_XVALUE_ST_VARLEN || h.ptr > KVSPACE_XVALUE_PTR_EXT ||
         (uint64_t)KVSPACE_XVALUE_HEAD_LEN + l > total)
         return 1;
+    /* storetype 4 的有效长度由 attr tag 2 给出；其余形态它不存在。
+       这里顺带用 EffectiveLen 把 tag 2 的归属校验做掉（与 Rust 侧同规）。 */
+    uint64_t effective = 0;
+    {
+        const uint64_t whole = total;
+        const uint64_t attrs = kvspaceXvalueHeadAttrsLen(&h);
+        if ((uint64_t)KVSPACE_XVALUE_HEAD_LEN + l + attrs > whole)
+            return 1;
+        if (kvspace_c_effective_len(d, whole, &effective) != 0)
+            return 1;
+    }
+    (void)effective;
     out->headlen = KVSPACE_XVALUE_HEAD_LEN;
     out->ref = h.ptr == KVSPACE_XVALUE_PTR_PTR ? 1 :
                h.ptr == KVSPACE_XVALUE_PTR_EXT ? 2 : 0;

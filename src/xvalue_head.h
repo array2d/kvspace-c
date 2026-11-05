@@ -12,6 +12,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 
 #ifdef __cplusplus
@@ -25,6 +26,8 @@ extern "C" {
 #define KVSPACE_XVALUE_ST_SLACK 1u   /* 变长（字节/字符数组/代码槽/指针路径，len=有效字节） */
 #define KVSPACE_XVALUE_ST_LARGE 2u   /* 大定长（张量，body=元素连续） */
 #define KVSPACE_XVALUE_ST_EXT   3u   /* 扩展定位（@ext，body=定位串） */
+/* 定容量变长：**bodylen 是容量**（与 0–3 语义不同），有效长度在 attr tag 2。 */
+#define KVSPACE_XVALUE_ST_VARLEN 4u
 
 /* ptr：指针/扩展形态 */
 #define KVSPACE_XVALUE_PTR_INLINE 0u
@@ -84,8 +87,14 @@ static inline const uint8_t *kvspaceXvalueHeadAttrs(const uint8_t *wire) {
     return wire + KVSPACE_XVALUE_HEAD_LEN + (uint64_t)h->bodylen;
 }
 
-/* attr 区常量：record tag 1 = langtype；2+ 预留扩展（ro/vid 等，未实现）。 */
+/* attr 区常量：record tag 1 = langtype；tag 2 = reallen（storetype 4 专用）；其余预留。 */
 #define KVSPACE_XVALUE_ATTR_TAG_LANGTYPE 1u
+/* tag 2 的归属是**排他**的：storetype 4 必须带、其它 storetype 必须不带。
+   未知 tag 一般忽略以保持前向兼容；tag 2 例外——它已分配给 reallen，而 reallen
+   只在 storetype 4 下有定义。「有定义但在此 storetype 下无意义」说明写读双方对格式
+   理解不一致，必须拒绝；「我不认识这个 tag」才该忽略。 */
+#define KVSPACE_XVALUE_ATTR_TAG_REALLEN 2u
+
 
 /* Scan the attr region for tag=1 (langtype) data; returns 0 if missing or
    malformed. Unbounded: caller must ensure the wire holds 16+bodylen+attrslen

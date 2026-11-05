@@ -1,4 +1,5 @@
 #include "xvalue_head.h"
+#include "xvalue_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -218,6 +219,83 @@ static void test_fail_contract(void) {
         free(buf);
     }
 }
+/* 造一条 storetype 4 的 wire（容量 cap、有效 reallen，带 langtype 记录）。
+   构造器 `kvspaceXvalueHeadNew*` 不接受 4（它需要同时给容量与 reallen），
+   这里按格式手工拼，正好也验证读侧能独立解析。 */
+static uint8_t *make_varlen(uint64_t cap, uint64_t reallen, const char *lt,
+                            uint64_t *out_total) {
+    size_t l = lt ? strlen(lt) : 0;
+    uint64_t alen = (l ? 3 + l : 0) + 11; /* langtype 记录 + tag2 记录 */
+    uint64_t total = KVSPACE_XVALUE_HEAD_LEN + cap + alen;
+    uint8_t *v = (uint8_t *)calloc(1, total);
+    kvspaceXvalueHead h = {.storetype = KVSPACE_XVALUE_ST_VARLEN,
+                           .ptr = KVSPACE_XVALUE_PTR_INLINE,
+                           .padding = {0u, 0u}};
+    kvspaceXvalueHeadSetLen(&h, cap);
+    kvspaceXvalueHeadSetAttrsLen(&h, (uint32_t)alen);
+    memcpy(v, &h, sizeof h);
+    uint8_t *a = v + KVSPACE_XVALUE_HEAD_LEN + cap;
+    if (l) {
+        a[0] = KVSPACE_XVALUE_ATTR_TAG_LANGTYPE;
+        a[1] = (uint8_t)l; a[2] = (uint8_t)(l >> 8);
+        memcpy(a + 3, lt, l);
+        a += 3 + l;
+    }
+    a[0] = KVSPACE_XVALUE_ATTR_TAG_REALLEN;
+    a[1] = 8; a[2] = 0;
+    for (int i = 0; i < 8; i++)
+        a[3 + i] = (uint8_t)(reallen >> (8 * i));
+    *out_total = total;
+    return v;
+}
+
+static void test_varlen(void) {
+    uint64_t total = 0;
+    /* 闭环：容量 32、有效 5；有效区之外是容量余量，不能被当成数据。 */
+    uint8_t *v = make_varlen(32, 5, "char/utf8", &total);
+    uint64_t eff = 123;
+    CHECK(kvspace_c_effective_len(v, total, &eff) == 0, "varlen effective ok");
+    CHECK(eff == 5, "effective=%llu expect 5", (unsigned long long)eff);
+    kvspaceXvalueHead h;
+    memcpy(&h, v, sizeof h);
+    CHECK(kvspaceXvalueHeadLen(&h) == 32, "head len is capacity");
+    const uint8_t *lt = NULL;
+    CHECK(kvspaceXvalueHeadLangtypeBounded(v, total, &lt) == 9, "langtype record");
+    free(v);
+
+    /* reallen == 0 合法：容量已分配、当前无内容。 */
+    v = make_varlen(16, 0, NULL, &total);
+    eff = 123;
+    CHECK(kvspace_c_effective_len(v, total, &eff) == 0 && eff == 0, "reallen=0 legal");
+    free(v);
+
+    /* 拒绝①：storetype 4 缺 tag 2（把 attrslen 改成 0，等于没有 tag 2）。 */
+    v = make_varlen(8, 3, NULL, &total);
+    h.storetype = KVSPACE_XVALUE_ST_VARLEN;
+    memcpy(v, &h, sizeof h);
+    kvspaceXvalueHeadSetAttrsLen(&h, 0);
+    memcpy(v, &h, sizeof h);
+    CHECK(kvspace_c_effective_len(v, total, &eff) != 0, "missing tag2 rejected");
+    free(v);
+
+    /* 拒绝②：reallen > 容量。 */
+    v = make_varlen(8, 9, NULL, &total);
+    CHECK(kvspace_c_effective_len(v, total, &eff) != 0, "reallen>cap rejected");
+    free(v);
+
+    /* 拒绝③：非 storetype 4 带 tag 2。 */
+    {
+        uint8_t *w = make_varlen(8, 3, NULL, &total);
+        kvspaceXvalueHead h2;
+        memcpy(&h2, w, sizeof h2);
+        h2.storetype = KVSPACE_XVALUE_ST_SLACK;
+        memcpy(w, &h2, sizeof h2);
+        CHECK(kvspace_c_effective_len(w, total, &eff) != 0,
+              "tag2 under non-varlen rejected");
+        free(w);
+    }
+}
+
 int main(void) {
     test_none();
     test_scalar();
@@ -226,6 +304,7 @@ int main(void) {
     test_ptr_ext();
     test_reserve_code();
     test_fail_contract();
+    test_varlen();
     if (failures) {
         fprintf(stderr, "%d failed\n", failures);
         return 1;

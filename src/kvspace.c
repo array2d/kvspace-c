@@ -12,6 +12,7 @@
 #include "slotsboxmalloc/slotsboxobj.h"
 #include "kvspace_shm.h"
 #include "xvalue_head.h"
+#include "xvalue_internal.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -649,12 +650,22 @@ static int head_of(const uint8_t *val, int32_t val_len, kvspaceXvalueHead *out) 
     memcpy(out, val, sizeof *out);
     if (!kvspaceXvalueHeadPaddingIsZero(out))
         return -1;
-    if (out->storetype > KVSPACE_XVALUE_ST_EXT ||
+    if (out->storetype > KVSPACE_XVALUE_ST_VARLEN ||
         out->ptr > KVSPACE_XVALUE_PTR_EXT)
         return -1;
     const uint64_t total = kvspaceXvalueHeadTotalLen(out);
     if (total == 0 || total > (uint64_t)val_len)
         return -1;
+    /* tag 2 的归属在这里守：storetype 4 必须有且 reallen<=bodylen；其它形态出现
+       它就是「有定义但此形态下无意义」，同样拒绝（与 Rust 侧同一规则）。
+       历史 wire 的 attr 尾部残余字节不算畸形——扫描器与 Rust 同语义，忽略不足
+       一条记录的尾巴。 */
+    {
+        uint64_t effective = 0;
+        if (kvspace_c_effective_len(val, total, &effective) != 0)
+            return -1;
+        (void)effective;
+    }
     return 0;
 }
 
