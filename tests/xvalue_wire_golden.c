@@ -12,7 +12,7 @@
  * 两路，shm 后端从未参与过 wire 布局的交叉验证。
  */
 
-#include "xvalue_head.h"
+#include <kvspace/xvalue_head.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,7 +53,7 @@ static void emit_scalar_int64(void) {
     uint8_t *wire = NULL;
     uint64_t length = 0;
 
-    REQUIRE(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, body, 8,
+    REQUIRE(kvspaceXvalueHeadNewScalar(body, 8,
                                        "int64", &wire, &length) == 0,
             "int64");
     if (wire != NULL) {
@@ -67,7 +67,7 @@ static void emit_scalar_bool(void) {
     uint8_t *wire = NULL;
     uint64_t length = 0;
 
-    REQUIRE(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, body, 1, "bool",
+    REQUIRE(kvspaceXvalueHeadNewScalar(body, 1, "bool",
                                        &wire, &length) == 0,
             "bool");
     if (wire != NULL) {
@@ -150,7 +150,7 @@ static void emit_reserve(void) {
     uint8_t *wire = NULL;
     uint64_t length = 0;
 
-    REQUIRE(kvspaceXvalueHeadReserve(KVSPACE_XVALUE_ST_SLACK, 4, 8, "[]u8",
+    REQUIRE(kvspaceXvalueHeadReserve(4, 8, "[]u8",
                                      &wire, &length) == 0,
             "reserve");
     if (wire != NULL) {

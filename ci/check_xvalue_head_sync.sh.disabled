@@ -1,3 +1,9 @@
+# ─────────────────────────────────────────────────────────────────────────
+# 已停用：用户裁决「不允许 vendor xvalue_head」，kvspace-c 现在直接
+# `#include <kvspace/xvalue_head.h>` 依赖上游那个文件本身（见 CMakeLists.txt 顶部的
+# KVSPACE_UPSTREAM_INCLUDE_DIRECTORY）。没有副本，就没有「副本与上游一致」这件事，
+# 该检查失去对象，已从 ctest 摘除。本文件保留只为留下判据的来龙去脉。
+# ─────────────────────────────────────────────────────────────────────────
 #!/usr/bin/env bash
 # 校验 kvspace-c 自带的 xvalue_head 副本与上游 kvspace 逐字节一致。
 #

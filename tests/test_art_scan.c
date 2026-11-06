@@ -2,7 +2,7 @@
 
 #define _GNU_SOURCE
 #include "kvspace_shm.h"
-#include "xvalue_head.h"
+#include <kvspace/xvalue_head.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,7 +40,7 @@ static int set_int32(kvspace_t *kv, const char *key, int32_t v) {
                     (uint8_t)(v >> 24)};
   uint8_t *xv;
   uint64_t n = 0;
-  if (kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 4, "", &xv, &n) != 0)
+  if (kvspaceXvalueHeadNewScalar(raw, 4, "", &xv, &n) != 0)
     return -1;
   int rc = kvspaceShmSet(kv, key, xv, (int32_t)n);
   free(xv);
@@ -99,7 +99,7 @@ static void t_correct(const char *db) {
   uint8_t raw[4] = {7};
   uint8_t *permitted = NULL;
   uint64_t permitted_len = 0;
-  CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 4, "", &permitted, &permitted_len) == 0 &&
+  CHECK(kvspaceXvalueHeadNewScalar(raw, 4, "", &permitted, &permitted_len) == 0 &&
             kvspaceShmSetValue(kv, "/private", permitted,
                                (int32_t)permitted_len) == 0,
         "set permitted value");
@@ -166,8 +166,7 @@ static void t_correct(const char *db) {
 
   CHECK(set_int32(kv, "/private", 8) == 0, "overwrite permitted value");
   uint8_t *body = NULL;
-  CHECK(kvspaceShmWriteNewPlace(kv, "/private", 0, KVSPACE_XVALUE_ST_SHORT,
-                                4, 4, "", &body) == 0,
+  CHECK(kvspaceShmWriteNewPlace(kv, "/private", 0, 4, 4, "", &body) == 0,
         "write new permitted place");
   if (body)
     memcpy(body, raw, 4);
@@ -175,7 +174,7 @@ static void t_correct(const char *db) {
 
   permitted = NULL;
   permitted_len = 0;
-  CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 4, "",
+  CHECK(kvspaceXvalueHeadNewScalar(raw, 4, "",
                                    &permitted, &permitted_len) == 0 &&
             kvspaceShmSetValue(kv, "/tree/a", permitted,
                                (int32_t)permitted_len) == 0,

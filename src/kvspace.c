@@ -11,7 +11,7 @@
 #define SLOTSBOXMALLOC_IMPLEMENTATION
 #include "slotsboxmalloc/slotsboxobj.h"
 #include "kvspace_shm.h"
-#include "xvalue_head.h"
+#include <kvspace/xvalue_head.h>
 #include "xvalue_internal.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -648,16 +648,15 @@ static int head_of(const uint8_t *val, int32_t val_len, kvspaceXvalueHead *out) 
     if (!val || val_len < (int32_t)KVSPACE_XVALUE_HEAD_LEN)
         return -1;
     memcpy(out, val, sizeof *out);
-    if (!kvspaceXvalueHeadPaddingIsZero(out))
-        return -1;
-    if (out->storetype > KVSPACE_XVALUE_ST_VARLEN ||
-        out->ptr > KVSPACE_XVALUE_PTR_EXT)
-        return -1;
+    /* padding 与 layout 的合法性由 `TotalLen` 一处判掉（它同时算总长、
+       溢出与布局值），这里不再自己比枚举上界——旧模型那两句
+       `storetype > ST_VARLEN || ptr > PTR_EXT` 的对应字段已经不存在。 */
     const uint64_t total = kvspaceXvalueHeadTotalLen(out);
     if (total == 0 || total > (uint64_t)val_len)
         return -1;
-    /* tag 2 的归属在这里守：storetype 4 必须有且 reallen<=bodylen；其它形态出现
-       它就是「有定义但此形态下无意义」，同样拒绝（与 Rust 侧同一规则）。
+    /* tag 2 的归属在这里守：`layout == CAPACITY` 必须有且 reallen<=bodylen；
+       其它 layout 出现它就是「有定义但此布局下无意义」，同样拒绝
+       （与 Rust 侧同一规则）。
        历史 wire 的 attr 尾部残余字节不算畸形——扫描器与 Rust 同语义，忽略不足
        一条记录的尾巴。 */
     {
@@ -696,7 +695,7 @@ int kvspaceShmViewFromRef(kvspace_t *kv, const kvspaceRef_t *ref,
     uint8_t *raw = kv->sbo_data + AV_OFF(hv);
     kvspaceXvalueHead w;
     if (head_of(raw, (int32_t)cap, &w) != 0 ||
-        w.ptr != KVSPACE_XVALUE_PTR_INLINE)
+        kvspace_c_reference_of(raw, cap) != KVSPACE_XVALUE_REFERENCE_INLINE)
         return -1;
     kv_gens_t *g = gens_at(kv, id);
     if (!g)
@@ -2732,7 +2731,8 @@ static art_hdr_t *resolve_fetch(kvspace_t *kv, const char *path, char *out, int 
         kvspaceXvalueHead wire;
         if (head_of(s, sz > INT32_MAX ? INT32_MAX : (int32_t)sz, &wire) == 0) {
             uint64_t l3 = kvspaceXvalueHeadLen(&wire);
-            if (wire.ptr != KVSPACE_XVALUE_PTR_PTR || l3 >= (uint64_t)osz) {
+            if (kvspace_c_reference_of(s, sz) != KVSPACE_XVALUE_REFERENCE_PTR ||
+                l3 >= (uint64_t)osz) {
                 if (parse_value(s, sz, rl) != 0)
                     return NULL;
                 *raw = s;
@@ -2772,7 +2772,7 @@ static int dir_ext_path(kvspace_t *kv, const char *dir, char *out, int osz) {
         return 0;
     kvspaceXvalueHead wire;
     if (head_of(raw, rl, &wire) != 0 ||
-        wire.ptr != KVSPACE_XVALUE_PTR_EXT)
+        kvspace_c_reference_of(raw, (uint64_t)rl) != KVSPACE_XVALUE_REFERENCE_EXT)
         return 0;
     uint64_t l4 = kvspaceXvalueHeadLen(&wire);
     if (l4 == 0 || l4 >= (uint64_t)osz)
@@ -2942,12 +2942,35 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
             const uint8_t *hs = kv->sbo_data + off;
             kvspaceXvalueHead w;
             memcpy(&w, hs, sizeof w);
-            if (w.storetype == KVSPACE_XVALUE_ST_SLACK &&
-                w.ptr == KVSPACE_XVALUE_PTR_INLINE) {
-                uint64_t len = kvspaceXvalueHeadLen(&w);
+            /*
+             * 快路径前置：**不是引用**（旧模型用 `storetype == SLACK` 表达，
+             * 新模型里「变长/定宽」不再是 head 的事实——它由 langtype 决定）。
+             * 这里只判引用性；「能否原地写」的最终判据在下面那段容量检查里，
+             * 而**类型不得改变**由调用方（`kvspaceShmSetPart` 的 `same_shape`）
+             * 保证。
+             */
+            if (kvspace_c_reference_of(
+                    hs, sbo_allocated_size(kv->sbo_meta, off)) ==
+                KVSPACE_XVALUE_REFERENCE_INLINE) {
+                /*
+                 * **`len` 是有效长度，不是 `bodylen`。**
+                 *
+                 * 旧模型里 `kvspaceXvalueHeadLen` 就是有效长度（storetype 4 的
+                 * 容量语义还没进来）。新布局把两者拆开：`bodylen` 在
+                 * `LAYOUT_CAPACITY` 下是**容量**，有效长度在 attr tag 2。
+                 * 用 `bodylen` 当上界会允许写到有效区之外——那是静默写脏数据，
+                 * 比越界更糟（越界至少会崩）。
+                 */
+                uint64_t total_box = sbo_allocated_size(kv->sbo_meta, off);
+                uint64_t len = 0U;
+                if (kvspace_c_effective_len(hs, total_box, &len) != 0)
+                    len = kvspaceXvalueHeadLen(&w); /* 畸形：退回 bodylen 走保守判定 */
                 /* per-box 物理容量：损坏 head 的 len 可能大于 box 但仍在全局内，
                  * 不做这一步会跨 box 写坏相邻值。 */
-                uint64_t cap = sbo_allocated_size(kv->sbo_meta, off);
+                uint64_t cap = total_box;
+                /* `offset` 是**整条 wire 的绝对偏移**（与 SetPart 同约定），
+                 * 所以上界是 `head + 有效长度`，不是有效长度本身。 */
+                (void)0;
                 if (cap <= data_size - off && len <= cap - KVSPACE_XVALUE_HEAD_LEN &&
                     (uint64_t)offset <= KVSPACE_XVALUE_HEAD_LEN + len &&
                     (uint64_t)buf_len <=
@@ -2987,8 +3010,10 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
     }
     uint8_t *raw;
     int32_t rl;
+    uint64_t bound = 0U;
     if (read_value(kv, AV_OFF(hv), &raw, &rl) < 0 ||
-        (uint64_t)offset + buf_len > (uint64_t)rl)
+        kvspace_c_effective_len(raw, (uint64_t)rl, &bound) != 0 ||
+        (uint64_t)offset + buf_len > (uint64_t)KVSPACE_XVALUE_HEAD_LEN + bound)
         return -1;
     kv_gens_t *g2 = gens_at(kv, id);
     if (g2)
@@ -3007,8 +3032,10 @@ int kvspaceShmSetPart(kvspace_t *kv, const char *key, uint32_t offset,
         return -1;
     int32_t rl = 0;
     uint8_t *d = kvspaceShmGet(kv, key, 1, &rl);
+    uint64_t bound = 0U;
     if (!d || read_value(kv, (uint64_t)(d - kv->sbo_data), &d, &rl) != 0 ||
-        (uint64_t)offset + buf_len > (uint64_t)rl)
+        kvspace_c_effective_len(d, (uint64_t)rl, &bound) != 0 ||
+        (uint64_t)offset + buf_len > (uint64_t)KVSPACE_XVALUE_HEAD_LEN + bound)
         return -1;
     memcpy(d + offset, buf, buf_len);
     return 0;
@@ -3026,6 +3053,24 @@ static int is_vthread_status_key(const char *key) {
     size_t n = strlen(key), sl = sizeof suf - 1;
     return n > sl && strncmp(key, pfx, sizeof pfx - 1) == 0 &&
            memcmp(key + n - sl, suf, sl) == 0;
+}
+
+/* langtype 的 base kind 是不是 char：`char/X`、`[N]char/X`、`[]char/X` 都算。
+   只看第一个 `]` 之后（形状段可以有多个维度）。引用前缀不在此判——引用槽在
+   调用点已被拒绝。 */
+static int is_char_langtype(const uint8_t *langtype, uint16_t length) {
+    if (!langtype || length == 0)
+        return 0;
+    uint16_t at = 0;
+    if (langtype[0] == '[') {
+        while (at < length && langtype[at] != ']')
+            ++at;
+        if (at >= length)
+            return 0;
+        ++at;
+    }
+    return (uint16_t)(length - at) >= 5 &&
+           memcmp(langtype + at, "char/", 5) == 0;
 }
 
 int kvspaceShmXvalueBodyView(kvspace_t *kv, const kvspaceRef_t *ref,
@@ -3052,20 +3097,26 @@ int kvspaceShmXvalueBodyView(kvspace_t *kv, const kvspaceRef_t *ref,
     kvspaceXvalueHead wire;
     if (head_of(raw, rl, &wire) != 0)
         return -1;
-    /* ptr/ext 槽不可视：没有稳定的 head/body 语义。 */
-    if (wire.ptr != KVSPACE_XVALUE_PTR_INLINE)
+    /* 引用槽（Ptr/Ext）不可视：没有稳定的 head/body 语义。 */
+    if (kvspace_c_reference_of(raw, (uint64_t)rl) !=
+        KVSPACE_XVALUE_REFERENCE_INLINE)
         return -1;
     uint64_t cap = sbo_allocated_size(kv->sbo_meta, AV_OFF(hv));
-    uint64_t l5 = kvspaceXvalueHeadLen(&wire);
-    if (cap < KVSPACE_XVALUE_HEAD_LEN ||
-        l5 > cap - KVSPACE_XVALUE_HEAD_LEN)
+    uint64_t effective = 0;
+    if (kvspaceXvalueHeadEffectiveLen(raw, (uint64_t)rl, &effective) != 0)
         return -1;
-    /* status: only expose canonical slots (SLACK, len <= 16) with sufficient physical capacity;
-       langtype ([n]char/utf8) lives in the inline attr region and is not checked here. */
+    if (cap < KVSPACE_XVALUE_HEAD_LEN ||
+        effective > cap - KVSPACE_XVALUE_HEAD_LEN)
+        return -1;
+    /* status: 文本形态（base kind 为 char）+ 有效长度 ≤16 + 物理容量 ≥80。
+       `bodylen` 在容量形态下是容量，不能当内容长度用（见 XValueHead线格式）。 */
     if (is_vthread_status_key(key_fallback)) {
-        if (wire.storetype != KVSPACE_XVALUE_ST_SLACK ||
-            cap < KVSPACE_STATUS_MIN_CAP ||
-            l5 > KVSPACE_STATUS_MAX_LEN)
+        const uint8_t *status_langtype = NULL;
+        const uint16_t status_langtype_len =
+            kvspaceXvalueHeadLangtypeBounded(raw, (uint64_t)rl, &status_langtype);
+        if (cap < KVSPACE_STATUS_MIN_CAP ||
+            effective > KVSPACE_STATUS_MAX_LEN ||
+            !is_char_langtype(status_langtype, status_langtype_len))
             return -1;
     }
     out->head = raw;
@@ -3161,8 +3212,13 @@ static int shm_set_raw(kvspace_t *kv, const char *key, const uint8_t *val,
     return shm_set_local(kv, key, val, val_len, old, reserve);
 }
 
-static int frame_operand_ptr(const char *key, const kvspaceXvalueHead *wire) {
-    if (wire->ptr != KVSPACE_XVALUE_PTR_PTR ||
+/* 「这个写入目标是 vthread 帧的操作数、且它是一个 Ptr」。
+ * 旧模型读 `wire->ptr`；新模型没有该字段，引用性由 langtype 前缀表达，
+ * 所以这里要多一层 wire 字节才能判——多出的两个参数就是为此。 */
+static int frame_operand_ptr(const char *key, const uint8_t *wire_bytes,
+                             uint64_t wire_len) {
+    if (kvspace_c_reference_of(wire_bytes, wire_len) !=
+            KVSPACE_XVALUE_REFERENCE_PTR ||
         strncmp(key, "/vthread/", 9) != 0)
         return 0;
     const char *slot = strrchr(key, '/');
@@ -3201,7 +3257,7 @@ static int shm_set_validated(kvspace_t *kv, const char *key,
                                        (const uint8_t *)tgt, (int)strlen(tgt));
             free(tgt);
             if (eh && AV_HAS(art_val_load(eh)) &&
-                !frame_operand_ptr(kbuf, wire)) {
+                !frame_operand_ptr(kbuf, val, (uint64_t)val_len)) {
                 free(pp);
                 free(nn);
                 return -1;
@@ -3211,11 +3267,25 @@ static int shm_set_validated(kvspace_t *kv, const char *key,
         free(nn);
     }
 
-    /* status slot: fixed shape (SLACK, len <= 16) and physical capacity >= minimum.
-     * langtype ([n]char/utf8) lives in the inline attr region and is not checked here. */
+    /* status slot: **文本形态**（langtype 以 `char/` 开头）+ 长度 <= 16 + 物理容量足够。
+     *
+     * 旧模型用 `storetype == SLACK` 表达「这是一个变长文本槽」。新布局没有
+     * storetype 位，而「变长文本」在新模型里恰好有**明确表达**：langtype 是
+     * 字符种类（`char/utf8` / `[N]char/…`）。所以判据从「storetype 枚举」换成
+     * 「langtype 是不是字符种类」——这不是找替代物，是把隐含信息显式化：
+     * 状态槽的语义本来就是「一段短文本」。
+     *
+     * 只判长度会放过 `int64` 这类定宽标量写进 status 槽（旧代码靠 storetype
+     * 拦住它们），那是**放宽**，不是迁移。 */
     if (is_vthread_status_key(kbuf)) {
-        if (wire->storetype != KVSPACE_XVALUE_ST_SLACK ||
-            kvspaceXvalueHeadLen(wire) > KVSPACE_STATUS_MAX_LEN)
+        const uint8_t *status_langtype = NULL;
+        const uint16_t status_langtype_len =
+            kvspaceXvalueHeadLangtypeBounded(val, (uint64_t)val_len,
+                                             &status_langtype);
+        uint64_t effective = 0;
+        if (kvspaceXvalueHeadEffectiveLen(val, (uint64_t)val_len, &effective) != 0 ||
+            effective > KVSPACE_STATUS_MAX_LEN ||
+            !is_char_langtype(status_langtype, status_langtype_len))
             return -1;
         if (local && AV_HAS(lhv)) {
             uint8_t *old_raw = kv->sbo_data + AV_OFF(lhv);
@@ -3223,10 +3293,17 @@ static int shm_set_validated(kvspace_t *kv, const char *key,
             kvspaceXvalueHead old;
             /* 旧 store 的不合规 status 槽（形状/容量任一不符）：
              * 不自动升级、不 realloc——写入硬错，需重建/重置。 */
+            const uint8_t *old_langtype = NULL;
+            const uint16_t old_langtype_len =
+                kvspaceXvalueHeadLangtypeBounded(old_raw, (uint64_t)old_sz,
+                                                 &old_langtype);
+            uint64_t old_effective = 0;
             if (head_of(old_raw, (int32_t)old_sz, &old) != 0 ||
-                old.storetype != KVSPACE_XVALUE_ST_SLACK ||
-                kvspaceXvalueHeadLen(&old) > KVSPACE_STATUS_MAX_LEN ||
-                old_sz < KVSPACE_STATUS_MIN_CAP)
+                kvspaceXvalueHeadEffectiveLen(old_raw, (uint64_t)old_sz,
+                                              &old_effective) != 0 ||
+                old_effective > KVSPACE_STATUS_MAX_LEN ||
+                old_sz < KVSPACE_STATUS_MIN_CAP ||
+                !is_char_langtype(old_langtype, old_langtype_len))
                 return -1;
         }
     }
@@ -3315,9 +3392,8 @@ int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
 }
 
 int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
-                            uint8_t storetype, int32_t body_len,
-                            uint64_t body_cap, const char *langtype,
-                            uint8_t **body) {
+                            int32_t body_len, uint64_t body_cap,
+                            const char *langtype, uint8_t **body) {
     if (!kv || !key || !body || body_len < 0)
         return -1;
     if (body_cap > INT32_MAX - 32)
@@ -3328,29 +3404,60 @@ int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
     size_t key_len = strlen(key);
     if (key_len >= 1024 || strstr(key, "//") || reserved_meta_path(key))
         return -1;
-    uint8_t ptr;
-    if (ref == 0 && storetype <= KVSPACE_XVALUE_ST_EXT)
-        ptr = KVSPACE_XVALUE_PTR_INLINE;
-    else if (ref == 1 && storetype == KVSPACE_XVALUE_ST_SLACK)
-        ptr = KVSPACE_XVALUE_PTR_PTR;
-    else if (ref == 2 && storetype == KVSPACE_XVALUE_ST_EXT)
-        ptr = KVSPACE_XVALUE_PTR_EXT;
-    else
+    /*
+     * 构造器分派：**引用性由构造器决定**，不再由 `storetype` 参数决定。
+     *
+     * 上游头把这件事定死了：`NewPtr`/`NewExt` 是唯一知道「这个值是引用」的构造点，
+     * 它们替调用方补 `*`/`@` 前缀（`xvalue_head.h:221-223`）；`Reserve` 不补前缀，
+     * 只做「占位 + layout 推导」。所以 ref≠0 时必须走 NewPtr/NewExt，不能拿
+     * Reserve 造一条普通值再假装它是引用——那样 langtype 里没有前缀，读侧会把它
+     * 当普通值处理。
+     *
+     * layout 由 `NewSlack`/`Reserve` 内部按 `cap > len` 推导（3.3 裁决），
+     * 本函数不再传 storetype。
+     */
+    if (ref > 2U)
         return -1;
+    /*
+     * 三种 ref 都走**占位构造**（`Reserve`）：它的 body 是**调用方待填的缓冲区**，
+     * 本函数的契约是「返回 body 指针给调用方写」。
+     *
+     * 引用性由 langtype 的 `*`/`@` 前缀表达，而 `Reserve` 不补前缀——所以这里
+     * 由**本函数**补（与 `NewPtr`/`NewExt` 的构造规则同源：空 langtype → 裸
+     * `*`/`@`；已带前缀 → 拒绝，双重前缀说明两处对格式理解不一致）。
+     *
+     * 为什么不直接调 `NewPtr`/`NewExt`：它们把 body 当作**已经写好的路径**来接收
+     * （参数就叫 `path`/`locator`），而这里的 body 是空的、等着调用方填。两者
+     * 的前置条件不同，借用会静默写出一段「内容是路径长度那么多零字节」的值。
+     */
+    char prefixed_langtype[256];
+    const char *effective_langtype = langtype;
+    if (ref != 0U) {
+        const char prefix = ref == 1U ? '*' : '@';
+        const size_t inner = langtype ? strlen(langtype) : 0U;
+        if (langtype && (langtype[0] == '*' || langtype[0] == '@'))
+            return -1; /* 双重前缀 */
+        if (inner + 2U > sizeof(prefixed_langtype))
+            return -1;
+        prefixed_langtype[0] = prefix;
+        if (inner)
+            memcpy(prefixed_langtype + 1, langtype, inner);
+        prefixed_langtype[inner + 1] = '\0';
+        effective_langtype = prefixed_langtype;
+    }
     uint8_t *value = NULL;
     uint64_t total = 0;
-    if (kvspaceXvalueHeadReserve(storetype, (uint64_t)body_len,
-                                 body_cap, langtype, &value, &total) != 0)
+    if (kvspaceXvalueHeadReserve((uint64_t)body_len, body_cap,
+                                 effective_langtype, &value, &total) != 0)
         return -1;
     if (total > INT32_MAX) {
         free(value);
         return -1;
     }
-    /* Reserve produces an inline header; patch ptr byte for ref=1/2. */
-    kvspaceXvalueHead hd;
-    memcpy(&hd, value, sizeof hd);
-    hd.ptr = ptr;
-    memcpy(value, &hd, sizeof hd);
+    /*
+     * 不再 patch `ptr` 字节：新布局没有这个字段，引用性由**构造器**写进
+     * langtype 前缀（上面已按 ref 分派到 NewPtr/NewExt/Reserve）。
+     */
     /* Fixed 8-byte header (body offset = 8) + attr at 8+body_len in a single write.
      * Reserve physical box capacity (8 + body_cap + attr) so body can grow in place. */
     uint64_t attr_len = total - KVSPACE_XVALUE_HEAD_LEN - (uint64_t)body_len;
@@ -3431,7 +3538,9 @@ static int is_ptr_key(kvspace_t *kv, const char *key) {
     int32_t rl = 0;
     kvspaceXvalueHead wire;
     return read_value(kv, AV_OFF(hv), &raw, &rl) == 0 && rl > 0 &&
-           head_of(raw, rl, &wire) == 0 && wire.ptr == KVSPACE_XVALUE_PTR_PTR;
+           head_of(raw, rl, &wire) == 0 &&
+           kvspace_c_reference_of(raw, (uint64_t)rl) ==
+               KVSPACE_XVALUE_REFERENCE_PTR;
 }
 
 /* Delete the entire subtree under prefix. A single trailing '/' or U+00B7 on
@@ -3905,9 +4014,8 @@ int kvspaceShmExtindex(kvspace_t *kv, const char *p, const char *ep,
     if (source_len >= (int32_t)KVSPACE_XVALUE_HEAD_LEN) {
         kvspaceXvalueHead sh;
         memcpy(&sh, source, sizeof sh);
-        if (kvspaceXvalueHeadPaddingIsZero(&sh) &&
-            sh.storetype <= KVSPACE_XVALUE_ST_EXT &&
-            sh.ptr <= KVSPACE_XVALUE_PTR_EXT) {
+        /* 合法性只剩「head 自洽」：`TotalLen` 一并校验 padding 与 layout。 */
+        if (kvspaceXvalueHeadTotalLen(&sh) != 0) {
             const uint64_t stotal = kvspaceXvalueHeadTotalLen(&sh);
             if (stotal != 0 && stotal <= (uint64_t)source_len)
                 ltl = kvspaceXvalueHeadLangtype(source, &ltd);

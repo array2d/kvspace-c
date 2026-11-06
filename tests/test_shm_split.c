@@ -2,7 +2,7 @@
 
 #define _GNU_SOURCE
 #include "kvspace_shm.h"
-#include "xvalue_head.h"
+#include <kvspace/xvalue_head.h>
 #include "test_util.h"
 #include <fcntl.h>
 #include <stdio.h>
@@ -33,7 +33,7 @@ static int set_int32(kvspace_t *kv, const char *key, int32_t v) {
                     (uint8_t)(v >> 24)};
   uint8_t *xv;
   uint64_t n = 0;
-  if (kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 4, "", &xv, &n) != 0)
+  if (kvspaceXvalueHeadNewScalar(raw, 4, "", &xv, &n) != 0)
     return -1;
   int rc = kvspaceShmSet(kv, key, xv, (int32_t)n);
   free(xv);

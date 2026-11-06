@@ -3,7 +3,7 @@
 
 #define _GNU_SOURCE
 #include "kvspace_shm.h"
-#include "xvalue_head.h"
+#include <kvspace/xvalue_head.h>
 #include "test_util.h"
 #include <fcntl.h>
 #include <stdio.h>

@@ -4,7 +4,7 @@
 
 #define _GNU_SOURCE
 #include "kvspace_shm.h"
-#include "xvalue_head.h"
+#include <kvspace/xvalue_head.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,10 +19,28 @@
         }                                                                      \
     } while (0)
 
+/* 无类型变长值（用于 /a/s 这类普通槽：它不要求文本 langtype）。 */
 static uint8_t *slack(const char *s, uint64_t *n) {
     uint8_t *v = NULL;
     if (kvspaceXvalueHeadNewSlack( (const uint8_t *)s, strlen(s),
                           strlen(s), "", &v, n) != 0)
+        return NULL;
+    return v;
+}
+
+/*
+ * 文本变长值 —— **status 槽必须用这个**。
+ *
+ * 旧代码靠 `storetype == SLACK` 判定「status 槽是变长文本」；新布局没有该字段，
+ * 判据换成 langtype 是字符种类（`char/utf8`）。所以「一个空 langtype 的 SLACK
+ * 值写进 status 槽」在新模型下**不再合法**——那个值没有文本类型的证据。
+ * 这不是放宽也不是收紧，是把旧实现里隐含的信息（storetype 携带的「文本」语义）
+ * 显式写出来。
+ */
+static uint8_t *text_slack(const char *s, uint64_t *n) {
+    uint8_t *v = NULL;
+    if (kvspaceXvalueHeadNewSlack((const uint8_t *)s, strlen(s), strlen(s),
+                                  "char/utf8", &v, n) != 0)
         return NULL;
     return v;
 }
@@ -58,7 +76,7 @@ int main(void) {
 
     /* status：短值 / 16B 合法，17B 与异型硬错。 */
     const char *sk = "/vthread/7/\xE2\x80\xA5status";
-    v = slack("init", &n);
+    v = text_slack("init", &n);
     CHECK(v != NULL);
     CHECK(kvspaceShmSet(kv, sk, v, (int32_t)n) == 0);
     free(v);
@@ -71,7 +89,7 @@ int main(void) {
     CHECK(view.body_cap >= 16);
 
     for (int i = 0; i < 100000; i++) {
-        v = slack("running", &n);
+        v = text_slack("running", &n);
         CHECK(v != NULL);
         CHECK(kvspaceShmSet(kv, sk, v, (int32_t)n) == 0);
         free(v);
@@ -79,37 +97,38 @@ int main(void) {
         CHECK(kvspaceShmXvalueBodyView(kv, &r, sk, &again) == 0);
         CHECK(again.head == head0 && again.body == body0 && again.cap == cap0);
     }
-    v = slack("0123456789abcdef", &n);
+    v = text_slack("0123456789abcdef", &n);
     CHECK(v != NULL);
     CHECK(kvspaceShmSet(kv, sk, v, (int32_t)n) == 0);
     free(v);
-    v = slack("0123456789abcdefg", &n);
+    v = text_slack("0123456789abcdefg", &n);
     CHECK(v != NULL);
     CHECK(kvspaceShmSet(kv, sk, v, (int32_t)n) != 0);
     free(v);
     uint8_t raw[8] = {1};
-    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, "", &v, &n) == 0);
+    CHECK(kvspaceXvalueHeadNewScalar(raw, 8, "", &v, &n) == 0);
     CHECK(kvspaceShmSet(kv, sk, v, (int32_t)n) != 0);
     free(v);
 
-    /* status 槽（固定头 SLACK）：创建即 view 成功（类型在 attr key，不在 head）。 */
+    /* status 槽：创建即 view 成功。**langtype 必须是文本种类**——新布局没有
+     * storetype 位，「这是一个文本槽」只能由 langtype 表达（旧代码靠 storetype）。 */
     const char *lk = "/vthread/8/\xE2\x80\xA5status";
     uint8_t *lbody = NULL;
-    CHECK(kvspaceShmWriteNewPlace(kv, lk, 0, KVSPACE_XVALUE_ST_SLACK, 0, 0, "", &lbody) == 0);
+    CHECK(kvspaceShmWriteNewPlace(kv, lk, 0, 0, 0, "char/utf8", &lbody) == 0);
     kvspaceRef_t lr;
     memset(&lr, 0, sizeof lr);
     CHECK(kvspaceShmResolveRef(kv, lk, &lr) == 0);
     kvspaceXvalueBodyView_t lv;
     CHECK(kvspaceShmXvalueBodyView(kv, &lr, lk, &lv) == 0);
-    v = slack("init", &n);
+    v = text_slack("init", &n);
     CHECK(v != NULL);
     CHECK(kvspaceShmSet(kv, lk, v, (int32_t)n) == 0);
     free(v);
 
-    /* 非 SLACK 形态（SHORT）作 status：view -1、写入硬错。 */
+    /* 非文本形态（int64 标量）作 status：view -1、写入硬错。 */
     const char *wk = "/vthread/9/\xE2\x80\xA5status";
     uint8_t *wbody = NULL;
-    CHECK(kvspaceShmWriteNewPlace(kv, wk, 0, KVSPACE_XVALUE_ST_SHORT, 0, 0, "", &wbody) == 0);
+    CHECK(kvspaceShmWriteNewPlace(kv, wk, 0, 0, 0, "", &wbody) == 0);
     kvspaceRef_t wr;
     memset(&wr, 0, sizeof wr);
     CHECK(kvspaceShmResolveRef(kv, wk, &wr) == 0);

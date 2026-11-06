@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "kvspace_shm.h"
-#include "xvalue_head.h"
+#include <kvspace/xvalue_head.h>
+#include "xvalue_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,7 +10,7 @@
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "failed: %s\n", #x); return 1; } } while (0)
 
-/* 固定 head 16 字节 [bodylen:u64][attrslen:u32][storetype][ptr][pad:2]；
+/* 固定 head 16 字节 [bodylen:u64][attrslen:u32][layout][padding:3]；
    body 偏移恒 16，attr 区紧随 body 且**没有**长度前缀。 */
 
 static int wire_len_of(const uint8_t *stored) {
@@ -28,7 +29,7 @@ int main(void) {
     uint8_t *value = NULL;
     uint64_t n = 0;
     uint8_t raw[8] = {42};
-    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, "",
+    CHECK(kvspaceXvalueHeadNewScalar(raw, 8, "",
                                      &value, &n) == 0);
     CHECK(n == 16 + 8);
     CHECK(kvspaceShmSet(kv, "/x", value, (int32_t)n) == 0);
@@ -46,7 +47,7 @@ int main(void) {
     CHECK(kvspaceXvalueHeadNewNone(&value, &n) == 0);
     CHECK(kvspaceShmSet(kv, "/m", value, (int32_t)n) == 0);
     free(value);
-    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, "",
+    CHECK(kvspaceXvalueHeadNewScalar(raw, 8, "",
                                      &value, &n) == 0);
     CHECK(kvspaceShmSet(kv, "/m·[0]", value, (int32_t)n) == 0);
     free(value);
@@ -92,12 +93,12 @@ int main(void) {
     free(value);
     stored = kvspaceShmGet(kv, "/vthread/1/[1]/[1,-1]", 0, &got);
     CHECK(stored != NULL);
-    kvspaceXvalueHead wh;
-    memcpy(&wh, stored, sizeof wh);
-    CHECK(wh.storetype == KVSPACE_XVALUE_ST_SLACK &&
-          wh.ptr == KVSPACE_XVALUE_PTR_PTR);
+    /* 引用性由 langtype 的 `*` 前缀表达，不在 head——判据直接对**读回来的
+       这条 wire**取，不是对上一条。 */
+    CHECK(kvspace_c_reference_of(stored, (uint64_t)got) ==
+          KVSPACE_XVALUE_REFERENCE_PTR);
 
-    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, "",
+    CHECK(kvspaceXvalueHeadNewScalar(raw, 8, "",
                                      &value, &n) == 0);
     CHECK(kvspaceShmSetValue(kv, "/vthread/1/[1]/[1,-1]", value,
                              (int32_t)n) == 0);
@@ -114,8 +115,7 @@ int main(void) {
     stored = kvspaceShmGet(kv, "/x", 0, &got);
     CHECK(stored && stored[KVSPACE_XVALUE_HEAD_LEN] == 43);
 
-    CHECK(kvspaceShmWriteNewPlace(kv, "/fresh", 0, KVSPACE_XVALUE_ST_SHORT,
-                                  8, 8, "", &body) == 0);
+    CHECK(kvspaceShmWriteNewPlace(kv, "/fresh", 0, 8, 8, "", &body) == 0);
     memcpy(body, raw, 8);
     stored = kvspaceShmGet(kv, "/fresh", 0, &got);
     CHECK(stored && stored[KVSPACE_XVALUE_HEAD_LEN] == 42);
@@ -123,8 +123,7 @@ int main(void) {
     CHECK(kvspaceShmCptree(kv, "/fresh", "/fresh-tree") == 0);
 
     static const uint8_t utf8[] = {0xc3, 0xa9, 'a'};
-    CHECK(kvspaceShmWriteNewPlace(kv, "/text", 0, KVSPACE_XVALUE_ST_SLACK,
-                                  3, 3, "", &body) == 0);
+    CHECK(kvspaceShmWriteNewPlace(kv, "/text", 0, 3, 3, "", &body) == 0);
     memcpy(body, utf8, sizeof utf8);
     stored = kvspaceShmGet(kv, "/text", 0, &got);
     CHECK(stored && wire_len_of(stored) == (int)(KVSPACE_XVALUE_HEAD_LEN + 3) &&
@@ -136,7 +135,7 @@ int main(void) {
     CHECK(kvspaceShmGet(kv, "/text", 1, &got) != NULL);
 
     uint8_t boolean = 1;
-    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, &boolean, 1, "",
+    CHECK(kvspaceXvalueHeadNewScalar(&boolean, 1, "",
                                      &value, &n) == 0);
     CHECK(kvspaceShmSet(kv, "/flag", value, (int32_t)n) == 0);
     free(value);

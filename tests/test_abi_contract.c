@@ -13,7 +13,8 @@
 #define _GNU_SOURCE
 #include <kvspace/kvspace.h>
 #include "test_util.h"
-#include "xvalue_head.h"
+#include <kvspace/xvalue_head.h>
+#include "xvalue_internal.h"
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -49,11 +50,15 @@ static int set_chars(void *h, const char *key, const char *s) {
     return rc;
 }
 
-static uint8_t ptr_byte(void *h, const char *key) {
+/* 引用性判定：新布局没有 ptr 字节，改读 langtype 前缀。
+ * 返回 KVSPACE_XVALUE_REFERENCE_*，读不到 wire 时返回 INVALID。 */
+static int reference_of(void *h, const char *key) {
     uint8_t *out = NULL;
     uint32_t n = 0;
-    kvspaceGet(h, key, 0, &out, &n);
-    return out && n >= KVSPACE_XVALUE_HEAD_LEN ? out[13] : 0xFF;
+
+    if (kvspaceGet(h, key, 0, &out, &n) != 0 || out == NULL)
+        return KVSPACE_XVALUE_REFERENCE_INVALID;
+    return kvspace_c_reference_of(out, (uint64_t)n);
 }
 
 static void test_writenewplace_ref(void) {
@@ -65,8 +70,8 @@ static void test_writenewplace_ref(void) {
                                  2, 2, "int64", &body, NULL, 0) == 0 && body,
             "WriteNewPlace ref=PTR");
     memcpy(body, "/t", 2);
-    CHECK(ptr_byte(h, "/p") == KVSPACE_XVALUE_PTR_PTR, "ref=PTR -> ptr byte %u",
-          ptr_byte(h, "/p"));
+    CHECK(reference_of(h, "/p") == KVSPACE_XVALUE_REFERENCE_PTR,
+          "ref=PTR -> langtype prefixed `*`, got %d", reference_of(h, "/p"));
     /* Link is dereferenced when resolve=1. */
     uint8_t *lnk = NULL, *tgt = NULL;
     uint32_t ln = 0, tn = 0;
@@ -79,14 +84,16 @@ static void test_writenewplace_ref(void) {
                                  5, "", &body, NULL, 0) == 0 && body,
             "WriteNewPlace ref=EXT");
     memcpy(body, "s3://", 5);
-    CHECK(ptr_byte(h, "/e") == KVSPACE_XVALUE_PTR_EXT, "ref=EXT -> ptr byte %u",
-          ptr_byte(h, "/e"));
-    CHECK(ptr_byte(h, "/t") == KVSPACE_XVALUE_PTR_INLINE, "inline stays inline");
-    /* Invalid (ref, storetype) combination is still rejected. */
-    CHECK(kvspaceWriteNewPlace(h, "/bad", KVSPACE_REF_PTR,
-                               KVSPACE_STORETYPE_FIXED_SMALL, 8, 8, "", &body,
-                               NULL, 0) != 0,
-          "ref=PTR + FIXED_SMALL rejected");
+    CHECK(reference_of(h, "/e") == KVSPACE_XVALUE_REFERENCE_EXT,
+          "ref=EXT -> langtype prefixed `@`, got %d", reference_of(h, "/e"));
+    CHECK(reference_of(h, "/t") == KVSPACE_XVALUE_REFERENCE_INLINE,
+          "inline stays inline");
+    /* ref 越界（>2）仍被拒绝。旧版这条写的是「ref=PTR + storetype=FIXED_SMALL」，
+       但 storetype 在新模型里不再携带信息（不分支、不校验），那条组合检查已不存在；
+       ref 本身仍是有效判据。 */
+    CHECK(kvspaceWriteNewPlace(h, "/bad", 9, KVSPACE_STORETYPE_SLACK, 8, 8, "",
+                               &body, NULL, 0) != 0,
+          "ref out of range rejected");
     kvspaceClose(h);
 }
 
@@ -105,13 +112,22 @@ static void test_writenewplace_body_cap(void) {
     REQUIRE(kvspaceXvalueBodyView(h, &ref, "/pc", &v) == 0, "body view");
     CHECK(v.body_cap >= 1024, "view.body_cap=%llu, want >= 1024",
           (unsigned long long)v.body_cap);
-    /* Logical body length remains 10 bytes on readback. */
+    /*
+     * **有效长度 10 记在 attr tag 2，body 区是容量 1024**（CAPACITY 布局）。
+     * 旧断言 `n == HEAD + 10` 是 storetype 4 之前的假设：那时 capacity 不进 body 区。
+     * 现在的判据是「有效长度对、前 10 字节对」，不是「总长等于 16+10」。
+     */
     uint8_t *out = NULL;
     uint32_t n = 0;
     kvspaceGet(h, "/pc", 0, &out, &n);
-    CHECK(out && n == KVSPACE_XVALUE_HEAD_LEN + 10 &&
-              memcmp(out + KVSPACE_XVALUE_HEAD_LEN, "0123456789", 10) == 0,
-          "value reads back (len=%u)", n);
+    {
+        uint64_t effective = 0;
+        CHECK(out && n >= KVSPACE_XVALUE_HEAD_LEN && effective == 0 &&
+                  kvspace_c_effective_len(out, n, &effective) == 0 && effective == 10 &&
+                  memcmp(out + KVSPACE_XVALUE_HEAD_LEN, "0123456789", 10) == 0,
+              "value reads back (wire=%u, effective=%llu)", n,
+              (unsigned long long)effective);
+    }
     /* Rewriting within reserved capacity reuses the existing box in place. */
     uint8_t *body2 = NULL;
     REQUIRE(kvspaceWriteNewPlace(h, "/pc", KVSPACE_REF_INLINE,
@@ -233,6 +249,35 @@ static void test_resolve_prefix(void) {
     kvspaceClose(h);
 }
 
+/*
+ * 值与 langtype 是否都完好：**一次读 wire、两件事一起答**。
+ *
+ * 判据取自公开头 `kvspaceXvalueHead*`（`kvspace` 仓的
+ * `include/kvspace/xvalue_head.h`，本仓 `src/xvalue_head.h` 是它的同步副本）。
+ */
+static int check_value_intact(void *h, const char *key, uint64_t expected_length,
+                              const char *expected_langtype) {
+    uint8_t *wire = NULL;
+    uint32_t wire_len = 0;
+    const kvspaceXvalueHead *head;
+    const uint8_t *langtype = NULL;
+    uint16_t langtype_len;
+
+    if (kvspaceGet(h, key, 0, &wire, &wire_len) != 0 || wire == NULL)
+        return 0;
+    if (wire_len < KVSPACE_XVALUE_HEAD_LEN)
+        return 0;
+    /* 本仓 vendor 的 head 副本没有 EffectiveLen（它属新版），用 head 的
+     * `bodylen` 判长度——本条用例的值是 LAYOUT 语义（无 attr tag 2），两者相等。 */
+    head = (const kvspaceXvalueHead *)(const void *)wire;
+    if (kvspaceXvalueHeadLen(head) != expected_length)
+        return 0;
+    langtype_len = kvspaceXvalueHeadLangtypeBounded(wire, wire_len, &langtype);
+    if (langtype == NULL || langtype_len != (uint16_t)strlen(expected_langtype))
+        return 0;
+    return memcmp(langtype, expected_langtype, langtype_len) == 0;
+}
+
 static void test_viewwrite_len(void) {
     void *h = open_db("view");
     REQUIRE(h, "connect");
@@ -242,9 +287,12 @@ static void test_viewwrite_len(void) {
     REQUIRE(kvspaceViewResolve(h, "/s", &tok) == 0, "view resolve");
     CHECK(kvspaceViewWrite(h, &tok, (const uint8_t *)"abcdefgh", 8) == 1,
           "longer ViewWrite falls back");
-    kvspaceHead_t hd;
-    CHECK(kvspaceGetHead(h, "/s", &hd) == 0 && hd.body_len == 2 &&
-              strcmp(hd.langtype, "char/utf8") == 0,
+    /*
+     * 判据不变（**写后值与 langtype 仍完好**），取数换成本地 ABI 的等价入口：
+     * `kvspaceGet` 拿整条 wire → `EffectiveLen` 取有效长度、`LangtypeBounded`
+     * 取类型——与公开头同一套入口，不再有第二份 head 读取实现。
+     */
+    CHECK(check_value_intact(h, "/s", 2, "char/utf8"),
           "value and langtype intact after rejected ViewWrite");
     CHECK(kvspaceViewWrite(h, &tok, (const uint8_t *)"xy", 2) == 0,
           "same-length ViewWrite");
@@ -253,7 +301,7 @@ static void test_viewwrite_len(void) {
     kvspaceGet(h, "/s", 0, &out, &n);
     CHECK(out && memcmp(out + KVSPACE_XVALUE_HEAD_LEN, "xy", 2) == 0,
           "same-length ViewWrite landed");
-    CHECK(kvspaceGetHead(h, "/s", &hd) == 0 && strcmp(hd.langtype, "char/utf8") == 0,
+    CHECK(check_value_intact(h, "/s", 2, "char/utf8"),
           "langtype intact after same-length ViewWrite");
     kvspaceClose(h);
 }

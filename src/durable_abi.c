@@ -9,7 +9,7 @@
 #define _DEFAULT_SOURCE
 
 #include "kvspace_shm.h"
-#include "xvalue_head.h"
+#include <kvspace/xvalue_head.h>
 #include "xvalue_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,53 +20,6 @@
 #include <limits.h>
 
 #define SHM_DEFAULT_SIZE (8ULL * 64 * 64 * 64 * 64)
-
-/* Mirrors the public ABI. */
-typedef struct {
-    uint16_t headlen;
-    uint8_t ref;
-    uint8_t storetype;
-    int32_t body_len;
-    int32_t ndim;
-    int32_t dims[8];
-    char langtype[256];
-    int32_t langtype_len;
-    int32_t body_offset;
-    uint64_t body_cap;
-} kvspaceHead_t;
-
-/* Decode fixed 8-byte header into metadata (langtype is in attr at 8+len; see kvspaceGetHead). */
-static int from_wire_head(const uint8_t *d, uint32_t total, kvspaceHead_t *out) {
-    if (!out || !d || total < KVSPACE_XVALUE_HEAD_LEN)
-        return 1;
-    memset(out, 0, sizeof *out);
-    kvspaceXvalueHead h;
-    memcpy(&h, d, sizeof h);
-    uint64_t l = kvspaceXvalueHeadLen(&h);
-    if (h.storetype > KVSPACE_XVALUE_ST_VARLEN || h.ptr > KVSPACE_XVALUE_PTR_EXT ||
-        (uint64_t)KVSPACE_XVALUE_HEAD_LEN + l > total)
-        return 1;
-    /* storetype 4 的有效长度由 attr tag 2 给出；其余形态它不存在。
-       这里顺带用 EffectiveLen 把 tag 2 的归属校验做掉（与 Rust 侧同规）。 */
-    uint64_t effective = 0;
-    {
-        const uint64_t whole = total;
-        const uint64_t attrs = kvspaceXvalueHeadAttrsLen(&h);
-        if ((uint64_t)KVSPACE_XVALUE_HEAD_LEN + l + attrs > whole)
-            return 1;
-        if (kvspace_c_effective_len(d, whole, &effective) != 0)
-            return 1;
-    }
-    (void)effective;
-    out->headlen = KVSPACE_XVALUE_HEAD_LEN;
-    out->ref = h.ptr == KVSPACE_XVALUE_PTR_PTR ? 1 :
-               h.ptr == KVSPACE_XVALUE_PTR_EXT ? 2 : 0;
-    out->storetype = h.storetype;
-    out->body_len = l > INT32_MAX ? INT32_MAX : (int32_t)l;
-    out->body_offset = KVSPACE_XVALUE_HEAD_LEN;
-    out->body_cap = l;
-    return 0;
-}
 
 static int parse_shm_path(const char *dsn, char *out, size_t osz) {
     if (!dsn)
@@ -210,29 +163,6 @@ int kvspaceSetPart(void *h, const char *key, uint32_t offset,
     return 0;
 }
 
-/* 读 head：取值前缀的三正交轴 head（不取 body）。空/不存在 → 返回 1。 */
-int kvspaceGetHead(void *h, const char *key, kvspaceHead_t *out) {
-    int32_t total = 0;
-    uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 1, &total);
-    if (!d || total <= 0)
-        return 1;
-    if (from_wire_head(d, (uint32_t)total, out) != 0)
-        return 1;
-    /* langtype 在 attr 区 tag=1 记录；attr 区长度由 head 给出，没有前缀。 */
-    const uint8_t *lt = NULL;
-    uint16_t ltl = kvspaceXvalueHeadLangtype(d, &lt);
-    if (lt && ltl > 0) {
-        size_t take = (size_t)ltl < (uint64_t)sizeof out->langtype - 1
-                          ? (size_t)ltl
-                          : (size_t)sizeof out->langtype - 1;
-        memcpy(out->langtype, lt, take);
-        out->langtype[take] = 0;
-        out->langtype_len = (int32_t)take;
-    } else {
-        out->langtype_len = 0;
-    }
-    return 0;
-}
 
 /* 就地写：返回原 box body 偏移指针；前置条件不满足 → 非 0 + err。 */
 int kvspaceWriteInPlace(void *h, const char *key, int resolve,
@@ -247,13 +177,27 @@ int kvspaceWriteInPlace(void *h, const char *key, int resolve,
     return 0;
 }
 
-/* 新位置写：按 (ref, storetype, body_len, body_cap, langtype) 分配 box、写固定头 +
- * langtype 尾部（整体单写），返回 body 偏移指针。 */
+/* 新位置写：按 (ref, body_len, body_cap, langtype) 分配 box、写固定头 +
+ * langtype 尾部（整体单写），返回 body 偏移指针。
+ *
+ * ── `storetype` 参数还在，但**本期不携带信息** ──────────────────────
+ *
+ * 签名必须与公开头逐参数对齐：前端 `frontend.c` 用 `dlsym` 按名字加载这个函数，
+ * 少一个参数就是调用约定错位（未定义行为，编译不报）。
+ *
+ * 新布局没有 storetype 位：`layout` 由 `body_cap != body_len` 推出，引用性由
+ * `ref` 决定（构造器给 langtype 加 `*`/`@` 前缀）。所以本函数**不读**该参数、
+ * 不校验它的取值、也不往下传——**它就是一个本期不再携带信息的参数**。
+ * 加一条 `storetype <= …` 的检查只会让它看起来还有语义，并把「传了奇怪值」
+ * 变成一条新的失败路径。
+ *
+ * `KVSPACE_STORETYPE_*` 常量的处置与签名删减是同一笔欠账，本期不动。 */
 int kvspaceWriteNewPlace(void *h, const char *key, uint8_t ref,
                          uint8_t storetype, uint32_t body_len, uint64_t body_cap,
                          const char *langtype,
                          uint8_t **body, char *err, uint32_t err_cap) {
-    if (kvspaceShmWriteNewPlace((kvspace_t *)h, key, ref, storetype,
+    (void)storetype; /* 见上：本期不携带信息，不分支、不校验、不传。 */
+    if (kvspaceShmWriteNewPlace((kvspace_t *)h, key, ref,
                                 (int32_t)body_len, body_cap, langtype,
                                 body) != 0) {
         if (err && err_cap)
@@ -408,7 +352,7 @@ int kvspaceNewBool(uint8_t v, const char *langtype,
     uint8_t b = v ? 1 : 0;
     uint8_t *value = NULL;
     uint64_t total = 0;
-    int rc = kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, &b, 1, langtype,
+    int rc = kvspaceXvalueHeadNewScalar(&b, 1, langtype,
                                         &value, &total);
     return rc == 0 ? finish(value, total, out, out_len) : 1;
 }
@@ -420,7 +364,7 @@ int kvspaceNewInt64(int64_t v, const char *langtype,
         raw[i] = (uint8_t)((uint64_t)v >> (8 * i));
     uint8_t *value = NULL;
     uint64_t total = 0;
-    int rc = kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, langtype,
+    int rc = kvspaceXvalueHeadNewScalar(raw, 8, langtype,
                                         &value, &total);
     return rc == 0 ? finish(value, total, out, out_len) : 1;
 }
@@ -434,7 +378,7 @@ int kvspaceNewFloat64(double v, const char *langtype,
         raw[i] = (uint8_t)(bits >> (8 * i));
     uint8_t *value = NULL;
     uint64_t total = 0;
-    int rc = kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, langtype,
+    int rc = kvspaceXvalueHeadNewScalar(raw, 8, langtype,
                                         &value, &total);
     return rc == 0 ? finish(value, total, out, out_len) : 1;
 }
@@ -445,8 +389,11 @@ static int wire_is_none(const uint8_t *d, uint32_t len) {
     if (len < KVSPACE_XVALUE_HEAD_LEN)
         return 0;
     const kvspaceXvalueHead *xh = (const kvspaceXvalueHead *)d;
-    if (xh->storetype != KVSPACE_XVALUE_ST_SHORT ||
-        xh->ptr != KVSPACE_XVALUE_PTR_INLINE ||
+    /* None 的判据：**空 body + 无 langtype 记录（或 langtype 恰是 "None"）**。
+       旧模型用 `storetype == ST_SHORT && ptr == INLINE` 表达「非引用且在 place」，
+       新模型里「是不是引用」看 langtype 前缀——空 langtype 即非引用，所以
+       长度 0 加下面的 langtype 检查已经足够，无需 storetype。 */
+    if (kvspace_c_reference_of(d, len) != KVSPACE_XVALUE_REFERENCE_INLINE ||
         kvspaceXvalueHeadLen(xh) != 0)
         return 0;
     const uint8_t *lt = NULL;

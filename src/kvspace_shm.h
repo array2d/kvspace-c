@@ -85,11 +85,12 @@ int kvspaceShmSetValueByRef(kvspace_t *kv, kvspaceRef_t *ref,
 // 覆写）；否则返回非 0。
 int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
                            int32_t body_len, uint8_t **body);
-// WriteNewPlace: allocate a box for (ref, storetype, body_len, body_cap, langtype)
+// WriteNewPlace: allocate a box for (ref, body_len, body_cap, langtype).
+// 无 storetype 参数：layout 由 body_cap > body_len 推出，引用性由构造器补 langtype 前缀。
 // with physical capacity >= 8 + body_cap + attr, write fixed header (ptr from ref)
 // and attr region in one atomic store, update parent index, and return body pointer.
 int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
-                            uint8_t storetype, int32_t body_len,
+                            int32_t body_len,
                             uint64_t body_cap, const char *langtype,
                             uint8_t **body);
 // ListLen: direct child count under prefix. ListAt: copy idx-th child name into buf.

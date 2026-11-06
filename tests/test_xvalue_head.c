@@ -1,11 +1,11 @@
-#include "xvalue_head.h"
+#include <kvspace/xvalue_head.h>
 #include "xvalue_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* 固定 head 16 字节 [bodylen:u64][attrslen:u32@8][storetype@12][ptr@13][pad@14,16)，
+/* 固定 head 16 字节 [bodylen:u64][attrslen:u32@8][layout@12][padding@13,16)，
    body 偏移恒 16，attr 区紧随 body 且**没有**长度前缀（attrslen 在 head 里）。
    单 key 整体——无 attr key。 */
 
@@ -31,21 +31,23 @@ static int attr_ok(const uint8_t *v, uint64_t total, uint64_t body_len,
     const uint64_t alen = (uint64_t)h.attrslen;
     if (total != kvspaceXvalueHeadTotalLen(&h))
         return 0;
+    /* CAPACITY 布局在 langtype 记录之后**多一条 reallen 记录**（11 字节）。 */
+    const uint64_t extra = h.layout == KVSPACE_XVALUE_LAYOUT_CAPACITY ? 11U : 0U;
     if (l == 0)
-        return alen == 0;
-    if (alen != 3 + l)
+        return alen == extra;
+    if (alen != 3 + l + extra)
         return 0;
     return a[0] == KVSPACE_XVALUE_ATTR_TAG_LANGTYPE && a[1] == l && a[2] == 0 &&
            memcmp(a + 3, lt, l) == 0;
 }
 
-/* padding 必须为零，storetype/ptr 必须落在 wire 的固定偏移上。 */
-static int head_ok(const uint8_t *v, uint8_t storetype, uint8_t ptr) {
+/* layout 落在 @12、padding 在 @13-15 且必须为零。 */
+static int head_ok(const uint8_t *v, uint8_t layout) {
     kvspaceXvalueHead h;
     memcpy(&h, v, sizeof h);
-    return kvspaceXvalueHeadPaddingIsZero(&h) && h.storetype == storetype &&
-           h.ptr == ptr && v[12] == storetype && v[13] == ptr && v[14] == 0 &&
-           v[15] == 0;
+    return kvspaceXvalueHeadPaddingIsZero(&h) && h.layout == layout &&
+           kvspaceXvalueHeadLayoutIsValid(&h) && v[12] == layout && v[13] == 0 &&
+           v[14] == 0 && v[15] == 0;
 }
 
 static void test_none(void) {
@@ -55,9 +57,9 @@ static void test_none(void) {
     CHECK(n == 16, "none len %llu", (unsigned long long)n);
     kvspaceXvalueHead h;
     memcpy(&h, buf, sizeof h);
-    CHECK(h.storetype == KVSPACE_XVALUE_ST_SHORT &&
-          h.ptr == KVSPACE_XVALUE_PTR_INLINE && kvspaceXvalueHeadLen(&h) == 0, "none head");
-    /* wire 布局：bodylen@0-7、attrslen@8-11、storetype@12、ptr@13、pad@14-15 */
+    CHECK(h.layout == KVSPACE_XVALUE_LAYOUT_LENGTH &&
+          kvspaceXvalueHeadLen(&h) == 0, "none head");
+    /* wire 布局：bodylen@0-7、attrslen@8-11、layout@12、padding@13-15 */
     CHECK(buf[0] == 0 && buf[7] == 0 && buf[8] == 0 && buf[11] == 0,
           "none wire layout");
     CHECK(attr_ok(buf, n, 0, ""), "none empty attr");
@@ -68,17 +70,18 @@ static void test_scalar(void) {
     uint8_t raw[8] = {0x0a, 0, 0, 0, 0, 0, 0, 0};
     uint8_t *buf = NULL;
     uint64_t n = 0;
-    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, "int64",
+    CHECK(kvspaceXvalueHeadNewScalar(raw, 8, "int64",
                                      &buf, &n) == 0, "i64 new");
     CHECK(n == 16 + 8 + 8, "i64 len %llu", (unsigned long long)n);
     kvspaceXvalueHead h;
     memcpy(&h, buf, sizeof h);
-    CHECK(kvspaceXvalueHeadLen(&h) == 8 && h.storetype == KVSPACE_XVALUE_ST_SHORT, "i64 head");
+    CHECK(kvspaceXvalueHeadLen(&h) == 8 &&
+          h.layout == KVSPACE_XVALUE_LAYOUT_LENGTH, "i64 head");
     CHECK(memcmp(buf + KVSPACE_XVALUE_HEAD_LEN, raw, 8) == 0, "i64 body@8");
     CHECK(attr_ok(buf, n, 8, "int64"), "i64 langtype attr");
     free(buf);
     /* 无类型（空 langtype）：空 attr [attr_len:2]。 */
-    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, "",
+    CHECK(kvspaceXvalueHeadNewScalar(raw, 8, "",
                                      &buf, &n) == 0, "scalar no-langtype");
     CHECK(n == 16 + 8, "no-langtype len %llu", (unsigned long long)n);
     CHECK(attr_ok(buf, n, 8, ""), "no-langtype empty attr");
@@ -93,11 +96,11 @@ static void test_slack(void) {
     CHECK(n == 16 + 8 + 8, "slack len %llu", (unsigned long long)n);
     kvspaceXvalueHead h;
     memcpy(&h, buf, sizeof h);
-    CHECK(h.storetype == KVSPACE_XVALUE_ST_SLACK &&
-          kvspaceXvalueHeadLen(&h) == 2, "slack head");
-    /* wire：bodylen@0=2、attrslen@8=3+10、storetype@12、ptr@13、pad@14-15 */
+    CHECK(kvspaceXvalueHeadLen(&h) == 2 &&
+          h.layout == KVSPACE_XVALUE_LAYOUT_LENGTH, "slack head");
+    /* wire：bodylen@0=2、attrslen@8=3+10、layout@12、padding@13-15 */
     CHECK(buf[0] == 2 && buf[1] == 0 && buf[7] == 0 &&
-          head_ok(buf, KVSPACE_XVALUE_ST_SLACK, KVSPACE_XVALUE_PTR_INLINE),
+          head_ok(buf, KVSPACE_XVALUE_LAYOUT_LENGTH),
           "slack wire layout");
     CHECK(memcmp(buf + KVSPACE_XVALUE_HEAD_LEN, hi, 2) == 0, "slack body");
     CHECK(attr_ok(buf, n, 2, "[]char/utf8"), "slack langtype attr");
@@ -116,7 +119,7 @@ static void test_tensor(void) {
     CHECK(n == 16 + 24 + (3 + 10), "tensor len %llu", (unsigned long long)n);
     kvspaceXvalueHead h;
     memcpy(&h, buf, sizeof h);
-    CHECK(h.storetype == KVSPACE_XVALUE_ST_LARGE &&
+    CHECK(h.layout == KVSPACE_XVALUE_LAYOUT_LENGTH &&
           kvspaceXvalueHeadLen(&h) == 24, "tensor head");
     CHECK(memcmp(buf + KVSPACE_XVALUE_HEAD_LEN, raw, 24) == 0, "tensor body@16");
     CHECK(attr_ok(buf, n, 24, "[2,3]int64"), "tensor langtype attr");
@@ -130,49 +133,62 @@ static void test_ptr_ext(void) {
     uint64_t n = 0;
     CHECK(kvspaceXvalueHeadNewPtr((const uint8_t *)"/varx", 5, "int64",
                                   &buf, &n) == 0, "ptr new");
-    CHECK(n == 16 + 5 + (3 + 5), "ptr len %llu", (unsigned long long)n);
+    /* NewPtr 给 langtype 补 `*`：记录长度是 3 + 6（"*int64"）。 */
+    CHECK(n == 16 + 5 + (3 + 6), "ptr len %llu", (unsigned long long)n);
     kvspaceXvalueHead h;
     memcpy(&h, buf, sizeof h);
-    CHECK(h.storetype == KVSPACE_XVALUE_ST_SLACK &&
-          h.ptr == KVSPACE_XVALUE_PTR_PTR &&
-          kvspaceXvalueHeadLen(&h) == 5, "ptr head");
+    CHECK(kvspaceXvalueHeadLen(&h) == 5, "ptr head");
+    /* 引用性在 langtype 前缀，不在 head：NewPtr 给 langtype 补 `*`。 */
+    CHECK(kvspace_c_reference_of(buf, n) == KVSPACE_XVALUE_REFERENCE_PTR,
+          "ptr reference");
     CHECK(memcmp(buf + KVSPACE_XVALUE_HEAD_LEN, "/varx", 5) == 0, "ptr body");
-    CHECK(attr_ok(buf, n, 5, "int64"), "ptr langtype attr");
+    CHECK(attr_ok(buf, n, 5, "*int64"), "ptr langtype attr (prefixed)");
     free(buf);
 
     CHECK(kvspaceXvalueHeadNewExt((const uint8_t *)"s3://", 5, "",
                                   &buf, &n) == 0, "ext new");
-    memcpy(&h, buf, sizeof h);
-    CHECK(h.storetype == KVSPACE_XVALUE_ST_EXT &&
-          h.ptr == KVSPACE_XVALUE_PTR_EXT, "ext head");
-    CHECK(attr_ok(buf, n, 5, ""), "ext empty attr");
+    CHECK(kvspace_c_reference_of(buf, n) == KVSPACE_XVALUE_REFERENCE_EXT,
+          "ext reference");
+    /* 空 langtype + NewExt ⇒ 裸 "@"（构造器补前缀）。 */
+    CHECK(attr_ok(buf, n, 5, "@"), "ext langtype is bare @");
     free(buf);
-    CHECK(kvspaceXvalueHeadNewPtr(NULL, 0, "", &buf, &n) != 0, "empty ptr");
+    /* `path_len == 0` 是**合法**的（新实现只在 `path_len && !path` 时拒）——
+     * 旧用例断言「empty ptr 失败」，那是旧实现的接口约定，不是格式的必然。 */
+    CHECK(kvspaceXvalueHeadNewPtr(NULL, 0, "", &buf, &n) == 0, "empty ptr is legal");
+    free(buf);
+    /* 已带前缀的 langtype 被拒绝（双重前缀说明两处对格式理解不一致）。 */
+    CHECK(kvspaceXvalueHeadNewPtr((const uint8_t *)"/varx", 5, "*int64", &buf, &n) != 0,
+          "pre-prefixed langtype rejected");
 }
 
 static void test_reserve_code(void) {
     uint8_t *value = NULL;
     uint64_t len = 0;
-    CHECK(kvspaceXvalueHeadReserve(KVSPACE_XVALUE_ST_SLACK, 7, 10, "[]u8",
+    CHECK(kvspaceXvalueHeadReserve(7, 10, "[]u8",
                                    &value, &len) == 0, "reserve slack");
-    CHECK(len == 16 + 7 + (3 + 4), "reserve len");
+    /* cap > len ⇒ LAYOUT_CAPACITY：**body 区是 cap=10**，有效长度 7 记在 attr tag 2。 */
+    CHECK(len == 16 + 10 + (3 + 4) + 11, "reserve len");
     kvspaceXvalueHead h;
     memcpy(&h, value, sizeof h);
-    CHECK(kvspaceXvalueHeadLen(&h) == 7, "reserve head len");
-    CHECK(attr_ok(value, len, 7, "[]u8"), "reserve langtype attr");
+    CHECK(kvspaceXvalueHeadLen(&h) == 10, "reserve head len is capacity");
+    CHECK(h.layout == KVSPACE_XVALUE_LAYOUT_CAPACITY, "reserve layout capacity");
+    {
+        uint64_t effective = 0;
+        CHECK(kvspace_c_effective_len(value, len, &effective) == 0 && effective == 7,
+              "reserve effective len is the requested body length");
+    }
+    CHECK(attr_ok(value, len, 10, "[]u8"), "reserve langtype attr");
     const uint8_t utf8[] = {0xe4, 0xbd, 0xa0, 0xf0, 0x9f, 0x98, 0x80};
     memcpy(value + KVSPACE_XVALUE_HEAD_LEN, utf8, sizeof utf8);
     free(value);
-    CHECK(kvspaceXvalueHeadReserve(KVSPACE_XVALUE_ST_LARGE, 10, 5, "",
+    CHECK(kvspaceXvalueHeadReserve(10, 5, "",
                                    &value, &len) != 0, "reserve body>cap");
 
     const uint8_t call_body[] = {0, 0, 0, 0, 0, 'f'};
     CHECK(kvspaceXvalueHeadNewCode(call_body, sizeof call_body, sizeof call_body,
                                    "rwir", &value, &len) == 0, "code new");
     memcpy(&h, value, sizeof h);
-    CHECK(h.storetype == KVSPACE_XVALUE_ST_SLACK &&
-          kvspaceXvalueHeadLen(&h) == sizeof call_body,
-          "code head");
+    CHECK(kvspaceXvalueHeadLen(&h) == sizeof call_body, "code head");
     CHECK(memcmp(value + KVSPACE_XVALUE_HEAD_LEN, call_body,
                  sizeof call_body) == 0, "code body");
     CHECK(attr_ok(value, len, sizeof call_body, "rwir"), "code langtype attr");
@@ -182,13 +198,13 @@ static void test_reserve_code(void) {
 }
 
 /* Failure contract (kvspace fix/review-v0.3.23): return -1 and clear *out on
-   failure; Reserve validates storetype via build; bounded langtype reader never
+   failure; Reserve validates content; bounded langtype reader never
    reads past wire_len. */
 static void test_fail_contract(void) {
     uint8_t sentinel = 0;
     uint8_t *buf = &sentinel;
     uint64_t n = 0;
-    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, NULL, 3, "", &buf,
+    CHECK(kvspaceXvalueHeadNewScalar(NULL, 3, "", &buf,
                                      &n) != 0,
           "NewScalar(NULL, 3) rejected");
     CHECK(buf == NULL, "NewScalar(NULL, 3) clears *out");
@@ -196,17 +212,11 @@ static void test_fail_contract(void) {
     CHECK(kvspaceXvalueHeadNewSlack(NULL, 4, 4, "", &buf, &n) != 0 && buf == NULL,
           "NewSlack(NULL, 4) rejected, *out cleared");
     buf = &sentinel;
-    CHECK(kvspaceXvalueHeadReserve(9, 4, 4, "", &buf, &n) != 0,
-          "Reserve(storetype=9) rejected");
-    CHECK(buf == NULL, "Reserve(storetype=9) clears *out");
-    buf = &sentinel;
-    CHECK(kvspaceXvalueHeadReserve(KVSPACE_XVALUE_ST_SLACK, 8, 4, "", &buf, &n) != 0 &&
-              buf == NULL,
+    CHECK(kvspaceXvalueHeadReserve(8, 4, "", &buf, &n) != 0 && buf == NULL,
           "Reserve(cap < len) rejected, *out cleared");
     buf = NULL;
-    CHECK(kvspaceXvalueHeadReserve(KVSPACE_XVALUE_ST_SLACK, 4, 4, "int32", &buf, &n) ==
-                  0 && buf,
-          "Reserve(SLACK) ok");
+    CHECK(kvspaceXvalueHeadReserve(4, 4, "int32", &buf, &n) == 0 && buf,
+          "Reserve ok");
     if (buf) {
         const uint8_t *lt = NULL;
         CHECK(kvspaceXvalueHeadLangtypeBounded(buf, n, &lt) == 5 && lt &&
@@ -219,18 +229,18 @@ static void test_fail_contract(void) {
         free(buf);
     }
 }
-/* 造一条 storetype 4 的 wire（容量 cap、有效 reallen，带 langtype 记录）。
-   构造器 `kvspaceXvalueHeadNew*` 不接受 4（它需要同时给容量与 reallen），
-   这里按格式手工拼，正好也验证读侧能独立解析。 */
+/* 造一条 `layout == CAPACITY` 的 wire（body 区 cap 字节、有效 reallen，
+   带 langtype 记录）。构造函数收 (body_len, cap)，这里要「容量已分配、有效长度
+   更小」，`Reserve(cap, cap, …)` 出来的是 cap==len 的 LENGTH 布局，所以按格式
+   手工拼，正好也验证读侧能独立解析。 */
 static uint8_t *make_varlen(uint64_t cap, uint64_t reallen, const char *lt,
                             uint64_t *out_total) {
     size_t l = lt ? strlen(lt) : 0;
     uint64_t alen = (l ? 3 + l : 0) + 11; /* langtype 记录 + tag2 记录 */
     uint64_t total = KVSPACE_XVALUE_HEAD_LEN + cap + alen;
     uint8_t *v = (uint8_t *)calloc(1, total);
-    kvspaceXvalueHead h = {.storetype = KVSPACE_XVALUE_ST_VARLEN,
-                           .ptr = KVSPACE_XVALUE_PTR_INLINE,
-                           .padding = {0u, 0u}};
+    kvspaceXvalueHead h = {.layout = KVSPACE_XVALUE_LAYOUT_CAPACITY,
+                           .padding = {0u, 0u, 0u}};
     kvspaceXvalueHeadSetLen(&h, cap);
     kvspaceXvalueHeadSetAttrsLen(&h, (uint32_t)alen);
     memcpy(v, &h, sizeof h);
@@ -269,10 +279,9 @@ static void test_varlen(void) {
     CHECK(kvspace_c_effective_len(v, total, &eff) == 0 && eff == 0, "reallen=0 legal");
     free(v);
 
-    /* 拒绝①：storetype 4 缺 tag 2（把 attrslen 改成 0，等于没有 tag 2）。 */
+    /* 拒绝①：CAPACITY 布局缺 tag 2（把 attrslen 改成 0，等于没有 tag 2）。 */
     v = make_varlen(8, 3, NULL, &total);
-    h.storetype = KVSPACE_XVALUE_ST_VARLEN;
-    memcpy(v, &h, sizeof h);
+    memcpy(&h, v, sizeof h);
     kvspaceXvalueHeadSetAttrsLen(&h, 0);
     memcpy(v, &h, sizeof h);
     CHECK(kvspace_c_effective_len(v, total, &eff) != 0, "missing tag2 rejected");
@@ -283,12 +292,12 @@ static void test_varlen(void) {
     CHECK(kvspace_c_effective_len(v, total, &eff) != 0, "reallen>cap rejected");
     free(v);
 
-    /* 拒绝③：非 storetype 4 带 tag 2。 */
+    /* 拒绝③：非 CAPACITY 布局带 tag 2。 */
     {
         uint8_t *w = make_varlen(8, 3, NULL, &total);
         kvspaceXvalueHead h2;
         memcpy(&h2, w, sizeof h2);
-        h2.storetype = KVSPACE_XVALUE_ST_SLACK;
+        h2.layout = KVSPACE_XVALUE_LAYOUT_LENGTH;
         memcpy(w, &h2, sizeof h2);
         CHECK(kvspace_c_effective_len(w, total, &eff) != 0,
               "tag2 under non-varlen rejected");
