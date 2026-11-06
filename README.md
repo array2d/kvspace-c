@@ -36,17 +36,24 @@ Two surfaces:
 
 ## XValue
 
-Fixed 8-byte head (`#566`) followed by the body and an attr region (`#571`), stored as one value under one key:
+Fixed **16-byte** head followed by the body and an attr region, stored as one value under one key.
+This section mirrors `kvspace/include/kvspace/xvalue_head.h` verbatim — that header is the
+single source of truth for the wire layout.
 
 ```
-[len:u48 le @0-5][storetype:u8 @6][ptr:u8 @7][body @8][attr @8+len]
-attr = [attr_len:u16 le][records]      attr_len includes itself; empty attr = 2
-record = [tag:u8][len:u16 le][data]    tag 1 = langtype (kindexpr); 2+ reserved
-total = 8 + len + attr_len
+[bodylen:u64 le @0-7][attrslen:u32 le @8-11][layout:u8 @12][padding:3 @13-15][body @16][attr @16+bodylen]
+attr  = records, no length prefix      (attrslen is in the head — a second prefix would be a second truth)
+record = [tag:u8][len:u16 le][data]    tag 1 = langtype (kindexpr); tag 2 = reallen; 3+ reserved
+total = 16 + bodylen + attrslen
 ```
 
-- storetype selects short, slack, large, or extension storage; ptr marks pointer/ext.
+- **`bodylen` 的语义由 `layout` 决定**：`layout = 0`（LENGTH）时它就是有效长度；
+  `layout = 1`（CAPACITY）时它是**容量**，有效长度在 attr tag 2（`reallen`）。
+  `padding` 必须为零，非零即非法。
+- **没有 storetype / ptr 字段**：存储形态与「是不是引用」都从 langtype 推出——
+  langtype 首字节 `*` 是 Ptr、`@` 是 Ext，其余是普通值。
 - langtype (kindexpr) is the tag-1 record of the attr region; no record = untyped.
+- tag 2 的归属是**排他**的：`layout = CAPACITY` 必须恰有一条，其它 layout 必须不带。
 - Values are built with the `kvspaceXvalueHeadNew*` constructors. `kvspaceSetValue`
   rejects values whose attr region is missing or runs past the value.
 - Store format version 6 (this wire). Stores written by older versions are refused at open; rebuild them.

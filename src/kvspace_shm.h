@@ -22,8 +22,10 @@ typedef struct kvspace kvspace_t;
  *   5 = ART 112-byte block;
  *   6 = XValue fixed 8-byte header + inline attr region (#566/#571, incompatible
  *       with format 5) plus header list_gen for cross-process List cache invalidation.
+ *   7 = **16 字节 head**（`[bodylen:u64][attrslen:u32][layout:u8][padding:3]`，
+ *       与 `kvspace/include/kvspace/xvalue_head.h` 一致）。6 的 8 字节 head 不再兼容。
  * Incompatible older versions fail hard on open with a rebuild hint (no migration). */
-#define KVSPACE_FORMAT_VERSION 6
+#define KVSPACE_FORMAT_VERSION 7
 
 /* 对齐 kvspace/include/kvspace/kvspace.h：叶子 + 目录祖先。 */
 typedef struct {

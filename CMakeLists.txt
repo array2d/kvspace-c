@@ -34,6 +34,20 @@ file(READ "${KVSPACE_UPSTREAM_INCLUDE_DIRECTORY}/kvspace/xvalue_head.h"
      KVSPACE_UPSTREAM_HEADER_TEXT)
 # 判据取一个**只在新布局存在**的常量：旧的 storetype 布局里没有它，所以命中
 # 就等于「这份头是新的」。不取 `KVSPACE_XVALUE_HEAD_LEN`（两代都有，区分不了）。
+# 上游 xvalue_head 的**实现**同样直接编译，不留副本。
+#
+# 为什么这条要单独断言：头缺失会在编译期炸得很明显，而 `.c` 缺失会变成
+# 「链接期找不到 kvspaceXvalueHeadNew*」——错误信息指向调用方，不指向路径。
+set(KVSPACE_UPSTREAM_IMPLEMENTATION
+    "${KVSPACE_UPSTREAM_INCLUDE_DIRECTORY}/../src/xvalue_head.c")
+if(NOT EXISTS "${KVSPACE_UPSTREAM_IMPLEMENTATION}")
+    message(FATAL_ERROR
+        "kvspace-c compiles the upstream xvalue_head implementation directly "
+        "(no vendored copy). Expected it at ${KVSPACE_UPSTREAM_IMPLEMENTATION}. "
+        "Clone array2d/kvspace as a sibling of kvspace-c, or set "
+        "KVSPACE_UPSTREAM_INCLUDE_DIRECTORY to its include/ directory.")
+endif()
+
 if(NOT KVSPACE_UPSTREAM_HEADER_TEXT MATCHES "KVSPACE_XVALUE_LAYOUT_LENGTH")
     message(FATAL_ERROR
         "kvspace-c requires the NEW xvalue_head layout (16-byte head with "
@@ -45,7 +59,7 @@ endif()
 
 add_library(kvspace-c SHARED
     src/coord.c
-    src/xvalue_head.c
+    "${KVSPACE_UPSTREAM_IMPLEMENTATION}"
     src/kvspace.c
     src/durable_abi.c
 )
@@ -97,13 +111,15 @@ if(KVSPACE_BUILD_TESTS)
     target_link_libraries(test_handle_cache PRIVATE kvspace-c)
     add_test(NAME handle_cache COMMAND test_handle_cache)
 
-    add_executable(test_xvalue_head tests/test_xvalue_head.c src/xvalue_head.c)
+    add_executable(test_xvalue_head tests/test_xvalue_head.c
+    "${KVSPACE_UPSTREAM_IMPLEMENTATION}")
     target_include_directories(test_xvalue_head PRIVATE src "${KVSPACE_UPSTREAM_INCLUDE_DIRECTORY}")
     add_test(NAME xvalue_head COMMAND test_xvalue_head)
 
     # wire 金标准：把同一批操作的字节打印出来，供三路（前端 / C 后端 / durable）
     # 逐字节对拍。用例集合与输出格式以 kvspace/tests/xvalue_wire_golden.c 为准。
-    add_executable(xvalue_wire_golden tests/xvalue_wire_golden.c src/xvalue_head.c)
+    add_executable(xvalue_wire_golden tests/xvalue_wire_golden.c
+    "${KVSPACE_UPSTREAM_IMPLEMENTATION}")
     target_include_directories(xvalue_wire_golden PRIVATE src "${KVSPACE_UPSTREAM_INCLUDE_DIRECTORY}")
     add_test(NAME xvalue_wire_golden COMMAND xvalue_wire_golden)
     add_executable(test_codec_abi tests/test_codec_abi.c)
@@ -139,7 +155,8 @@ if(KVSPACE_BUILD_TESTS)
     target_link_libraries(test_art_alignment PRIVATE kvspace-c)
     add_test(NAME art_alignment COMMAND test_art_alignment)
 
-    # xvalue_head 的「副本与上游逐字节一致」检查已删除：副本不存在了。
+    # xvalue_head 的「副本与上游逐字节一致」检查已删除：**本仓不再有副本**
+    # （头与实现都直接取自上游，见顶部 KVSPACE_UPSTREAM_* 两个变量）。
     # 用户裁决「不允许 vendor」，kvspace-c 直接 `#include <kvspace/xvalue_head.h>`
     # 依赖上游那个文件本身（见顶部 KVSPACE_UPSTREAM_INCLUDE_DIRECTORY）——
     # 没有副本可以漂移，也就不需要「证明副本没漂移」的检查。

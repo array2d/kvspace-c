@@ -2931,8 +2931,8 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
         return -1;
     int32_t id = ref_leaf(kv, ref, key_fallback);
     art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
-    /* SLACK 的 part-write 快路径：固定 8 字节 head 直读 + per-box 物理容量校验后
-     * 写正文。任何不自洽（gen>0、无值、storetype/ptr 不符、offset/buf_len 越界、
+    /* part-write 快路径：head 直读 + per-box 物理容量校验后写正文。
+     * 任何不自洽（gen>0、无值、是引用、offset/buf_len 越过有效长度、
      * 超出 box 物理容量）一律回退现有路径，行为不变。不修改 head。 */
     uint64_t hv = h ? art_val_load(h) : 0;
     if (h && AV_HAS(hv) && ref->gen == 0) {
@@ -3458,8 +3458,8 @@ int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
      * 不再 patch `ptr` 字节：新布局没有这个字段，引用性由**构造器**写进
      * langtype 前缀（上面已按 ref 分派到 NewPtr/NewExt/Reserve）。
      */
-    /* Fixed 8-byte header (body offset = 8) + attr at 8+body_len in a single write.
-     * Reserve physical box capacity (8 + body_cap + attr) so body can grow in place. */
+    /* 16 字节 head（body offset = 16）+ attr 紧随 body，单 key 一次写。
+     * 预留物理 box 容量 (16 + body_cap + attr)，让 body 能在原地长。 */
     uint64_t attr_len = total - KVSPACE_XVALUE_HEAD_LEN - (uint64_t)body_len;
     size_t reserve = (size_t)(KVSPACE_XVALUE_HEAD_LEN + body_cap + attr_len);
     int rc = shm_set_raw(kv, key, value, (int32_t)total, reserve);
