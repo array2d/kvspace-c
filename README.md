@@ -41,15 +41,16 @@ This section mirrors `kvspace/include/kvspace/xvalue_head.h` verbatim — that h
 single source of truth for the wire layout.
 
 ```
-[bodylen:u64 le @0-7][attrslen:u32 le @8-11][layout:u8 @12][padding:3 @13-15][body @16][attr @16+bodylen]
+[bodylen:u64 le @0-7][attrslen:u16 le @8-9][reserved:u16 le @10-11]
+[layout:u8 @12][padding:3 @13-15][body @16][attr @16+bodylen]
 attr  = records, no length prefix      (attrslen is in the head — a second prefix would be a second truth)
 record = [tag:u8][len:u16 le][data]    tag 1 = langtype (kindexpr); tag 2 = reallen; 3+ reserved
-total = 16 + bodylen + attrslen
+total = 16 + bodylen + attrslen       (attrslen <= UINT16_MAX; reserved must be zero)
 ```
 
 - **`bodylen` 的语义由 `layout` 决定**：`layout = 0`（LENGTH）时它就是有效长度；
   `layout = 1`（CAPACITY）时它是**容量**，有效长度在 attr tag 2（`reallen`）。
-  `padding` 必须为零，非零即非法。
+  `reserved` 与 `padding` 必须为零，非零即非法。
 - **没有 storetype / ptr 字段**：存储形态与「是不是引用」都从 langtype 推出——
   langtype 首字节 `*` 是 Ptr、`@` 是 Ext，其余是普通值。
 - langtype (kindexpr) is the tag-1 record of the attr region; no record = untyped.

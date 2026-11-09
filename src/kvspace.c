@@ -642,14 +642,14 @@ static void p2_atfork_install(void) {
 #define P2_VIEW_GUARD(kv) ((kv)->quiesced || P2_FORK_GUARD(kv))
 
 /* 固定头直读辅助：校验 value 是合法 16 字节头 + 总长自洽；产出头。
-   padding 非零或总长溢出即失败——旧 8 字节 wire 的 body 首字节会落进 padding
-   或被当成超长 attrslen，因此在这里就被挡住，不做兼容。 */
+   reserved/padding 非零或总长溢出即失败——旧 8 字节 wire 的 body 首字节会落进
+   padding 或被当成超长 attrslen，因此在这里就被挡住，不做兼容。 */
 static int head_of(const uint8_t *val, int32_t val_len, kvspaceXvalueHead *out) {
     if (!val || val_len < (int32_t)KVSPACE_XVALUE_HEAD_LEN)
         return -1;
     memcpy(out, val, sizeof *out);
-    /* padding 与 layout 的合法性由 `TotalLen` 一处判掉（它同时算总长、
-       溢出与布局值），这里不再自己比枚举上界——旧模型那两句
+    /* reserved、padding 与 layout 的合法性由 `TotalLen` 一处判掉（它同时算
+       总长、溢出与布局值），这里不再自己比枚举上界——旧模型那两句
        `storetype > ST_VARLEN || ptr > PTR_EXT` 的对应字段已经不存在。 */
     const uint64_t total = kvspaceXvalueHeadTotalLen(out);
     if (total == 0 || total > (uint64_t)val_len)

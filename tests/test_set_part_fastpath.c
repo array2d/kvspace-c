@@ -194,7 +194,7 @@ int main(void) {
             memset(&ph, 0, sizeof ph);
             ph.layout = KVSPACE_XVALUE_LAYOUT_LENGTH;
             kvspaceXvalueHeadSetLen(&ph, 2);
-            kvspaceXvalueHeadSetAttrsLen(&ph, (uint32_t)(3 + sizeof prefixed - 1));
+            kvspaceXvalueHeadSetAttrsLen(&ph, (uint16_t)(3 + sizeof prefixed - 1));
             memcpy(d, &ph, sizeof ph);
             d[HEAD + 0] = '/';
             d[HEAD + 1] = 'x';

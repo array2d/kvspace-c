@@ -13,8 +13,8 @@
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "failed: %s\n", #x); return 1; } } while (0)
 
-/* head 固定 16 字节 [bodylen:u64][attrslen:u32][layout][padding:3]，body 偏移恒 16，
-   attr 区紧随 body 且没有长度前缀。整体单 key——无 attr key。 */
+/* head 固定 16 字节 [bodylen:u64][attrslen:u16][reserved:u16][layout][padding:3]，
+   body 偏移恒 16，attr 区紧随 body 且没有长度前缀。整体单 key——无 attr key。 */
 
 /* 读固定头：返回 (layout, body_len)，并校验总长 ≥ head+body。
  *

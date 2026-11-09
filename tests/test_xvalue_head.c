@@ -5,9 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 固定 head 16 字节 [bodylen:u64][attrslen:u32@8][layout@12][padding@13,16)，
-   body 偏移恒 16，attr 区紧随 body 且**没有**长度前缀（attrslen 在 head 里）。
-   单 key 整体——无 attr key。 */
+/* 固定 head 16 字节 [bodylen:u64@0][attrslen:u16@8][reserved:u16@10][layout@12]
+   [padding@13,16)，body 偏移恒 16，attr 区紧随 body 且**没有**长度前缀
+   （attrslen 在 head 里）。单 key 整体——无 attr key。 */
 
 static int failures = 0;
 #define CHECK(cond, ...)                                                       \
@@ -59,7 +59,8 @@ static void test_none(void) {
     memcpy(&h, buf, sizeof h);
     CHECK(h.layout == KVSPACE_XVALUE_LAYOUT_LENGTH &&
           kvspaceXvalueHeadLen(&h) == 0, "none head");
-    /* wire 布局：bodylen@0-7、attrslen@8-11、layout@12、padding@13-15 */
+    /* wire 布局：bodylen@0-7、attrslen@8-9、reserved@10-11、layout@12、
+       padding@13-15 */
     CHECK(buf[0] == 0 && buf[7] == 0 && buf[8] == 0 && buf[11] == 0,
           "none wire layout");
     CHECK(attr_ok(buf, n, 0, ""), "none empty attr");
@@ -242,7 +243,7 @@ static uint8_t *make_varlen(uint64_t cap, uint64_t reallen, const char *lt,
     kvspaceXvalueHead h = {.layout = KVSPACE_XVALUE_LAYOUT_CAPACITY,
                            .padding = {0u, 0u, 0u}};
     kvspaceXvalueHeadSetLen(&h, cap);
-    kvspaceXvalueHeadSetAttrsLen(&h, (uint32_t)alen);
+    kvspaceXvalueHeadSetAttrsLen(&h, (uint16_t)alen);
     memcpy(v, &h, sizeof h);
     uint8_t *a = v + KVSPACE_XVALUE_HEAD_LEN + cap;
     if (l) {

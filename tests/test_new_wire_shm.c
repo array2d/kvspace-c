@@ -10,7 +10,7 @@
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "failed: %s\n", #x); return 1; } } while (0)
 
-/* 固定 head 16 字节 [bodylen:u64][attrslen:u32][layout][padding:3]；
+/* 固定 head 16 字节 [bodylen:u64][attrslen:u16][reserved:u16][layout][padding:3]；
    body 偏移恒 16，attr 区紧随 body 且**没有**长度前缀。 */
 
 static int wire_len_of(const uint8_t *stored) {
