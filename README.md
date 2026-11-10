@@ -1,79 +1,42 @@
-# kvspace-c
+# kvspace-c（已冻结）
 
-[![CI](https://github.com/array2d/kvspace-c/actions/workflows/ci.yml/badge.svg)](https://github.com/array2d/kvspace-c/actions/workflows/ci.yml)
+> **本仓冻结，不再更新。** SHM 存储引擎已并入 [`kvspace`](../kvspace) 仓。
 
-C implementation of the **KVSpace** used by kvlang — the filesystem-style key-value store that serves as kvlang's unified addressing and memory space (keys are paths, values are XValues).
+## 实现去哪了
 
-This is one of two standard implementations of the KVSpace contract; the other is [kvspace-durable](../kvspace-durable). Both expose the same C ABI and the same XValue kindexpr format, so a consumer (the kvlang layout/runtime) switches between them by DSN only.
+| 原位置 | 新位置 |
+|---|---|
+| `kvspace-c/src/`（`kvspace.c`、`coord.c/h`、`kvspace_shm.h`、`xvalue_internal.h`） | [`kvspace/src/shm/`](../kvspace/tree/main/src/shm) |
+| `kvspace-c/tests/` | [`kvspace/tests/shm/`](../kvspace/tree/main/tests/shm) |
+| `kvspace-c/CMakeLists.txt` 的构建逻辑 | `kvspace/CMakeLists.txt` 的 `kvspace-c` target |
 
-Backend: `shm://` — single file-backed mmap block (ART-tree key index + slotsboxmalloc value storage), shared across processes.
+## 怎么构建
 
-## Build
-
-```bash
-make            # → build/libkvspace-c.so
-make test       # → build-test/, runs ctest (needs the kvspace ABI headers)
-```
-
-Dependencies: [`blockmalloc`](../blockmalloc), [`slotsboxmalloc`](../slotsboxmalloc) (header-only, compiled into this library).
-Tests additionally include the authoritative ABI header `<kvspace/kvspace.h>` from [`kvspace`](../kvspace) (`include/`).
-`ci/deps.sh` installs all three at the versions pinned in `deps.json`.
-
-## API
-
-Two surfaces:
-
-1. **Native C API** (`kvspaceShm*`) — `src/kvspace_shm.h` (internal header):
-   `kvspaceShmOpen/Close`, `kvspaceShmGet/Set`, `kvspaceShmList`, `kvspaceShmDel/Deltree`, `kvspaceShmMkindex`, `kvspaceShmExtindex/Delextindex`, `kvspaceShmNotify/Watch`.
-
-2. **durable C ABI** — byte-compatible with `kvspace-durable` (`src/durable_abi.c`):
-   `kvspaceConnect/Close/Disconnect`, `kvspaceGet` (zero-copy borrow) `/WriteInPlace/WriteNewPlace`,
-   `kvspaceListLen/ListAt/Del/DelTree/Cp/CpTree`,
-   `kvspaceMkindex/MkindexExt/RmindexExt/Watch/Clear`,
-   `kvspaceNewPtr/NewChar/NewBool/NewInt64/NewFloat64`.
-
-   A consumer (e.g. the kvlang layout) links this ABI and switches backends by DSN only, with no code change.
-
-## XValue
-
-Fixed **16-byte** head followed by the body and an attr region, stored as one value under one key.
-This section mirrors `kvspace/include/kvspace/xvalue_head.h` verbatim — that header is the
-single source of truth for the wire layout.
-
-```
-[bodylen:u64 le @0-7][attrslen:u16 le @8-9][padding:6 @10-15]
-[body @16][attr @16+bodylen]
-attr  = records, no length prefix      (attrslen is in the head — a second prefix would be a second truth)
-record = [tag:u8][len:u16 le][data]    tag 1 = langtype (kindexpr); tags 3+ reserved
-total = 16 + bodylen + attrslen       (attrslen <= UINT16_MAX; padding must be zero)
-```
-
-- **`bodylen` 恒为有效字节数**，没有第二个长度来源。容量是存储后端的物理分配属性
-  （`WriteNewPlace` 的 `body_cap` / box 尺寸），不进入 wire。10-15 六个字节只是
-  padding，必须为零，非零即非法。
-- **没有 storetype / ptr / layout 字段**：存储形态与「是不是引用」都从 langtype 推出——
-  langtype 首字节 `*` 是 Ptr、`@` 是 Ext，其余是普通值。
-- langtype (kindexpr) is the tag-1 record of the attr region; no record = untyped.
-- **没有 tag 2**：早期 wire 的 `reallen`（容量形态的有效长度）已删除，出现即拒
-  ——`kvspaceXvalueHeadScan` 是唯一的拒绝闸口，`EffectiveLen` 直接返回 `bodylen`。
-- Values are built with the `kvspaceXvalueHeadNew*` constructors (no capacity
-  argument: `Reserve(body_len, langtype)` 只产 `body_len` 字节零 body）。`kvspaceSetValue`
-  rejects values whose attr region is missing, runs past the value, or carries tag 2.
-- Store format version 8 (this wire). Stores written by older versions are refused at
-  open; rebuild them. Version 7 wrote `layout = 1` into wire byte 12, which is padding
-  now — it is rejected as nonzero padding, which is why the bump cannot be avoided.
-
-## Tests
+在 `kvspace` 仓里，目标名仍是 `kvspace-c`：
 
 ```bash
-make test                                                  # C tests (ctest)
-KVSPACE_C_SO=build/libkvspace-c.so python3 py/tests/test_wire.py
-(cd rust && cargo test)                                    # links ../build
+cmake -S ../kvspace -B ../kvspace/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build ../kvspace/build --target kvspace-c -j
 ```
 
-Cross-language tutorials live in the [`kvspace`](../kvspace) repo (`tutorial-c/`).
+产物名与 SONAME **保持不变**：`libkvspace-c.so.1`。dispatch 前端按这个名字 `dlopen`
+后端，改名就断链——所以并入后仍叫 `kvspace-c`，不叫 `kvspace-shm`。
 
-## Language wrappers
+测试：
 
-- `py/` — Python ctypes binding.
-- `rust/` — Rust FFI crate.
+```bash
+cmake --build ../kvspace/build -j
+cd ../kvspace/build && ctest --output-on-failure   # shm_* 开头的 8 项
+```
+
+## 为什么并仓
+
+`kvspace-c` 只依赖 `kvspace` 的公开头（`kvspace.h`、`kvspace_xvalue.h`、
+`kvlang_xvalue.h`）与两个 header-only 分配器（`blockmalloc`、`slotsboxmalloc`）。
+两仓分离带来的全部代价是「找兄弟目录的头 + 配置期断言版本对不对」这一层
+跨仓布局补丁，而没有换来任何独立性——真正的解耦早已由头文件完成。并仓后那层
+补丁是纯冗余，故删除。
+
+## 历史
+
+本仓保留是为了让旧的 git 历史与 issue 引用仍可追溯，**代码不再演进**。

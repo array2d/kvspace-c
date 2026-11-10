@@ -1,38 +1,13 @@
-name: ci-macos
+# 本仓已冻结：SHM 存储引擎并入 kvspace 仓，构建与发布都在那边。
+# 这里保留一个显式跳过，而不是删掉 workflow —— 删掉会让 GitHub 继续按
+# 旧记录显示上一次的成功状态，看起来像还在跑；跳过会明确写「已冻结」。
+name: frozen
 on: [push, pull_request]
 jobs:
-  build:
-    runs-on: macos-latest
+  frozen:
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: 构建依赖 blockmalloc（macOS 无预编译 ABI，从源码装）
+      - name: 已冻结
         run: |
-          git clone --depth 1 --branch v0.1.4 https://github.com/array2d/blockmalloc.git /tmp/blockmalloc
-          cmake -S /tmp/blockmalloc -B /tmp/blockmalloc/build \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
-          cmake --build /tmp/blockmalloc/build -j
-          sudo cmake --install /tmp/blockmalloc/build
-      - name: 构建依赖 slotsboxmalloc（同上，从源码装）
-        run: |
-          # 跟 main：v0.1.5 尚不含 macOS 的 _POSIX_C_SOURCE 修复（待其发新 tag 后改回固定版本）
-          git clone --depth 1 https://github.com/array2d/slotsboxmalloc.git /tmp/slotsboxmalloc
-          cmake -S /tmp/slotsboxmalloc -B /tmp/slotsboxmalloc/build \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
-          cmake --build /tmp/slotsboxmalloc/build -j
-          sudo cmake --install /tmp/slotsboxmalloc/build
-      - name: Install kvspace ABI headers (version from deps.json)
-        run: |
-          ver=$(jq -r '.kvspace' deps.json)
-          git clone --depth 1 --branch "$ver" https://github.com/array2d/kvspace.git /tmp/kvspace
-          sudo mkdir -p /usr/local/include
-          sudo cp -R /tmp/kvspace/include/. /usr/local/include/
-      - name: 构建
-        run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
-            -DKVSPACE_BUILD_TESTS=ON
-          cmake --build build -j
-      - name: 测试
-        env:
-          # macOS 无 ldconfig，dyld 不会自动搜 /usr/local/lib
-          DYLD_FALLBACK_LIBRARY_PATH: /usr/local/lib
-        run: cd build && ctest --output-on-failure
+          echo "kvspace-c 已冻结，实现见 kvspace/src/shm。"
+          echo "构建/测试/发布请用 array2d/kvspace 仓。"

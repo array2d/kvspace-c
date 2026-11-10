@@ -1,45 +1,13 @@
-name: release-abi
-on:
-  push:
-    tags: ['v*']
-  # 手动重跑（tag 已存在但 release 缺失时用；tag 删+重建同 sha 不会重新触发）
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 要发布的 tag（须已存在，如 v0.2.18）
-        required: true
-permissions:
-  contents: write
+# 本仓已冻结：SHM 存储引擎并入 kvspace 仓，构建与发布都在那边。
+# 这里保留一个显式跳过，而不是删掉 workflow —— 删掉会让 GitHub 继续按
+# 旧记录显示上一次的成功状态，看起来像还在跑；跳过会明确写「已冻结」。
+name: frozen
+on: [push, pull_request]
 jobs:
-  publish:
+  frozen:
     runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
-        with: { ref: "${{ inputs.tag || github.ref }}" }
-      - name: 下载 ABI 依赖
-        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
-        run: ./ci/deps.sh
-      - name: 构建
-        run: make
-      - name: 打包 ABI 产物
+      - name: 已冻结
         run: |
-          set -euo pipefail
-          v="${RELEASE_TAG:-${GITHUB_REF_NAME}}"
-          d="kvspace-c-abi-$v-linux-x86_64"
-          mkdir -p "$d/include" "$d/lib"
-          # Copy authoritative ABI headers from the pinned kvspace tag in deps.json.
-          kvspace_ver=$(jq -r '.kvspace' deps.json)
-          test -n "$kvspace_ver" && test "$kvspace_ver" != null
-          git clone --depth 1 --branch "$kvspace_ver" https://github.com/array2d/kvspace.git /tmp/kvspace-hdr
-          cp -R /tmp/kvspace-hdr/include/. "$d/include/"
-          # 库：扫构建目录的所有 .so*/.dylib（-P 保符号链接）
-          find build -maxdepth 3 \( -name 'lib*.so*' -o -name 'lib*.dylib' \) -exec cp -P {} "$d/lib/" \;
-          # 本仓无可执行产物（纯库），故不带 bin/
-          printf '{"abi":"%s"}\n' "$v" > "$d/abi-manifest.json"
-          tar czf "$d.tar.gz" "$d"
-          sha256sum "$d.tar.gz" > SHA256SUMS
-      - name: 发布 release
-        run: gh release create "${RELEASE_TAG:-${GITHUB_REF_NAME}}" kvspace-c-abi-*.tar.gz SHA256SUMS --generate-notes
+          echo "kvspace-c 已冻结，实现见 kvspace/src/shm。"
+          echo "构建/测试/发布请用 array2d/kvspace 仓。"

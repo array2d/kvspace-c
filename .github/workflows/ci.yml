@@ -1,16 +1,13 @@
-name: ci
+# 本仓已冻结：SHM 存储引擎并入 kvspace 仓，构建与发布都在那边。
+# 这里保留一个显式跳过，而不是删掉 workflow —— 删掉会让 GitHub 继续按
+# 旧记录显示上一次的成功状态，看起来像还在跑；跳过会明确写「已冻结」。
+name: frozen
 on: [push, pull_request]
 jobs:
-  build:
+  frozen:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: 下载 ABI 依赖
-        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
-        run: ./ci/deps.sh
-      - name: 构建
-        run: make
-      - name: Run C tests
-        run: make test
-      - name: Run Python wrapper tests
-        run: KVSPACE_C_SO=build/libkvspace-c.so python3 py/tests/test_wire.py
+      - name: 已冻结
+        run: |
+          echo "kvspace-c 已冻结，实现见 kvspace/src/shm。"
+          echo "构建/测试/发布请用 array2d/kvspace 仓。"
