@@ -48,12 +48,12 @@ if(NOT EXISTS "${KVSPACE_UPSTREAM_IMPLEMENTATION}")
         "KVSPACE_UPSTREAM_INCLUDE_DIRECTORY to its include/ directory.")
 endif()
 
-if(NOT KVSPACE_UPSTREAM_HEADER_TEXT MATCHES "KVSPACE_XVALUE_LAYOUT_LENGTH")
+if(NOT KVSPACE_UPSTREAM_HEADER_TEXT MATCHES "padding\\[6\\]")
     message(FATAL_ERROR
         "kvspace-c requires the NEW xvalue_head layout (16-byte head with "
-        "`layout` at @12). The header at "
+        "`padding[6]` at @10, no `reserved` / `layout` / tag 2). The header at "
         "${KVSPACE_UPSTREAM_INCLUDE_DIRECTORY}/kvspace/xvalue_head.h does not "
-        "define KVSPACE_XVALUE_LAYOUT_LENGTH, so it is the OLD storetype layout. "
+        "declare `padding[6]`, so it is an older layout. "
         "Update the upstream kvspace clone.")
 endif()
 

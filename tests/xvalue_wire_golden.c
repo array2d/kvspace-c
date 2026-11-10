@@ -81,7 +81,7 @@ static void emit_slack_utf8(void) {
     uint8_t *wire = NULL;
     uint64_t length = 0;
 
-    REQUIRE(kvspaceXvalueHeadNewSlack(body, sizeof body, sizeof body,
+    REQUIRE(kvspaceXvalueHeadNewSlack(body, sizeof body,
                                       "[]char/utf8", &wire, &length) == 0,
             "utf8");
     if (wire != NULL) {
@@ -95,7 +95,7 @@ static void emit_slack_no_langtype(void) {
     uint8_t *wire = NULL;
     uint64_t length = 0;
 
-    REQUIRE(kvspaceXvalueHeadNewSlack(body, sizeof body, sizeof body, "", &wire,
+    REQUIRE(kvspaceXvalueHeadNewSlack(body, sizeof body, "", &wire,
                                       &length) == 0,
             "no-langtype");
     if (wire != NULL) {
@@ -150,7 +150,7 @@ static void emit_reserve(void) {
     uint8_t *wire = NULL;
     uint64_t length = 0;
 
-    REQUIRE(kvspaceXvalueHeadReserve(4, 8, "[]u8",
+    REQUIRE(kvspaceXvalueHeadReserve(4, "[]u8",
                                      &wire, &length) == 0,
             "reserve");
     if (wire != NULL) {

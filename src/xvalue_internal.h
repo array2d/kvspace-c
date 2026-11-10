@@ -3,8 +3,8 @@
  * 为什么不是公共头里的函数：用户要求**不加任何 ABI 符号**。格式知识在三个实现里
  * 各有一份（Rust / 本仓 / runtimec），一致性由**同一组测试矩阵**保证，不靠共享符号。
  *
- * 数值一律从常量取（`KVSPACE_XVALUE_ATTR_TAG_*` / `KVSPACE_XVALUE_LAYOUT_*`），
- * **不在这里写死 1、2 或 4**——格式知识可以重复，字面量不行。
+ * 数值一律从常量取（`KVSPACE_XVALUE_ATTR_TAG_*`），**不在这里写死 1 或 2**——
+ * 格式知识可以重复，字面量不行。
  *
  * 本文件**不安装**，只供本仓 .c 与测试使用。 */
 #ifndef KVSPACE_C_XVALUE_INTERNAL_H
@@ -33,7 +33,7 @@ static inline int kvspace_c_reference_of(const uint8_t *wire, uint64_t wire_len)
     const uint8_t *langtype = NULL;
     uint16_t langtype_len = 0;
 
-    if (kvspaceXvalueHeadScan(wire, wire_len, &langtype, &langtype_len, NULL) != 0)
+    if (kvspaceXvalueHeadScan(wire, wire_len, &langtype, &langtype_len) != 0)
         return KVSPACE_XVALUE_REFERENCE_INVALID;
     if (langtype == NULL || langtype_len == 0)
         return KVSPACE_XVALUE_REFERENCE_INLINE; /* 空 langtype = 不是引用 */
@@ -44,11 +44,10 @@ static inline int kvspace_c_reference_of(const uint8_t *wire, uint64_t wire_len)
     return KVSPACE_XVALUE_REFERENCE_INLINE;
 }
 
-/* 有效长度：`layout == LAYOUT_CAPACITY` 时是 attr tag 2 的 reallen；
- * 否则是 bodylen。
+/* 有效长度 = `bodylen`（head 里已没有容量之说，wire 里也没有 tag 2）。
  *
- * 上游头的 `kvspaceXvalueHeadEffectiveLen` 已经做这件事（含 padding / layout /
- * tag 2 归属的全部校验），本仓直接用它——**不在这里维护第二份**。保留本包装只为
+ * 上游头的 `kvspaceXvalueHeadEffectiveLen` 已经做这件事（含 padding 与总长的
+ * 全部校验），本仓直接用它——**不在这里维护第二份**。保留本包装只为
  * 让调用点不必各自写「传 NULL 取错误」的样板。
  *
  * 返回 0 成功；非 0 失败（畸形 wire）。**错误不走长度值**：0 是合法长度。 */
@@ -84,8 +83,6 @@ static inline int kvspace_c_same_shape(const uint8_t *left, uint64_t left_len,
     if (kvspaceXvalueHeadLen(left_head) != kvspaceXvalueHeadLen(right_head))
         return 0;
     if (kvspaceXvalueHeadAttrsLen(left_head) != kvspaceXvalueHeadAttrsLen(right_head))
-        return 0;
-    if (kvspaceXvalueHeadLayout(left_head) != kvspaceXvalueHeadLayout(right_head))
         return 0;
     return memcmp(left, right, KVSPACE_XVALUE_HEAD_LEN) == 0 &&
            memcmp(left + KVSPACE_XVALUE_HEAD_LEN + kvspaceXvalueHeadLen(left_head),

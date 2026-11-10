@@ -10,8 +10,8 @@
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "failed: %s\n", #x); return 1; } } while (0)
 
-/* 固定 head 16 字节 [bodylen:u64][attrslen:u16][reserved:u16][layout][padding:3]；
-   body 偏移恒 16，attr 区紧随 body 且**没有**长度前缀。 */
+/* 固定 head 16 字节 [bodylen:u64][attrslen:u16][padding:6]；body 偏移恒 16，
+   attr 区紧随 body 且**没有**长度前缀。 */
 
 static int wire_len_of(const uint8_t *stored) {
     kvspaceXvalueHead h;
@@ -80,8 +80,7 @@ int main(void) {
 
     CHECK(kvspaceShmMkindex(kv, "/lib/f/", 0) == 0);
     const uint8_t code[] = {0, 0, 0, 0, 0, 'x'};
-    CHECK(kvspaceXvalueHeadNewCode(code, sizeof code, sizeof code, "",
-                                   &value, &n) == 0);
+    CHECK(kvspaceXvalueHeadNewCode(code, sizeof code, "", &value, &n) == 0);
     CHECK(kvspaceShmSet(kv, "/lib/f/[1,-1]", value, (int32_t)n) == 0);
     CHECK(kvspaceShmSet(kv, "/lib/f/[1,0]", value, (int32_t)n) == 0);
     free(value);

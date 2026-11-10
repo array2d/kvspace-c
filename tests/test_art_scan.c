@@ -54,7 +54,7 @@ static int32_t get_int32(kvspace_t *kv, const char *key) {
     return -1;
   kvspaceXvalueHead h;
   memcpy(&h, d, sizeof h);
-  if (kvspaceXvalueHeadLen(&h) != 4 || 0 /* reserved 并入 len */)
+  if (kvspaceXvalueHeadLen(&h) != 4)
     return -1;
   const uint8_t *b = d + KVSPACE_XVALUE_HEAD_LEN;
   return (int32_t)((uint32_t)b[0] | ((uint32_t)b[1] << 8) |

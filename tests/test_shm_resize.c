@@ -53,7 +53,7 @@ static int check_bytes(kvspace_t *kv, const char *key, int32_t n, int seed) {
     return 1;
   kvspaceXvalueHead h;
   memcpy(&h, d, sizeof h);
-  if (kvspaceXvalueHeadLen(&h) != (uint32_t)n || 0 /* reserved 并入 len */)
+  if (kvspaceXvalueHeadLen(&h) != (uint32_t)n)
     return 2;
   const uint8_t *b = d + KVSPACE_XVALUE_HEAD_LEN;
   for (int32_t j = 0; j < n; j++)

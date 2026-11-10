@@ -259,7 +259,7 @@ static int check_value_intact(void *h, const char *key, uint64_t expected_length
                               const char *expected_langtype) {
     uint8_t *wire = NULL;
     uint32_t wire_len = 0;
-    const kvspaceXvalueHead *head;
+    uint64_t effective = 0;
     const uint8_t *langtype = NULL;
     uint16_t langtype_len;
 
@@ -267,10 +267,9 @@ static int check_value_intact(void *h, const char *key, uint64_t expected_length
         return 0;
     if (wire_len < KVSPACE_XVALUE_HEAD_LEN)
         return 0;
-    /* 本仓 vendor 的 head 副本没有 EffectiveLen（它属新版），用 head 的
-     * `bodylen` 判长度——本条用例的值是 LAYOUT 语义（无 attr tag 2），两者相等。 */
-    head = (const kvspaceXvalueHead *)(const void *)wire;
-    if (kvspaceXvalueHeadLen(head) != expected_length)
+    /* 长度取**有效长度** = bodylen（wire 里没有容量，也没有 tag 2）。 */
+    if (kvspace_c_effective_len(wire, wire_len, &effective) != 0 ||
+        effective != expected_length)
         return 0;
     langtype_len = kvspaceXvalueHeadLangtypeBounded(wire, wire_len, &langtype);
     if (langtype == NULL || langtype_len != (uint16_t)strlen(expected_langtype))

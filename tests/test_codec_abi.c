@@ -13,15 +13,16 @@
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "failed: %s\n", #x); return 1; } } while (0)
 
-/* head 固定 16 字节 [bodylen:u64][attrslen:u16][reserved:u16][layout][padding:3]，
-   body 偏移恒 16，attr 区紧随 body 且没有长度前缀。整体单 key——无 attr key。 */
+/* head 固定 16 字节 [bodylen:u64][attrslen:u16][padding:6]，body 偏移恒 16，
+   attr 区紧随 body 且没有长度前缀。整体单 key——无 attr key。 */
 
-/* 读固定头：返回 (layout, body_len)，并校验总长 ≥ head+body。
+/* 读固定头：返回 body_len 与有效长度，并校验总长 ≥ head+body。
  *
- * 旧版返回 (storetype, ptr)；新布局没有这两个字段——`layout` 由 `TotalLen`
- * 一并校验（它同时判 padding 与布局值），引用性由 langtype 前缀表达。 */
-static int peek(const uint8_t *v, uint32_t total, uint8_t *layout,
-                uint64_t *blen) {
+ * 旧版返回 (storetype, ptr)；更早的一版返回 layout——三个字段现在都不在 head
+ * 里：padding 由 `TotalLen` 一并校验，引用性由 langtype 前缀表达，「bodylen
+ * 是不是容量」由 langtype 判。 */
+static int peek(const uint8_t *v, uint32_t total, uint64_t *blen,
+                uint64_t *effective) {
     if (total < KVSPACE_XVALUE_HEAD_LEN)
         return 1;
     kvspaceXvalueHead h;
@@ -29,12 +30,13 @@ static int peek(const uint8_t *v, uint32_t total, uint8_t *layout,
     const uint64_t full = kvspaceXvalueHeadTotalLen(&h);
     if (full == 0 || full > total)
         return 1;
-    *layout = h.layout;
+    if (kvspaceXvalueHeadEffectiveLen(v, total, effective) != 0)
+        return 1;
     *blen = kvspaceXvalueHeadLen(&h);
     return 0;
 }
 
-/* 校验 attr 区：total = 8+body_len+attr_len；langtype 记录存在且与 lt 一致。 */
+/* 校验 attr 区：total = 16+bodylen+attrslen；langtype 记录存在且与 lt 一致。 */
 static int attr_ok(const uint8_t *v, uint32_t total, uint64_t body_len,
                    const char *lt) {
     size_t l = strlen(lt);
@@ -53,14 +55,13 @@ static int attr_ok(const uint8_t *v, uint32_t total, uint64_t body_len,
 }
 
 static int test_head_constructors(void) {
-    /* None：8 字节空体 + 空 attr。 */
+    /* None：16 字节空体 + 空 attr。 */
     uint8_t *v = NULL;
     uint64_t n = 0;
     CHECK(kvspaceXvalueHeadNewNone(&v, &n) == 0 && n == 16);
     kvspaceXvalueHead h;
     memcpy(&h, v, sizeof h);
-    CHECK(h.layout == KVSPACE_XVALUE_LAYOUT_LENGTH &&
-          kvspaceXvalueHeadLen(&h) == 0);
+    CHECK(kvspaceXvalueHeadLen(&h) == 0 && kvspaceXvalueHeadPaddingIsZero(&h));
     CHECK(attr_ok(v, (uint32_t)n, 0, ""));
     free(v);
 
@@ -70,7 +71,7 @@ static int test_head_constructors(void) {
                                      &v, &n) == 0);
     CHECK(n == 16 + 8 + (3 + 5));
     memcpy(&h, v, sizeof h);
-    CHECK(kvspaceXvalueHeadLen(&h) == 8 && h.layout == KVSPACE_XVALUE_LAYOUT_LENGTH);
+    CHECK(kvspaceXvalueHeadLen(&h) == 8);
     CHECK(memcmp(v + KVSPACE_XVALUE_HEAD_LEN, raw, 8) == 0);
     CHECK(attr_ok(v, (uint32_t)n, 8, "int64"));
     free(v);
@@ -85,12 +86,11 @@ static int test_head_constructors(void) {
 
     /* slack：变长 body + 类型记录。 */
     const uint8_t utf8[] = {0xe4, 0xbd, 0xa0, 0xf0, 0x9f, 0x98, 0x80};
-    CHECK(kvspaceXvalueHeadNewSlack(utf8, sizeof utf8, sizeof utf8, "char/utf8",
+    CHECK(kvspaceXvalueHeadNewSlack(utf8, sizeof utf8, "char/utf8",
                                     &v, &n) == 0);
     CHECK(n == 16 + sizeof utf8 + (3 + 9));
     memcpy(&h, v, sizeof h);
-    CHECK(kvspaceXvalueHeadLen(&h) == sizeof utf8 &&
-          h.layout == KVSPACE_XVALUE_LAYOUT_LENGTH);
+    CHECK(kvspaceXvalueHeadLen(&h) == sizeof utf8);
     CHECK(memcmp(v + KVSPACE_XVALUE_HEAD_LEN, utf8, sizeof utf8) == 0);
     CHECK(attr_ok(v, (uint32_t)n, sizeof utf8, "char/utf8"));
     free(v);
@@ -127,39 +127,39 @@ static int test_head_constructors(void) {
 static int test_new_abi(void) {
     uint8_t *v = NULL;
     uint32_t len = 0;
-    uint8_t layout;
     uint64_t blen;
+    uint64_t effective;
 
     CHECK(kvspaceNewInt64(42, "int64", &v, &len) == 0);
-    CHECK(len == 16 + 8 + (3 + 5) && peek(v, len, &layout, &blen) == 0);
-    CHECK(layout == KVSPACE_XVALUE_LAYOUT_LENGTH && blen == 8);
+    CHECK(len == 16 + 8 + (3 + 5) && peek(v, len, &blen, &effective) == 0);
+    CHECK(blen == 8 && effective == 8);
     CHECK(v[KVSPACE_XVALUE_HEAD_LEN] == 42 && v[KVSPACE_XVALUE_HEAD_LEN + 1] == 0); /* 小端 */
     CHECK(attr_ok(v, len, 8, "int64"));
     free(v);
 
     CHECK(kvspaceNewFloat64(1.5, "float64", &v, &len) == 0);
-    CHECK(len == 16 + 8 + (3 + 7) && peek(v, len, &layout, &blen) == 0);
-    CHECK(layout == KVSPACE_XVALUE_LAYOUT_LENGTH && blen == 8);
+    CHECK(len == 16 + 8 + (3 + 7) && peek(v, len, &blen, &effective) == 0);
+    CHECK(blen == 8 && effective == 8);
     CHECK(attr_ok(v, len, 8, "float64"));
     free(v);
 
     CHECK(kvspaceNewBool(1, "bool", &v, &len) == 0);
-    CHECK(len == 16 + 8 && peek(v, len, &layout, &blen) == 0);
-    CHECK(layout == KVSPACE_XVALUE_LAYOUT_LENGTH && blen == 1 && v[KVSPACE_XVALUE_HEAD_LEN] == 1);
+    CHECK(len == 16 + 8 && peek(v, len, &blen, &effective) == 0);
+    CHECK(blen == 1 && effective == 1 && v[KVSPACE_XVALUE_HEAD_LEN] == 1);
     CHECK(attr_ok(v, len, 1, "bool"));
     free(v);
 
     const uint8_t utf8[] = {0xe4, 0xbd, 0xa0, 0xf0, 0x9f, 0x98, 0x80};
     CHECK(kvspaceNewChar(utf8, sizeof utf8, "char/utf8", &v, &len) == 0);
-    CHECK(len == 16 + sizeof utf8 + (3 + 9) && peek(v, len, &layout, &blen) == 0);
-    CHECK(layout == KVSPACE_XVALUE_LAYOUT_LENGTH && blen == sizeof utf8);
+    CHECK(len == 16 + sizeof utf8 + (3 + 9) && peek(v, len, &blen, &effective) == 0);
+    CHECK(blen == sizeof utf8 && effective == sizeof utf8);
     CHECK(memcmp(v + KVSPACE_XVALUE_HEAD_LEN, utf8, sizeof utf8) == 0);
     CHECK(attr_ok(v, len, sizeof utf8, "char/utf8"));
     free(v);
 
     CHECK(kvspaceNewPtr("int64", "/x", &v, &len) == 0);
     /* NewPtr 给 langtype 补 `*`：记录是 3 + 6（"*int64"），不是 3 + 5。 */
-    CHECK(len == 16 + 2 + (3 + 6) && peek(v, len, &layout, &blen) == 0);
+    CHECK(len == 16 + 2 + (3 + 6) && peek(v, len, &blen, &effective) == 0);
     CHECK(kvspace_c_reference_of(v, len) == KVSPACE_XVALUE_REFERENCE_PTR && blen == 2);
     CHECK(memcmp(v + KVSPACE_XVALUE_HEAD_LEN, "/x", 2) == 0);
     CHECK(attr_ok(v, len, 2, "*int64"));
@@ -194,16 +194,15 @@ static int value_langtype_is(void *h, const char *key, const char *expected) {
 static int value_length_is(void *h, const char *key, uint64_t expected) {
     uint8_t *wire = NULL;
     uint32_t wire_len = 0;
-    const kvspaceXvalueHead *head;
+    uint64_t effective = 0;
 
     if (kvspaceGet(h, key, 0, &wire, &wire_len) != 0 || wire == NULL)
         return 0;
     if (wire_len < KVSPACE_XVALUE_HEAD_LEN)
         return 0;
-    /* 本仓 vendor 副本无 `EffectiveLen`；本条值的长度取 head 的 `bodylen`
-     * （新建的值是 LAYOUT 语义，没有 attr tag 2 覆盖）。 */
-    head = (const kvspaceXvalueHead *)(const void *)wire;
-    return kvspaceXvalueHeadLen(head) == expected;
+    /* 长度取**有效长度** = bodylen（wire 里没有容量，也没有 tag 2）。 */
+    return kvspace_c_effective_len(wire, wire_len, &effective) == 0 &&
+           effective == expected;
 }
 
 static int test_gethead_tail(void) {

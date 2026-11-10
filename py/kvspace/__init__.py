@@ -38,35 +38,36 @@ _bind(_lib.kvspaceShmNotify, [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(c
 _bind(_lib.kvspaceShmWatch, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32)], ctypes.POINTER(ctypes.c_uint8))
 
 # ── 权威 head 构造器绑定（kvspace ABI，无 handle）──────────────────
-# #566/#571: Fixed 8-byte header [len:u48][storetype][ptr], body at offset 8, attr at
-# 8+len ([attr_len:u16][records], record = [tag:u8][len:u16][data], tag 1 = langtype).
-# Constructed via C kvspaceXvalueHeadNew*; parsed locally on read.
+# 固定 16 字节 head：[bodylen:u64 LE@0][attrslen:u16 LE@8][padding:6@10-15]，
+# body@16，attr 紧随 body 且**没有**长度前缀（attrslen 在 head 里）。
+# record = [tag:u8][len:u16 LE][data]，tag 1 = langtype；tag 2（旧 reallen）
+# 已删除，出现即拒。构造走 C 的 kvspaceXvalueHeadNew*，读侧本地解析。
 
 _U8P = ctypes.POINTER(ctypes.c_uint8)
 _U8PP = ctypes.POINTER(_U8P)
 _U64P = ctypes.POINTER(ctypes.c_uint64)
 _bind(_lib.kvspaceXvalueHeadNewScalar,
-      [ctypes.c_uint8, _U8P, ctypes.c_uint32, ctypes.c_char_p, _U8PP, _U64P], ctypes.c_int)
+      [_U8P, ctypes.c_uint32, ctypes.c_char_p, _U8PP, _U64P], ctypes.c_int)
 _bind(_lib.kvspaceXvalueHeadNewSlack,
-      [_U8P, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_char_p, _U8PP, _U64P], ctypes.c_int)
+      [_U8P, ctypes.c_uint64, ctypes.c_char_p, _U8PP, _U64P], ctypes.c_int)
 _bind(_lib.kvspaceXvalueHeadNewPtr,
       [_U8P, ctypes.c_uint32, ctypes.c_char_p, _U8PP, _U64P], ctypes.c_int)
 _bind(_lib.kvspaceXvalueHeadNewExt,
       [_U8P, ctypes.c_uint32, ctypes.c_char_p, _U8PP, _U64P], ctypes.c_int)
 
-ST_SHORT, ST_SLACK, ST_LARGE, ST_EXT = 0, 1, 2, 3
-PTR_INLINE, PTR_PTR, PTR_EXT = 0, 1, 2
-HEAD_LEN = 8
+HEAD_LEN = 16
+PADDING_LEN = 6
+ATTR_TAG_LANGTYPE = 1
+# 旧 wire 的 tag 2（reallen）：已删除，出现即拒。
+BANNED_ATTR_TAG_REALLEN = 2
 
-# 存储位置：与 KVSPACE_REF_* 对齐（由 ptr 位推导）。
+# 引用性：head 里没有 ptr 位，由 langtype 首字节的 `*` / `@` 前缀表达。
 REF_INLINE, REF_PTR, REF_EXT = 0, 1, 2
 
 
 # ── XValue helpers ────────────────────────────────────────────────
 # Construct via C constructors (_take copies and frees malloc buffer); parse header + attr locally.
 # Empty langtype = untyped (empty attr).
-
-ATTR_TAG_LANGTYPE = 1
 
 
 def _take(out, total: ctypes.c_uint64) -> bytes:
@@ -90,55 +91,75 @@ def _u8buf(raw: bytes):
 
 
 def _xv_scalar(raw: bytes, langtype: str) -> bytes:
-    return _new(_lib.kvspaceXvalueHeadNewScalar, ST_SHORT, _u8buf(raw), len(raw),
+    return _new(_lib.kvspaceXvalueHeadNewScalar, _u8buf(raw), len(raw),
                 langtype.encode())
 
 
 def _xv_slack(raw: bytes, langtype: str) -> bytes:
-    return _new(_lib.kvspaceXvalueHeadNewSlack, _u8buf(raw), len(raw), len(raw),
+    return _new(_lib.kvspaceXvalueHeadNewSlack, _u8buf(raw), len(raw),
                 langtype.encode())
 
 
 def _split_wire(data: Optional[bytes]):
-    """Validate and split wire into (storetype, ptr, body, attr); returns None if malformed."""
-    if not data or len(data) < HEAD_LEN + 2:
+    """校验并切分 wire -> (body, attr)；畸形返回 None。
+
+    判据全部来自 head 本身，没有第二个长度来源：
+      - 长度够一个 head；padding 10-15 全零；16+bodylen+attrslen == len(data)；
+      - attr 区逐条 record 自洽，且不含已删除的 tag 2（旧 reallen）。"""
+    if not data or len(data) < HEAD_LEN:
         return None
-    body_len = int.from_bytes(data[:6], "little")
-    storetype, ptr = data[6], data[7]
-    if storetype > ST_EXT or ptr > PTR_EXT or HEAD_LEN + body_len + 2 > len(data):
+    body_len = int.from_bytes(data[0:8], "little")
+    attr_len = int.from_bytes(data[8:10], "little")
+    if any(data[10:10 + PADDING_LEN]):
         return None
-    a = HEAD_LEN + body_len
-    attr_len = int.from_bytes(data[a:a + 2], "little")
-    if attr_len < 2 or a + attr_len != len(data):
+    total = HEAD_LEN + body_len + attr_len
+    if total != len(data):
         return None
-    return storetype, ptr, data[HEAD_LEN:a], data[a:a + attr_len]
-
-
-def _xv_from_wire(data: Optional[bytes]) -> tuple[int, int, bytes]:
-    """Read fixed header -> (ref, storetype, body) excluding attr; returns (0, 0, b"") if invalid."""
-    parts = _split_wire(data)
-    if parts is None:
-        return (0, 0, b"")
-    storetype, ptr, body, _ = parts
-    ref = REF_PTR if ptr == PTR_PTR else REF_EXT if ptr == PTR_EXT else REF_INLINE
-    return (ref, storetype, body)
-
-
-def xv_langtype(data: Optional[bytes]) -> str:
-    """Read attr tag=1 (langtype) record; returns "" if untyped or invalid."""
-    parts = _split_wire(data)
-    if parts is None:
-        return ""
-    attr = parts[3]
-    p = 2
+    attr = data[HEAD_LEN + body_len:total]
+    p = 0
     while p + 3 <= len(attr):
         tag, rlen = attr[p], int.from_bytes(attr[p + 1:p + 3], "little")
         if p + 3 + rlen > len(attr):
-            return ""
-        if tag == ATTR_TAG_LANGTYPE:
-            return attr[p + 3:p + 3 + rlen].decode()
+            return None
+        if tag == BANNED_ATTR_TAG_REALLEN:
+            return None
         p += 3 + rlen
-    return ""
+    return data[HEAD_LEN:HEAD_LEN + body_len], attr
+
+
+def _langtype_of(attr: bytes) -> bytes:
+    """attr 区里 tag 1 的原始字节；没有就是空。"""
+    p = 0
+    while p + 3 <= len(attr):
+        tag, rlen = attr[p], int.from_bytes(attr[p + 1:p + 3], "little")
+        if tag == ATTR_TAG_LANGTYPE:
+            return attr[p + 3:p + 3 + rlen]
+        p += 3 + rlen
+    return b""
+
+
+def _xv_from_wire(data: Optional[bytes]) -> tuple[int, bytes]:
+    """读 wire -> (ref, body)；畸形返回 (REF_INLINE, b"")。
+
+    ref 由 langtype 首字节决定（head 里没有 ptr 位）。"""
+    parts = _split_wire(data)
+    if parts is None:
+        return (REF_INLINE, b"")
+    body, attr = parts
+    langtype = _langtype_of(attr)
+    if langtype[:1] == b"*":
+        return (REF_PTR, body)
+    if langtype[:1] == b"@":
+        return (REF_EXT, body)
+    return (REF_INLINE, body)
+
+
+def xv_langtype(data: Optional[bytes]) -> str:
+    """读 attr tag 1（langtype）；无类型或畸形返回 ""。"""
+    parts = _split_wire(data)
+    if parts is None:
+        return ""
+    return _langtype_of(parts[1]).decode()
 
 
 def xv_int(v: int, langtype: str = "") -> bytes:
@@ -154,18 +175,18 @@ def xv_str(s: str, langtype: str = "") -> bytes:
 
 
 def xv_index() -> bytes:
-    """Directory value (empty-body SHORT header, untyped)."""
+    """Directory value (empty body, untyped)."""
     return _xv_scalar(b"", "")
 
 
 def xv_link(target: str, langtype: str = "") -> bytes:
-    """Pointer value (ptr=PTR): body=target key, langtype=target constraint ("" = unconstrained)."""
+    """Pointer value：body=target key，构造器给 langtype 补 `*` 前缀（"" = 无约束）。"""
     t = target.encode()
     return _new(_lib.kvspaceXvalueHeadNewPtr, _u8buf(t), len(t), langtype.encode())
 
 
 def xv_ext(locator: str, langtype: str = "") -> bytes:
-    """External locator (EXT class): body=locator."""
+    """External locator：body=locator，构造器给 langtype 补 `@` 前缀。"""
     loc = locator.encode()
     return _new(_lib.kvspaceXvalueHeadNewExt, _u8buf(loc), len(loc), langtype.encode())
 

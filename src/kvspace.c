@@ -642,28 +642,27 @@ static void p2_atfork_install(void) {
 #define P2_VIEW_GUARD(kv) ((kv)->quiesced || P2_FORK_GUARD(kv))
 
 /* 固定头直读辅助：校验 value 是合法 16 字节头 + 总长自洽；产出头。
-   reserved/padding 非零或总长溢出即失败——旧 8 字节 wire 的 body 首字节会落进
-   padding 或被当成超长 attrslen，因此在这里就被挡住，不做兼容。 */
+   padding（10-15 全 6 字节）非零或总长溢出即失败——旧 8 字节 wire 的 body 首字节会
+   落进 padding 或被当成超长 attrslen，因此在这里就被挡住，不做兼容。 */
 static int head_of(const uint8_t *val, int32_t val_len, kvspaceXvalueHead *out) {
     if (!val || val_len < (int32_t)KVSPACE_XVALUE_HEAD_LEN)
         return -1;
     memcpy(out, val, sizeof *out);
-    /* reserved、padding 与 layout 的合法性由 `TotalLen` 一处判掉（它同时算
-       总长、溢出与布局值），这里不再自己比枚举上界——旧模型那两句
-       `storetype > ST_VARLEN || ptr > PTR_EXT` 的对应字段已经不存在。 */
+    /* padding 与总长由 `TotalLen` 一处判掉（它同时算溢出与 padding 为零）。
+       head 里已没有 `reserved` 与 `layout` 两个字段，旧模型那两句
+       `storetype > ST_VARLEN || ptr > PTR_EXT` 的对应字段也不存在。 */
     const uint64_t total = kvspaceXvalueHeadTotalLen(out);
     if (total == 0 || total > (uint64_t)val_len)
         return -1;
-    /* tag 2 的归属在这里守：`layout == CAPACITY` 必须有且 reallen<=bodylen；
-       其它 layout 出现它就是「有定义但此布局下无意义」，同样拒绝
-       （与 Rust 侧同一规则）。
-       历史 wire 的 attr 尾部残余字节不算畸形——扫描器与 Rust 同语义，忽略不足
-       一条记录的尾巴。 */
+    /* attr 区在这里整体过一遍：tag 2（旧 reallen）出现即拒绝——那是已删除的
+       格式，把它误读成有效长度会让跨版本读到错数据。head 没有 layout/reserved
+       位可判，bodylen 就是有效长度。历史 wire 的 attr 尾部残余字节不算畸形——
+       扫描器与 Rust 同语义，忽略不足一条记录的尾巴。 */
     {
-        uint64_t effective = 0;
-        if (kvspace_c_effective_len(val, total, &effective) != 0)
+        const uint8_t *langtype = NULL;
+        uint16_t langtype_len = 0;
+        if (kvspaceXvalueHeadScan(val, total, &langtype, &langtype_len) != 0)
             return -1;
-        (void)effective;
     }
     return 0;
 }
@@ -700,11 +699,18 @@ int kvspaceShmViewFromRef(kvspace_t *kv, const kvspaceRef_t *ref,
     kv_gens_t *g = gens_at(kv, id);
     if (!g)
         return -1;
+    /* `value_len` 就是 `bodylen`：wire 里不再有「容量」这回事（物理容量是后端
+       的分配属性）。仍然过一遍 `EffectiveLen`，好让畸形 wire 在建立 token 时
+       就失败，而不是等到写。 */
+    uint64_t effective = 0;
+    if (kvspace_c_effective_len(raw, cap, &effective) != 0 ||
+        effective > UINT32_MAX)
+        return -1;
     uint32_t gen = __atomic_load_n(&g->struct_gen, __ATOMIC_ACQUIRE);
     tok->head = raw;
     tok->body = raw + KVSPACE_XVALUE_HEAD_LEN;
     tok->headlen = KVSPACE_XVALUE_HEAD_LEN;
-    tok->value_len = (uint32_t)kvspaceXvalueHeadLen(&w);
+    tok->value_len = (uint32_t)effective;
     tok->cap = cap;
     tok->body_cap = cap - KVSPACE_XVALUE_HEAD_LEN;
     tok->struct_gen = gen;
@@ -822,6 +828,7 @@ int kvspaceShmViewWrite(kvspace_t *kv, kvspaceViewToken_t *tok,
         return -1;
     if (kvspaceShmViewCheck(kv, tok) != 0)
         return 1;
+    /* 判据是 `bodylen`（= 有效长度）：等长原地写，短于 body_cap 只是物理余量。 */
     kvspaceXvalueHead cur;
     memcpy(&cur, tok->head, sizeof cur);
     if ((uint64_t)len != kvspaceXvalueHeadLen(&cur) || len > tok->body_cap)
@@ -2952,15 +2959,8 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
             if (kvspace_c_reference_of(
                     hs, sbo_allocated_size(kv->sbo_meta, off)) ==
                 KVSPACE_XVALUE_REFERENCE_INLINE) {
-                /*
-                 * **`len` 是有效长度，不是 `bodylen`。**
-                 *
-                 * 旧模型里 `kvspaceXvalueHeadLen` 就是有效长度（storetype 4 的
-                 * 容量语义还没进来）。新布局把两者拆开：`bodylen` 在
-                 * `LAYOUT_CAPACITY` 下是**容量**，有效长度在 attr tag 2。
-                 * 用 `bodylen` 当上界会允许写到有效区之外——那是静默写脏数据，
-                 * 比越界更糟（越界至少会崩）。
-                 */
+                /* `len` 就是 `bodylen`：wire 里没有容量之说，容量是后端的物理
+                   分配属性。 */
                 uint64_t total_box = sbo_allocated_size(kv->sbo_meta, off);
                 uint64_t len = 0U;
                 if (kvspace_c_effective_len(hs, total_box, &len) != 0)
@@ -2970,7 +2970,6 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
                 uint64_t cap = total_box;
                 /* `offset` 是**整条 wire 的绝对偏移**（与 SetPart 同约定），
                  * 所以上界是 `head + 有效长度`，不是有效长度本身。 */
-                (void)0;
                 if (cap <= data_size - off && len <= cap - KVSPACE_XVALUE_HEAD_LEN &&
                     (uint64_t)offset <= KVSPACE_XVALUE_HEAD_LEN + len &&
                     (uint64_t)buf_len <=
@@ -3109,7 +3108,8 @@ int kvspaceShmXvalueBodyView(kvspace_t *kv, const kvspaceRef_t *ref,
         effective > cap - KVSPACE_XVALUE_HEAD_LEN)
         return -1;
     /* status: 文本形态（base kind 为 char）+ 有效长度 ≤16 + 物理容量 ≥80。
-       `bodylen` 在容量形态下是容量，不能当内容长度用（见 XValueHead线格式）。 */
+       容量只看**物理分配尺寸**（`sbo_allocated_size`，就是上面的 `cap`），wire
+       里只有有效长度；`effective` 即 bodylen。 */
     if (is_vthread_status_key(key_fallback)) {
         const uint8_t *status_langtype = NULL;
         const uint16_t status_langtype_len =
@@ -3396,7 +3396,7 @@ int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
                             const char *langtype, uint8_t **body) {
     if (!kv || !key || !body || body_len < 0)
         return -1;
-    if (body_cap > INT32_MAX - 32)
+    if (body_cap > INT32_MAX - 32 || body_cap < (uint64_t)body_len)
         return -1;
     *body = NULL;
     if (kv_sync(kv) != 0)
@@ -3409,12 +3409,12 @@ int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
      *
      * 上游头把这件事定死了：`NewPtr`/`NewExt` 是唯一知道「这个值是引用」的构造点，
      * 它们替调用方补 `*`/`@` 前缀（`xvalue_head.h:221-223`）；`Reserve` 不补前缀，
-     * 只做「占位 + layout 推导」。所以 ref≠0 时必须走 NewPtr/NewExt，不能拿
+     * 只做「占位 + 容量推导」。所以 ref≠0 时必须走 NewPtr/NewExt，不能拿
      * Reserve 造一条普通值再假装它是引用——那样 langtype 里没有前缀，读侧会把它
      * 当普通值处理。
      *
-     * layout 由 `NewSlack`/`Reserve` 内部按 `cap > len` 推导（3.3 裁决），
-     * 本函数不再传 storetype。
+     * 容量不是 wire 的属性（wire 只有 bodylen = 有效长度），物理容量由本函数的
+     * `reserve` 参数交给存储后端；本函数不传 storetype。
      */
     if (ref > 2U)
         return -1;
@@ -3447,8 +3447,8 @@ int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
     }
     uint8_t *value = NULL;
     uint64_t total = 0;
-    if (kvspaceXvalueHeadReserve((uint64_t)body_len, body_cap,
-                                 effective_langtype, &value, &total) != 0)
+    if (kvspaceXvalueHeadReserve((uint64_t)body_len, effective_langtype,
+                                 &value, &total) != 0)
         return -1;
     if (total > INT32_MAX) {
         free(value);
@@ -4014,7 +4014,7 @@ int kvspaceShmExtindex(kvspace_t *kv, const char *p, const char *ep,
     if (source_len >= (int32_t)KVSPACE_XVALUE_HEAD_LEN) {
         kvspaceXvalueHead sh;
         memcpy(&sh, source, sizeof sh);
-        /* 合法性只剩「head 自洽」：`TotalLen` 一并校验 padding 与 layout。 */
+        /* 合法性只剩「head 自洽」：`TotalLen` 一并校验 padding 与总长。 */
         if (kvspaceXvalueHeadTotalLen(&sh) != 0) {
             const uint64_t stotal = kvspaceXvalueHeadTotalLen(&sh);
             if (stotal != 0 && stotal <= (uint64_t)source_len)

@@ -22,10 +22,15 @@ typedef struct kvspace kvspace_t;
  *   5 = ART 112-byte block;
  *   6 = XValue fixed 8-byte header + inline attr region (#566/#571, incompatible
  *       with format 5) plus header list_gen for cross-process List cache invalidation.
- *   7 = **16 字节 head**（`[bodylen:u64][attrslen:u16][reserved:u16][layout:u8][padding:3]`，
- *       与 `kvspace/include/kvspace/xvalue_head.h` 一致）。6 的 8 字节 head 不再兼容。
+ *   7 = 16 字节 head（`[bodylen:u64][attrslen:u16][reserved:u16][layout:u8][padding:3]`）。
+ *   8 = **16 字节 head，10-15 全为 padding**（`[bodylen:u64][attrslen:u16][padding:6]`，
+ *       与 `kvspace/include/kvspace/xvalue_head.h` 一致）：删除 `reserved` 与 `layout`，
+ *       bodylen 是容量还是有效长度由 langtype 判（bufferarray ⇒ 容量，此时有效长度在
+ *       attr tag 2），存储层只校验 tag 2 的形状，不按 layout 判归属。
+ *       7 写的 store 在 byte12 上是 layout=1（容量值非零），按 8 读会落进 padding
+ *       被判非法——所以必须升版本号硬拒，不能原地兼容。
  * Incompatible older versions fail hard on open with a rebuild hint (no migration). */
-#define KVSPACE_FORMAT_VERSION 7
+#define KVSPACE_FORMAT_VERSION 8
 
 /* 对齐 kvspace/include/kvspace/kvspace.h：叶子 + 目录祖先。 */
 typedef struct {

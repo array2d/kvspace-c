@@ -41,23 +41,27 @@ This section mirrors `kvspace/include/kvspace/xvalue_head.h` verbatim — that h
 single source of truth for the wire layout.
 
 ```
-[bodylen:u64 le @0-7][attrslen:u16 le @8-9][reserved:u16 le @10-11]
-[layout:u8 @12][padding:3 @13-15][body @16][attr @16+bodylen]
+[bodylen:u64 le @0-7][attrslen:u16 le @8-9][padding:6 @10-15]
+[body @16][attr @16+bodylen]
 attr  = records, no length prefix      (attrslen is in the head — a second prefix would be a second truth)
-record = [tag:u8][len:u16 le][data]    tag 1 = langtype (kindexpr); tag 2 = reallen; 3+ reserved
-total = 16 + bodylen + attrslen       (attrslen <= UINT16_MAX; reserved must be zero)
+record = [tag:u8][len:u16 le][data]    tag 1 = langtype (kindexpr); tags 3+ reserved
+total = 16 + bodylen + attrslen       (attrslen <= UINT16_MAX; padding must be zero)
 ```
 
-- **`bodylen` 的语义由 `layout` 决定**：`layout = 0`（LENGTH）时它就是有效长度；
-  `layout = 1`（CAPACITY）时它是**容量**，有效长度在 attr tag 2（`reallen`）。
-  `reserved` 与 `padding` 必须为零，非零即非法。
-- **没有 storetype / ptr 字段**：存储形态与「是不是引用」都从 langtype 推出——
+- **`bodylen` 恒为有效字节数**，没有第二个长度来源。容量是存储后端的物理分配属性
+  （`WriteNewPlace` 的 `body_cap` / box 尺寸），不进入 wire。10-15 六个字节只是
+  padding，必须为零，非零即非法。
+- **没有 storetype / ptr / layout 字段**：存储形态与「是不是引用」都从 langtype 推出——
   langtype 首字节 `*` 是 Ptr、`@` 是 Ext，其余是普通值。
 - langtype (kindexpr) is the tag-1 record of the attr region; no record = untyped.
-- tag 2 的归属是**排他**的：`layout = CAPACITY` 必须恰有一条，其它 layout 必须不带。
-- Values are built with the `kvspaceXvalueHeadNew*` constructors. `kvspaceSetValue`
-  rejects values whose attr region is missing or runs past the value.
-- Store format version 6 (this wire). Stores written by older versions are refused at open; rebuild them.
+- **没有 tag 2**：早期 wire 的 `reallen`（容量形态的有效长度）已删除，出现即拒
+  ——`kvspaceXvalueHeadScan` 是唯一的拒绝闸口，`EffectiveLen` 直接返回 `bodylen`。
+- Values are built with the `kvspaceXvalueHeadNew*` constructors (no capacity
+  argument: `Reserve(body_len, langtype)` 只产 `body_len` 字节零 body）。`kvspaceSetValue`
+  rejects values whose attr region is missing, runs past the value, or carries tag 2.
+- Store format version 8 (this wire). Stores written by older versions are refused at
+  open; rebuild them. Version 7 wrote `layout = 1` into wire byte 12, which is padding
+  now — it is rejected as nonzero padding, which is why the bump cannot be avoided.
 
 ## Tests
 

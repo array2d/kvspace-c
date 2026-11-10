@@ -185,8 +185,9 @@ int kvspaceWriteInPlace(void *h, const char *key, int resolve,
  * 签名必须与公开头逐参数对齐：前端 `frontend.c` 用 `dlsym` 按名字加载这个函数，
  * 少一个参数就是调用约定错位（未定义行为，编译不报）。
  *
- * 新布局没有 storetype 位：`layout` 由 `body_cap != body_len` 推出，引用性由
- * `ref` 决定（构造器给 langtype 加 `*`/`@` 前缀）。所以本函数**不读**该参数、
+ * 新布局没有 storetype 位：`body_cap != body_len` 只决定 effective_len 写进
+ * attr tag 2（容量形态），引用性由 `ref` 决定（构造器给 langtype 加 `*`/`@`
+ * 前缀）。所以本函数**不读**该参数、
  * 不校验它的取值、也不往下传——**它就是一个本期不再携带信息的参数**。
  * 加一条 `storetype <= …` 的检查只会让它看起来还有语义，并把「传了奇怪值」
  * 变成一条新的失败路径。
@@ -343,7 +344,7 @@ int kvspaceNewChar(const uint8_t *bytes, uint32_t len, const char *langtype,
                    uint8_t **out, uint32_t *out_len) {
     uint8_t *value = NULL;
     uint64_t total = 0;
-    int rc = kvspaceXvalueHeadNewSlack(bytes, len, len, langtype, &value, &total);
+    int rc = kvspaceXvalueHeadNewSlack(bytes, len, langtype, &value, &total);
     return rc == 0 ? finish(value, total, out, out_len) : 1;
 }
 

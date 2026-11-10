@@ -7,7 +7,7 @@
 //! kv.mkindex("/t/", 0);
 //! kv.set("/t/x", &xvalue::int64(42));
 //! let v = kv.get("/t/x").unwrap();
-//! assert_eq!(xvalue::from_wire(&v), (0, 0, &[42, 0, 0, 0, 0, 0, 0, 0][..]));
+//! assert_eq!(xvalue::from_wire(&v), (xvalue::REF_INLINE, &[42, 0, 0, 0, 0, 0, 0, 0][..]));
 //! ```
 
 use std::ffi::{CStr, CString};
@@ -53,10 +53,9 @@ mod ffi {
             err: *mut c_char,
             err_cap: u32,
         ) -> i32;
-        // Header constructors (#566/#571: fixed 8-byte header + body + attr region;
-        // empty string = untyped; malloc-allocated output freed by caller).
+        // Head constructors（固定 16 字节 head + body + attr 区；空字符串 = 无类型；
+        // 输出由 malloc 分配，调用方负责 free）。
         pub fn kvspaceXvalueHeadNewScalar(
-            storetype: u8,
             raw: *const u8,
             raw_len: u32,
             langtype: *const c_char,
@@ -66,7 +65,6 @@ mod ffi {
         pub fn kvspaceXvalueHeadNewSlack(
             data: *const u8,
             data_len: u64,
-            cap: u64,
             langtype: *const c_char,
             out: *mut *mut u8,
             out_len: *mut u64,
@@ -92,21 +90,24 @@ mod ffi {
 
 // ── xvalue helpers ─────────────────────────────────────────────
 //
-// #566/#571: Fixed 8-byte header [len:u48][storetype][ptr], body at offset 8, attr at 8+len
-// ([attr_len:u16][records], tag 1 = langtype), total = 8 + len + attr_len. Constructed via C
-// kvspaceXvalueHeadNew*; helpers here write untyped values (empty attr).
+// 固定 16 字节 head：[bodylen:u64 LE@0][attrslen:u16 LE@8][padding:6@10-15]，body@16，
+// attr 紧随 body 且没有长度前缀，total = 16 + bodylen + attrslen。
+// record = [tag:u8][len:u16 LE][data]，tag 1 = langtype；tag 2（旧 reallen）已删除，出现即拒。
+// 构造走 C 的 kvspaceXvalueHeadNew*；这里的 helper 写无类型值（空 attr）。
 
 pub mod xvalue {
     use super::ffi;
     use super::*;
 
-    pub const ST_SHORT: u8 = 0;
-    pub const ST_SLACK: u8 = 1;
-    pub const ST_EXT: u8 = 3;
-    pub const PTR_INLINE: u8 = 0;
-    pub const PTR_PTR: u8 = 1;
-    pub const PTR_EXT: u8 = 2;
-    pub const HEAD_LEN: usize = 8;
+    /// 引用性：head 里没有 ptr 位，由 langtype 首字节的 `*` / `@` 前缀表达。
+    pub const REF_INLINE: u8 = 0;
+    pub const REF_PTR: u8 = 1;
+    pub const REF_EXT: u8 = 2;
+    pub const HEAD_LEN: usize = 16;
+    pub const PADDING_LEN: usize = 6;
+    pub const ATTR_TAG_LANGTYPE: u8 = 1;
+    /// 旧 wire 的 tag 2（reallen）：已删除，出现即拒。
+    pub const BANNED_ATTR_TAG_REALLEN: u8 = 2;
     /// Empty langtype (untyped, empty attr).
     const NO_TYPE: *const c_char = b"\0".as_ptr() as *const c_char;
 
@@ -122,7 +123,7 @@ pub mod xvalue {
         let mut total: u64 = 0;
         let raw = v.to_le_bytes();
         let rc = unsafe {
-            ffi::kvspaceXvalueHeadNewScalar(ST_SHORT, raw.as_ptr(), 8, NO_TYPE, &mut out, &mut total)
+            ffi::kvspaceXvalueHeadNewScalar(raw.as_ptr(), 8, NO_TYPE, &mut out, &mut total)
         };
         if rc != 0 {
             return Vec::new();
@@ -134,7 +135,7 @@ pub mod xvalue {
         let mut total: u64 = 0;
         let raw = v.to_le_bytes();
         let rc = unsafe {
-            ffi::kvspaceXvalueHeadNewScalar(ST_SHORT, raw.as_ptr(), 8, NO_TYPE, &mut out, &mut total)
+            ffi::kvspaceXvalueHeadNewScalar(raw.as_ptr(), 8, NO_TYPE, &mut out, &mut total)
         };
         if rc != 0 {
             return Vec::new();
@@ -145,33 +146,26 @@ pub mod xvalue {
         let mut out: *mut u8 = ptr::null_mut();
         let mut total: u64 = 0;
         let rc = unsafe {
-            ffi::kvspaceXvalueHeadNewSlack(
-                s.as_ptr(),
-                s.len() as u64,
-                s.len() as u64,
-                NO_TYPE,
-                &mut out,
-                &mut total,
-            )
+            ffi::kvspaceXvalueHeadNewSlack(s.as_ptr(), s.len() as u64, NO_TYPE, &mut out, &mut total)
         };
         if rc != 0 {
             return Vec::new();
         }
         take(out, total)
     }
-    /// Directory value (empty-body SHORT header).
+    /// Directory value (empty body, untyped).
     pub fn index() -> Vec<u8> {
         let mut out: *mut u8 = ptr::null_mut();
         let mut total: u64 = 0;
         let rc = unsafe {
-            ffi::kvspaceXvalueHeadNewScalar(ST_SHORT, ptr::null(), 0, NO_TYPE, &mut out, &mut total)
+            ffi::kvspaceXvalueHeadNewScalar(ptr::null(), 0, NO_TYPE, &mut out, &mut total)
         };
         if rc != 0 {
             return Vec::new();
         }
         take(out, total)
     }
-    /// Pointer value (ptr=PTR): body = target key.
+    /// Pointer value：body = target key，构造器给 langtype 补 `*` 前缀。
     pub fn link(target: &str) -> Vec<u8> {
         let mut out: *mut u8 = ptr::null_mut();
         let mut total: u64 = 0;
@@ -183,7 +177,7 @@ pub mod xvalue {
         }
         take(out, total)
     }
-    /// External locator (EXT class): body = locator.
+    /// External locator：body = locator，构造器给 langtype 补 `@` 前缀。
     pub fn ext(locator: &str) -> Vec<u8> {
         let mut out: *mut u8 = ptr::null_mut();
         let mut total: u64 = 0;
@@ -202,38 +196,54 @@ pub mod xvalue {
         take(out, total)
     }
 
-    /// Read fixed header -> (ref, storetype, body) excluding attr; returns (0, 0, &[]) if invalid.
-    pub fn from_wire(data: &[u8]) -> (u8, u8, &[u8]) {
-        if data.len() < HEAD_LEN + 2 {
-            return (0, 0, &[]);
+    /// 读 wire -> (ref, body)；畸形返回 (REF_INLINE, &[])。
+    ///
+    /// 判据全部来自 head 本身：padding 10-15 全零、16+bodylen+attrslen == len(data)、
+    /// attr 区逐条 record 自洽且不含已删除的 tag 2。ref 由 langtype 首字节决定。
+    pub fn from_wire(data: &[u8]) -> (u8, &[u8]) {
+        if data.len() < HEAD_LEN {
+            return (REF_INLINE, &[]);
         }
         let mut body_len: u64 = 0;
-        for (i, b) in data[..6].iter().enumerate() {
+        for (i, b) in data[..8].iter().enumerate() {
             body_len |= (*b as u64) << (8 * i);
         }
-        let storetype = data[6];
-        let ptr = data[7];
+        let attrs_len = u16::from_le_bytes([data[8], data[9]]) as usize;
+        if data[10..10 + PADDING_LEN].iter().any(|b| *b != 0) {
+            return (REF_INLINE, &[]);
+        }
         let Ok(blen) = usize::try_from(body_len) else {
-            return (0, 0, &[]);
+            return (REF_INLINE, &[]);
         };
         let Some(a) = HEAD_LEN.checked_add(blen) else {
-            return (0, 0, &[]);
+            return (REF_INLINE, &[]);
         };
-        if storetype > ST_EXT || ptr > PTR_EXT || a + 2 > data.len() {
-            return (0, 0, &[]);
-        }
-        let attr_len = u16::from_le_bytes([data[a], data[a + 1]]) as usize;
-        if attr_len < 2 || a + attr_len != data.len() {
-            return (0, 0, &[]);
-        }
-        let r#ref = if ptr == PTR_PTR {
-            1
-        } else if ptr == PTR_EXT {
-            2
-        } else {
-            0
+        let Some(total) = a.checked_add(attrs_len) else {
+            return (REF_INLINE, &[]);
         };
-        (r#ref, storetype, &data[HEAD_LEN..a])
+        if total != data.len() {
+            return (REF_INLINE, &[]);
+        }
+        let attr = &data[a..total];
+        let mut p = 0usize;
+        let mut langtype: &[u8] = &[];
+        while p + 3 <= attr.len() {
+            let tag = attr[p];
+            let rlen = u16::from_le_bytes([attr[p + 1], attr[p + 2]]) as usize;
+            if p + 3 + rlen > attr.len() || tag == BANNED_ATTR_TAG_REALLEN {
+                return (REF_INLINE, &[]);
+            }
+            if tag == ATTR_TAG_LANGTYPE {
+                langtype = &attr[p + 3..p + 3 + rlen];
+            }
+            p += 3 + rlen;
+        }
+        let r#ref = match langtype.first() {
+            Some(b'*') => REF_PTR,
+            Some(b'@') => REF_EXT,
+            _ => REF_INLINE,
+        };
+        (r#ref, &data[HEAD_LEN..a])
     }
 }
 

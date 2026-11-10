@@ -22,8 +22,7 @@
 /* 无类型变长值（用于 /a/s 这类普通槽：它不要求文本 langtype）。 */
 static uint8_t *slack(const char *s, uint64_t *n) {
     uint8_t *v = NULL;
-    if (kvspaceXvalueHeadNewSlack( (const uint8_t *)s, strlen(s),
-                          strlen(s), "", &v, n) != 0)
+    if (kvspaceXvalueHeadNewSlack((const uint8_t *)s, strlen(s), "", &v, n) != 0)
         return NULL;
     return v;
 }
@@ -39,8 +38,7 @@ static uint8_t *slack(const char *s, uint64_t *n) {
  */
 static uint8_t *text_slack(const char *s, uint64_t *n) {
     uint8_t *v = NULL;
-    if (kvspaceXvalueHeadNewSlack((const uint8_t *)s, strlen(s), strlen(s),
-                                  "char/utf8", &v, n) != 0)
+    if (kvspaceXvalueHeadNewSlack((const uint8_t *)s, strlen(s), "char/utf8", &v, n) != 0)
         return NULL;
     return v;
 }

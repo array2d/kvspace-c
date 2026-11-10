@@ -12,7 +12,8 @@
  * 「变长」由 langtype 表达，引用性由 langtype 的 `*`/`@` 前缀表达。所以：
  *   - 旧「非 SLACK 必须失败」→ **不再成立**（新判据下非引用值走快路径）；
  *   - 旧「ptr 非 INLINE 不得进快路径」→ **保留**，判据换成 langtype 前缀；
- *   - 旧「storetype 非法（>3）」→ 换成「layout 非法（>1）」。
+ *   - 旧「storetype 非法（>3）」→「layout 非法（>1）」→ 现在 head 没有布局位，
+ *     换成「padding 非零 / 总长不自洽」。
  * 改的是判据来源，测试意图（不该进快路径的绝不进）没变。 */
 
 #define _GNU_SOURCE
@@ -46,17 +47,16 @@ static void mkpc(char *out, size_t len) {
 }
 
 /*
- * 写入一条**容量为 CAP 的文本值**（有效长度 = n）。
+ * 写入一条有效长度 n 的文本值。
  *
- * 关键：`NewSlack(body, n, CAP)` 在 `CAP > n` 时产出 `LAYOUT_CAPACITY`，
- * **body 区是 CAP 字节**（有效长度记在 attr tag 2）。旧模型这里是
- * `storetype == SLACK`，body 区只有 n 字节、cap 只是物理预留——判据变了，
- * 所以下面所有 offset 计算都以 CAP（body 区大小）为界，不是 n。
+ * `NewSlack` 不再有容量参数：body 区就是 n 字节，容量是存储后端的物理分配属性
+ * （这里 CAP 只用作测试缓冲区上界）。所以下面所有 offset 计算以 n 为界——越界
+ * 判定看的正是 bodylen。
  */
 static int put(kvspace_t *kv, const char *key, const char *body, uint64_t n) {
     uint8_t *v = NULL;
     uint64_t vl = 0;
-    if (kvspaceXvalueHeadNewSlack((const uint8_t *)body, n, CAP, "char/utf8",
+    if (kvspaceXvalueHeadNewSlack((const uint8_t *)body, n, "char/utf8",
                                   &v, &vl) != 0)
         return -1;
     int rc = kvspaceShmSet(kv, key, v, (int32_t)vl);
@@ -91,7 +91,7 @@ int main(void) {
 
     /* 1. 正常路径：长度边界与跨档；每次重写整值后 part-write 覆盖正文。 */
     static const size_t lens[] = {9, 10, 39, 99, 100, 101, 255, 256, 9};
-    char s[512], body[CAP];
+    char s[512];
     for (size_t i = 0; i < sizeof lens / sizeof lens[0]; i++) {
         mkpc(s, lens[i]);
         CHECK(put(kv, "/p/pc", s, lens[i]) == 0, "set len=%zu", lens[i]);
@@ -117,11 +117,10 @@ int main(void) {
         CHECK(memcmp(got, nv, lens[i]) == 0, "body2 len=%zu", lens[i]);
     }
 
-    /* 2. 越界：offset+buf_len 超过**有效长度**必须拒绝且不写。
+    /* 2. 越界：offset+buf_len 超过 `bodylen` 必须拒绝且不写。
      *
-     * 上界是有效长度 16（`put` 的 n），不是容量 CAP 256：值虽然分配了 256 字节
-     * body 区，但有效内容只有 16 字节，写在它之外就是往「容量余量」里塞数据，
-     * 读的人按有效长度读不到，等于静默丢写。 */
+     * `bodylen` 就是有效长度（16），wire 里没有第二个长度来源。写在它之外
+     * 既越界又会让读方按 bodylen 读不到，等于静默丢写。 */
     {
         mkpc(s, 16);
         CHECK(put(kv, "/p/oob", s, 16) == 0, "oob set");
@@ -154,8 +153,11 @@ int main(void) {
         int32_t len = 0;
         uint8_t *d = (uint8_t *)raw(kv, "/p/bad", &len);
         CHECK(d != NULL && len >= HEAD, "bad raw");
-        uint8_t save[HEAD];
-        memcpy(save, d, sizeof save);
+        /* 整条 wire 快照（head + body + attr）：下面的畸形用例会改 attr 区，
+           只存 head 无法还原。 */
+        uint8_t *save = (uint8_t *)malloc((size_t)len);
+        CHECK(save != NULL, "save alloc");
+        memcpy(save, d, (size_t)len);
         kvspaceRef_t ref;
         CHECK(kvspaceShmResolveRef(kv, "/p/bad", &ref) == 0, "bad resolve");
         const uint8_t *nv = (const uint8_t *)"ZZZZ";
@@ -166,24 +168,21 @@ int main(void) {
          * 「这个值长度可变、可原地改」，新布局里 head 没有这个字段——「变长」
          * 由 langtype 决定，而 SetPartByRef 不解析 langtype。
          *
-         * 现在快路径的前置只有两条：**不是引用** + 容量自洽。所以原来这条
-         * 「非 SLACK 必须失败」的用例不再成立，换成它在新判据下的对应物：
-         * **引用态不得进快路径**（引用值是路径文本，原地改它的字节没有意义）。
+         * 快路径前置：**不是引用** + head 自洽（padding 零、attr 无 tag 2）+
+         * offset/buf_len 在 bodylen 内且不跨 box。所以「非 SLACK 必须失败」的
+         * 用例换成新判据下的对应物：引用态不得进快路径、脏 padding 不得进。
          */
         /*
-         * 本值是 CAPACITY 布局：有效长度在 attr tag 2，**清掉 attrs 会让它变成
-         * 畸形**（CAPACITY 必须带 tag 2）。所以这里保留 attrs、只把 langtype
-         * 记录去掉不现实——改为断言「畸形 head 一律不得进快路径」，
-         * 这比原来那条「非 SLACK 必须失败」更贴合新判据：快路径只接受自洽 head。
+         * padding 弄脏：head 不自洽，快路径必须绕过它（旧路径的
+         * `head_of` 也会拒，所以整体结果是失败，但绝不能写坏数据）。
          */
         kvspaceXvalueHead tmp;
         memcpy(&tmp, save, sizeof tmp);
-        kvspaceXvalueHeadSetAttrsLen(&tmp, 0);
+        tmp.padding[0] = 1;
         memcpy(d, &tmp, sizeof tmp);
-        /* 无 langtype = 非引用 ⇒ 这一条在新判据下**应当成功**（旧模型说必须失败）。 */
         int rc = kvspaceShmSetPartByRef(kv, &ref, "/p/bad", HEAD, nv, 4);
-        CHECK(rc != 0, "malformed head (CAPACITY without tag 2) must not take the fast path");
-        memcpy(d, save, HEAD);
+        CHECK(rc != 0, "head with nonzero padding must not take the fast path");
+        memcpy(d, save, (size_t)len);
 
         /* 引用态（langtype 带 `*`）不得进快路径——这是旧「ptr 非 INLINE」那条的直接对应物。 */
         {
@@ -192,7 +191,6 @@ int main(void) {
             uint64_t pvl = 0;
             kvspaceXvalueHead ph;
             memset(&ph, 0, sizeof ph);
-            ph.layout = KVSPACE_XVALUE_LAYOUT_LENGTH;
             kvspaceXvalueHeadSetLen(&ph, 2);
             kvspaceXvalueHeadSetAttrsLen(&ph, (uint16_t)(3 + sizeof prefixed - 1));
             memcpy(d, &ph, sizeof ph);
@@ -211,25 +209,33 @@ int main(void) {
             memset(got, 0, sizeof got);
             get_part(kv, "/p/bad", HEAD, 4, got);
             CHECK(rc != 0 || memcmp(got, "ZZZZ", 4) == 0, "reference fallback");
-            memcpy(d, save, HEAD);
+            memcpy(d, save, (size_t)len);
         }
 
-        /* layout 非法（>1）：head 不自洽，拒绝。这是旧「storetype 非法（>3）」的对应物。 */
-        memset(&tmp, 0, sizeof tmp);
-        tmp.layout = 9;
-        memcpy(d, &tmp, sizeof tmp);
-        rc = kvspaceShmSetPartByRef(kv, &ref, "/p/bad", HEAD, nv, 4);
-        CHECK(rc != 0, "invalid layout must fail");
-        memcpy(d, save, HEAD);
+        /* attr 区出现旧 tag 2（reallen）：那是已删除的格式，head_of 扫描即拒。
+           这是旧「storetype 非法（>3）」→「layout 非法」的第三形态。 */
+        {
+            kvspaceXvalueHead ah;
+            memcpy(&ah, save, sizeof ah);
+            const uint64_t old_attrs = kvspaceXvalueHeadAttrsLen(&ah);
+            uint8_t *a = d + HEAD + kvspaceXvalueHeadLen(&ah);
+            a[0] = 2; /* 旧 tag 2 */
+            a[1] = 8; a[2] = 0;
+            memset(a + 3, 0, 8);
+            kvspaceXvalueHeadSetAttrsLen(&ah, (uint16_t)(old_attrs + 11));
+            memcpy(d, &ah, sizeof ah);
+            rc = kvspaceShmSetPartByRef(kv, &ref, "/p/bad", HEAD, nv, 4);
+            CHECK(rc != 0, "old tag2 in attr must fail");
+            memcpy(d, save, (size_t)len);
+        }
 
         /* len 越界（声称超过映射剩余空间）：拒绝 */
         memset(&tmp, 0, sizeof tmp);
-        tmp.layout = KVSPACE_XVALUE_LAYOUT_LENGTH;
         kvspaceXvalueHeadSetLen(&tmp, 0xFFFF);
         memcpy(d, &tmp, sizeof tmp);
         rc = kvspaceShmSetPartByRef(kv, &ref, "/p/bad", HEAD, nv, 4);
         CHECK(rc != 0, "len overflow must fail");
-        memcpy(d, save, HEAD);
+        memcpy(d, save, (size_t)len);
 
         /* len 大于 box 物理容量但仍在全局映射内：必须按 per-box cap 回退，
          * 不得跨 box 写入。offset=512 落在 box 外。 */
@@ -237,14 +243,13 @@ int main(void) {
             char lead[8] = {0}, trail[8] = {0};
             memcpy(lead, d + 512, 4);
             memset(&tmp, 0, sizeof tmp);
-            tmp.layout = KVSPACE_XVALUE_LAYOUT_LENGTH;
             kvspaceXvalueHeadSetLen(&tmp, 4096);
             memcpy(d, &tmp, sizeof tmp);
             rc = kvspaceShmSetPartByRef(kv, &ref, "/p/bad", 512, nv, 4);
             memcpy(trail, d + 512, 4);
             CHECK(rc != 0, "len>box_cap must fail");
             CHECK(memcmp(lead, trail, 4) == 0, "no cross-box write");
-            memcpy(d, save, HEAD);
+            memcpy(d, save, (size_t)len);
         }
 
         /* 恢复后快路径仍可用 */
