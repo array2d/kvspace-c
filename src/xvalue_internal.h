@@ -10,12 +10,12 @@
 #ifndef KVSPACE_C_XVALUE_INTERNAL_H
 #define KVSPACE_C_XVALUE_INTERNAL_H
 
-#include <kvspace/xvalue_head.h>
+#include <kvspace/kvlang_xvalue.h>
 
 /* 引用性 —— 从 langtype 的**首字节**判定。
  *
  * 旧布局把「是不是引用」放在 head 的 `ptr` 字节里；新布局没有这个字段，
- * 它由 langtype 前缀 `*`（Ptr）与 `@`（Ext）表达（见 `xvalue_head.h` 里
+ * 它由 langtype 前缀 `*`（Ptr）与 `@`（Ext）表达（见 `kvlang_xvalue.h` 里
  * `NewPtr`/`NewExt` 的注释：它们是唯一知道「这个值是引用」的构造点，
  * 构造器补前缀）。
  *
@@ -29,11 +29,64 @@
 #define KVSPACE_XVALUE_REFERENCE_PTR 2
 #define KVSPACE_XVALUE_REFERENCE_EXT 3
 
+/* 已删除的 tag 2（旧 reallen）：任何位置出现都算畸形。
+ * 上游实现里这个常量是私有的（`src/xvalue_head.c`），本仓要在读取路径上
+ * 拒绝它，故在此重复一次。**重复的不是格式知识，是一条拒绝规则**——
+ * 值必须与上游一致（2）。 */
+#define KVSPACE_C_ATTR_TAG_RETIRED_REALLEN 2u
+
+/* 扫完整条 attr 区并取出 tag 1（langtype）：返回 0 成功，-1 畸形。
+ *
+ * 这是本仓的**唯一读取闸口**，替代已被删除的 `kvspaceXvalueHeadScan`。
+ * 为什么不直接用上游的 `kvspaceXvalueGetAttr`：它是「找某个 tag」，
+ * **找到就返回**，不会继续扫后面的记录——于是「tag 1 在前、已废的 tag 2 在后」
+ * 这种畸形会被它放过（实测：`GetAttr(tag1)` 返回 0）。而读取路径要的是
+ * 「整区自洽」这个更强的判据，所以这里自己扫完整区。
+ *
+ * 输出参数都可为 NULL。语义与被删的 Scan 一致：重复 tag 1 取第一条，
+ * 尾部不足一条记录的残余字节忽略（与 Rust 侧同语义）。 */
+static inline int kvspace_c_scan_attrs(const uint8_t *wire, uint64_t wire_len,
+                                       const uint8_t **out_langtype,
+                                       uint16_t *out_langtype_len) {
+    if (out_langtype)
+        *out_langtype = NULL;
+    if (out_langtype_len)
+        *out_langtype_len = 0;
+    if (!wire || wire_len < KVSPACE_XVALUE_HEAD_LEN)
+        return -1;
+    const kvspaceXvalueHead *h = (const kvspaceXvalueHead *)(const void *)wire;
+    const uint64_t total = kvspaceXvalueHeadTotalLen(h);
+    if (total == 0 || total > wire_len)
+        return -1;
+    const uint8_t *p = wire + KVSPACE_XVALUE_HEAD_LEN + kvspaceXvalueHeadLen(h);
+    const uint8_t *end = p + kvspaceXvalueHeadAttrsLen(h);
+    const uint8_t *langtype = NULL;
+    uint16_t langtype_len = 0;
+    while (p + 3 <= end) {
+        const uint8_t tag = p[0];
+        const uint16_t rlen = (uint16_t)((uint16_t)p[1] | ((uint16_t)p[2] << 8));
+        if (p + 3 + rlen > end)
+            return -1;
+        if (tag == KVSPACE_C_ATTR_TAG_RETIRED_REALLEN)
+            return -1; /* 已删除的格式：出现即拒，不猜 */
+        if (tag == KVSPACE_XVALUE_ATTR_TAG_LANGTYPE && !langtype) {
+            langtype = p + 3;
+            langtype_len = rlen;
+        }
+        p += 3 + rlen;
+    }
+    if (out_langtype)
+        *out_langtype = langtype;
+    if (out_langtype_len)
+        *out_langtype_len = langtype_len;
+    return 0;
+}
+
 static inline int kvspace_c_reference_of(const uint8_t *wire, uint64_t wire_len) {
     const uint8_t *langtype = NULL;
     uint16_t langtype_len = 0;
 
-    if (kvspaceXvalueHeadScan(wire, wire_len, &langtype, &langtype_len) != 0)
+    if (kvspace_c_scan_attrs(wire, wire_len, &langtype, &langtype_len) != 0)
         return KVSPACE_XVALUE_REFERENCE_INVALID;
     if (langtype == NULL || langtype_len == 0)
         return KVSPACE_XVALUE_REFERENCE_INLINE; /* 空 langtype = 不是引用 */

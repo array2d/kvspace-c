@@ -1,4 +1,4 @@
-#include <kvspace/xvalue_head.h>
+#include <kvspace/kvlang_xvalue.h>
 #include "xvalue_internal.h"
 
 #include <stdio.h>
@@ -271,15 +271,17 @@ static void test_reallen_rejected(void) {
     const uint8_t *lt = NULL;
     uint16_t ltn = 0;
 
-    /* `kvspaceXvalueHeadScan` 是**拒绝 tag 2 的唯一闸口**（`EffectiveLen` 只读
-       bodylen，不扫 attr；存储层 `head_of` 走 Scan，所以畸形在入场就被挡）。 */
+    /* `kvspace_c_scan_attrs` 是**拒绝 tag 2 的唯一闸口**（`EffectiveLen` 只读
+       bodylen，不扫 attr；存储层 `head_of` 走这个扫描器，所以畸形在入场就被挡）。
+       上游已删除 `kvspaceXvalueHeadScan`，`kvspaceXvalueGetAttr` 不能顶替它——
+       后者找到目标 tag 就返回，不会继续扫后面的记录（见本文件末尾的对照用例）。 */
 
     /* 底线：只有 langtype 一条记录的 wire 通过，EffectiveLen == bodylen。 */
     {
         uint8_t *v = make_wire(8, "char/utf8", 3 + 9, &total);
         CHECK(kvspace_c_effective_len(v, total, &eff) == 0 && eff == 8,
               "effective len is bodylen");
-        CHECK(kvspaceXvalueHeadScan(v, total, &lt, &ltn) == 0 && ltn == 9,
+        CHECK(kvspace_c_scan_attrs(v, total, &lt, &ltn) == 0 && ltn == 9,
               "baseline wire scans clean");
         free(v);
     }
@@ -288,7 +290,7 @@ static void test_reallen_rejected(void) {
     {
         uint8_t *v = make_wire(8, "char/utf8", 3 + 9, &total);
         v = append_reallen(v, total, 8, 5, &total);
-        CHECK(kvspaceXvalueHeadScan(v, total, &lt, &ltn) != 0,
+        CHECK(kvspace_c_scan_attrs(v, total, &lt, &ltn) != 0,
               "tag2 after langtype rejected");
         free(v);
     }
@@ -297,7 +299,7 @@ static void test_reallen_rejected(void) {
     {
         uint8_t *v = make_wire(8, NULL, 0, &total);
         v = append_reallen(v, total, 8, 5, &total);
-        CHECK(kvspaceXvalueHeadScan(v, total, &lt, &ltn) != 0,
+        CHECK(kvspace_c_scan_attrs(v, total, &lt, &ltn) != 0,
               "tag2 alone rejected");
         free(v);
     }
@@ -307,7 +309,7 @@ static void test_reallen_rejected(void) {
         uint8_t *v = make_wire(8, NULL, 0, &total);
         v = append_reallen(v, total, 8, 5, &total);
         v = append_reallen(v, total, 8, 5, &total);
-        CHECK(kvspaceXvalueHeadScan(v, total, &lt, &ltn) != 0,
+        CHECK(kvspace_c_scan_attrs(v, total, &lt, &ltn) != 0,
               "two tag2 records rejected");
         free(v);
     }
@@ -320,7 +322,7 @@ static void test_reallen_rejected(void) {
             w[index] = 1;
             CHECK(kvspace_c_effective_len(w, total, &eff) != 0,
                   "nonzero padding at byte %d rejected", index);
-            CHECK(kvspaceXvalueHeadScan(w, total, &lt, &ltn) != 0,
+            CHECK(kvspace_c_scan_attrs(w, total, &lt, &ltn) != 0,
                   "nonzero padding at byte %d rejected by scan", index);
             free(w);
         }
@@ -329,6 +331,21 @@ static void test_reallen_rejected(void) {
         CHECK(kvspace_c_effective_len(w, total, &eff) == 0 && eff == 8,
               "same wire with zero padding accepted");
         free(w);
+    }
+
+    /* 已废 tag 2 的位置无关性：GetAttr 命中目标 tag 后也必须扫完整区，
+     * 不能因为 tag 2 排在后面就放过畸形 wire。 */
+    {
+        const uint8_t *data = NULL;
+        uint16_t dlen = 0;
+        uint8_t *v = make_wire(8, "char/utf8", 3 + 9, &total);
+        v = append_reallen(v, total, 8, 5, &total);
+        CHECK(kvspaceXvalueGetAttr(v, total, KVSPACE_XVALUE_ATTR_TAG_LANGTYPE,
+                                   &data, &dlen) != 0,
+              "GetAttr 必须拒绝 tag1 之后的 tag2");
+        CHECK(kvspace_c_scan_attrs(v, total, &lt, &ltn) != 0,
+              "扫描器同样拒绝");
+        free(v);
     }
 }
 

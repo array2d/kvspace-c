@@ -1,8 +1,9 @@
 /*
- * kvspace.h — KVSpace C API
+ * kvspace_shm.h — kvspace-c 的 SHM 引擎内部契约（不是公共 ABI）。
  *
- * file-backed mmap, ART 树索引 + slotsboxmalloc 变长存储.
- * 对齐 kvspace-go KVSpace 接口.
+ * file-backed mmap, ART 树索引 + slotsboxmalloc 变长存储。公共 ABI 只有
+ * <kvspace/kvspace.h> 的 12 个符号；本头的 kvspaceShm* 与 kvspace_t 只给
+ * src/kvspace.c 与内部测试使用。
  */
 
 /* Guard must not be KVSPACE_H: that is the canonical ABI header <kvspace/kvspace.h>
@@ -11,6 +12,7 @@
 #define KVSPACE_SHM_H
 
 #include "coord.h"
+#include <kvspace/kvspace.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -24,30 +26,12 @@ typedef struct kvspace kvspace_t;
  *       with format 5) plus header list_gen for cross-process List cache invalidation.
  *   7 = 16 字节 head（`[bodylen:u64][attrslen:u16][reserved:u16][layout:u8][padding:3]`）。
  *   8 = **16 字节 head，10-15 全为 padding**（`[bodylen:u64][attrslen:u16][padding:6]`，
- *       与 `kvspace/include/kvspace/xvalue_head.h` 一致）：删除 `reserved` 与 `layout`，
- *       bodylen 是容量还是有效长度由 langtype 判（bufferarray ⇒ 容量，此时有效长度在
- *       attr tag 2），存储层只校验 tag 2 的形状，不按 layout 判归属。
- *       7 写的 store 在 byte12 上是 layout=1（容量值非零），按 8 读会落进 padding
- *       被判非法——所以必须升版本号硬拒，不能原地兼容。
+ *       与 `kvspace/include/kvspace/kvspace_xvalue.h` 一致）：删除 `reserved` 与 `layout`，
+ *       `bodylen` 恒为有效字节数；容量是存储后端的物理分配属性，不进入 wire。
+ *       7 写的 store 在 byte12 上是 layout=1（非零），按 8 读会落进 padding 被判非法——
+ *       所以必须升版本号硬拒，不能原地兼容。
  * Incompatible older versions fail hard on open with a rebuild hint (no migration). */
 #define KVSPACE_FORMAT_VERSION 8
-
-/* 对齐 kvspace/include/kvspace/kvspace.h：叶子 + 目录祖先。 */
-typedef struct {
-    uint32_t block_id;
-    uint32_t gen;
-    uint32_t parent_id;
-    uint32_t depth;
-} kvspaceRef_t;
-
-/* 与 kvspace/include/kvspace/kvspace.h 的 kvspaceXvalueBodyView_t 逐字段一致。 */
-typedef struct {
-    uint8_t *head;
-    uint32_t headlen;
-    uint8_t *body;
-    uint64_t body_cap;
-    uint64_t cap;
-} kvspaceXvalueBodyView_t;
 
 /* ================================================================
  * 生命周期
@@ -65,49 +49,52 @@ void kvspaceShmClose(kvspace_t *kv);
 // Get: resolve=1 穿透 link，resolve=0 返回 link 本身。
 uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
                        int32_t *out_len);
-int kvspaceShmResolveRef(kvspace_t *kv, const char *key, kvspaceRef_t *ref);
-uint8_t *kvspaceShmGetByRef(kvspace_t *kv, kvspaceRef_t *ref,
-                            const char *key_fallback, int32_t *out_len);
-/* shm slot view：返回映射内 head/body 与整 box 物理容量。0=成功，-1=不可视槽。 */
-int kvspaceShmXvalueBodyView(kvspace_t *kv, const kvspaceRef_t *ref,
-                       const char *key_fallback, kvspaceXvalueBodyView_t *out);
 int kvspaceShmSetPart(kvspace_t *kv, const char *key, uint32_t offset,
                       const uint8_t *buf, uint32_t buf_len);
-int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
-                           const char *key_fallback, uint32_t offset,
-                           const uint8_t *buf, uint32_t buf_len);
 
 // Set: 写入 value（XValue 字节）。总是穿透 link 写入 target。
 int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
                   int32_t val_len);
 int kvspaceShmSetValue(kvspace_t *kv, const char *key, const uint8_t *val,
                        int32_t val_len);
-/* 整值写 by cached ref：ref 失效时退回 key 的完整 SetValue 并重解析。 */
-int kvspaceShmSetValueByRef(kvspace_t *kv, kvspaceRef_t *ref,
-                            const char *key_fallback, const uint8_t *val,
-                            int32_t val_len);
-
-// 零拷贝写原语——返回 SHM 常驻 body 偏移指针供调用方直接写；写即持久，无收尾。
-// WriteInPlace: key 必须已存在、body_len 必须等于原 body_len（同 kind
-// 覆写）；否则返回非 0。
-int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
-                           int32_t body_len, uint8_t **body);
-// WriteNewPlace: allocate a box for (ref, body_len, body_cap, langtype).
-// 无 storetype 参数：layout 由 body_cap > body_len 推出，引用性由构造器补 langtype 前缀。
-// with physical capacity >= 8 + body_cap + attr, write fixed header (ptr from ref)
-// and attr region in one atomic store, update parent index, and return body pointer.
-int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
-                            int32_t body_len,
-                            uint64_t body_cap, const char *langtype,
-                            uint8_t **body);
-// ListLen: direct child count under prefix. ListAt: copy idx-th child name into buf.
-// Both share a per-handle cache so ListLen + indexed ListAt scans the directory once,
-// invalidating on key-set, link-target, or extindex changes (including cross-process).
+// ListLen: direct child count under prefix. 每次调用直接扫描，不缓存。
 int kvspaceShmListLen(kvspace_t *kv, const char *prefix, bool expand_ext,
                       int resolve, int32_t *out_count);
-int kvspaceShmListAt(kvspace_t *kv, const char *prefix, bool expand_ext,
-                     int resolve, int32_t idx, uint8_t *buf, uint32_t buf_cap,
-                     uint32_t *out_len);
+
+/* ================================================================
+ * 存储层 ABI 原语（<kvspace/kvspace.h> 的 12 符号由 src/kvspace.c 直接实现）
+ *
+ * 原语返回公共状态码 KVSPACE_*，没有内部/公共两套枚举，也没有映射层。
+ * ================================================================ */
+
+/* anchor 0 = root（与上游 src/anchor.h 同值）。 */
+#define KVSPACE_ANCHOR_ROOT UINT64_C(0)
+
+/* 进程内值区基址：地址 = 基址 + value_offset；扩容前后不变。 */
+uint8_t *kvspaceShmStorageDataBase(kvspace_t *kv);
+int kvspaceShmStorageResolve(kvspace_t *kv, const char *key,
+                             uint64_t *out_offset);
+/* 公共 anchor 是 key 区的 int64 字节偏移；进入引擎后转换成 ART 块号。
+ * 0 = root，由调用方直接走 kvspaceShmStorageResolve，不进本函数。 */
+typedef struct kvspaceAnchor {
+    int64_t key_offset; /* 公共 ABI 传来的原始偏移，保留用于诊断 */
+    int32_t block_id;   /* ART 块号（blockid_bydataoffset 的结果） */
+} kvspaceAnchor_t;
+
+/* 带 anchor：只校验节点仍存活；查找仍按绝对 key。节点失效 → ANCHOR_INVALID。 */
+int kvspaceShmStorageResolveFrom(kvspace_t *kv, const char *key,
+                                 kvspaceAnchor_t anchor, uint64_t *out_offset);
+/* 唯一写原语：不存在则创建（清零），存在则容量内原地 / 超容量搬移。 */
+int kvspaceShmStorageRealloc(kvspace_t *kv, const char *key,
+                             uint64_t body_len, uint64_t attr_len,
+                             uint64_t *out_offset);
+int kvspaceShmStorageFree(kvspace_t *kv, const char *key);
+int kvspaceShmStorageMakeindex(kvspace_t *kv, const char *key);
+int kvspaceShmStorageListlen(kvspace_t *kv, const char *key, int64_t *out_count,
+                             uint32_t *out_max_name_length);
+int kvspaceShmStorageList(kvspace_t *kv, const char *key, char *out_names,
+                          uint32_t out_capacity, uint32_t *out_length,
+                          uint32_t *out_count, uint64_t *out_generation);
 
 /* ================================================================
  * 目录操作
@@ -140,48 +127,16 @@ int kvspaceShmExtindex(kvspace_t *kv, const char *path, const char *extpath,
                        char *err, uint32_t err_cap);
 int kvspaceShmDelextindex(kvspace_t *kv, const char *path); // 移除 extindex
 
-/* ================================================================
- * Watch / Notify
- * ================================================================ */
-
-int kvspaceShmNotify(kvspace_t *kv, const char *key, const uint8_t *val,
-                     int32_t val_len);
-
-// 阻塞等待通知，timeout_ms 毫秒。返回 malloc XValue，超时返回 NULL.
-uint8_t *kvspaceShmWatch(kvspace_t *kv, const char *key, int32_t timeout_ms,
-                         int32_t *out_len);
-
-#ifndef KVSPACE_VIEW_TOKEN_DEFINED
-#define KVSPACE_VIEW_TOKEN_DEFINED
-typedef struct {
-    uint8_t *head; uint8_t *body; uint32_t headlen; uint32_t value_len;
-    uint64_t cap; uint64_t body_cap;
-    uint32_t struct_gen; uint32_t value_gen;
-    uint64_t store_id; uint32_t node_id; uint32_t _pad;
-} kvspaceViewToken_t;
-#endif
-int kvspaceShmResolvePrefix(kvspace_t *kv, const char *path, kvspaceRef_t *ref);
-int kvspaceShmViewResolve(kvspace_t *kv, const char *key, kvspaceViewToken_t *tok);
-int kvspaceShmViewFromRef(kvspace_t *kv, const kvspaceRef_t *ref,
-                          const char *key_fallback, kvspaceViewToken_t *tok);
-int kvspaceShmViewResolveFrom(kvspace_t *kv, const kvspaceRef_t *parent,
-                              const char *rel, kvspaceViewToken_t *tok);
-int kvspaceShmViewCheck(kvspace_t *kv, const kvspaceViewToken_t *tok);
-int kvspaceShmViewWrite(kvspace_t *kv, kvspaceViewToken_t *tok,
-                        const uint8_t *data, uint32_t len);
-int kvspaceShmViewDel(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key);
-int kvspaceShmViewRefresh(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key);
-int kvspaceShmViewAck(kvspace_t *kv, uint32_t *epoch);
-int kvspaceShmViewQuiesce(kvspace_t *kv, int on);
 #ifdef P2_TEST_HOOKS
-uint64_t kvspaceShmViewGarbBytes(kvspace_t *kv);
-void kvspaceShmViewRoundStats(kvspace_t *kv, uint64_t *ok, uint64_t *aborted,
-                              uint64_t *leaks);
 /* 对齐/格式验收（仅测试构建）：返回 -1=通过，>=0=首个坏块 id，-2=块头宽度
  * 不是 8；SetFormatVersion 用于构造"旧 store 必须拒绝"的用例。 */
 int64_t kvspaceShmArtAlignCheck(kvspace_t *kv);
 void kvspaceShmTestSetFormatVersion(kvspace_t *kv, uint32_t v);
+/* benchmark-only：给已存在的父节点 key，反算它在 ART key 区的公共 int64 偏移，
+ * 即 `kvspaceResolve` 的 `parent_key_anchor` 可接受的值。节点不存在 / 值槽为空 /
+ * 偏移反算不到合法块 → 失败，不造值。 */
+int kvspaceShmTestAnchorOf(kvspace_t *kv, const char *parent_key,
+                           int64_t *out_anchor);
 #endif
-int kvspaceShmViewSweep(kvspace_t *kv);
 
 #endif

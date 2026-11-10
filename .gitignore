@@ -24,3 +24,6 @@ smoke.garb
 smoke.gen
 smoke.sbo.data
 smoke.sbo.head
+
+# 本地工作区（构建/日志/临时副本，不入库）
+workspace/

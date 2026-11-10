@@ -9,7 +9,7 @@
 
 #define _GNU_SOURCE
 #include "kvspace_shm.h"
-#include <kvspace/xvalue_head.h>
+#include <kvspace/kvlang_xvalue.h>
 
 #include <stdio.h>
 #include <stdlib.h>

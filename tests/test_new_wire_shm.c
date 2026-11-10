@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #include "kvspace_shm.h"
-#include <kvspace/xvalue_head.h>
+#include <kvspace/kvlang_xvalue.h>
 #include "xvalue_internal.h"
 
 #include <stdio.h>
@@ -12,6 +12,16 @@
 
 /* 固定 head 16 字节 [bodylen:u64][attrslen:u16][padding:6]；body 偏移恒 16，
    attr 区紧随 body 且**没有**长度前缀。 */
+
+/* 新 ABI 写路径：Realloc 给容量与 offset，body 由调用方在基址上直接填。 */
+static int write_new_body(kvspace_t *kv, const char *key, uint64_t body_len,
+                          uint8_t **body) {
+    uint64_t offset = 0;
+    if (kvspaceShmStorageRealloc(kv, key, body_len, 0, &offset) != 0)
+        return -1;
+    *body = kvspaceShmStorageDataBase(kv) + offset + KVSPACE_XVALUE_HEAD_LEN;
+    return 0;
+}
 
 static int wire_len_of(const uint8_t *stored) {
     kvspaceXvalueHead h;
@@ -109,12 +119,12 @@ int main(void) {
     free(value);
 
     uint8_t *body = NULL;
-    CHECK(kvspaceShmWriteInPlace(kv, "/x", 0, 8, &body) == 0);
+    CHECK(write_new_body(kv, "/x", 8, &body) == 0);
     body[0] = 43;
     stored = kvspaceShmGet(kv, "/x", 0, &got);
     CHECK(stored && stored[KVSPACE_XVALUE_HEAD_LEN] == 43);
 
-    CHECK(kvspaceShmWriteNewPlace(kv, "/fresh", 0, 8, 8, "", &body) == 0);
+    CHECK(write_new_body(kv, "/fresh", 8, &body) == 0);
     memcpy(body, raw, 8);
     stored = kvspaceShmGet(kv, "/fresh", 0, &got);
     CHECK(stored && stored[KVSPACE_XVALUE_HEAD_LEN] == 42);
@@ -122,7 +132,7 @@ int main(void) {
     CHECK(kvspaceShmCptree(kv, "/fresh", "/fresh-tree") == 0);
 
     static const uint8_t utf8[] = {0xc3, 0xa9, 'a'};
-    CHECK(kvspaceShmWriteNewPlace(kv, "/text", 0, 3, 3, "", &body) == 0);
+    CHECK(write_new_body(kv, "/text", 3, &body) == 0);
     memcpy(body, utf8, sizeof utf8);
     stored = kvspaceShmGet(kv, "/text", 0, &got);
     CHECK(stored && wire_len_of(stored) == (int)(KVSPACE_XVALUE_HEAD_LEN + 3) &&

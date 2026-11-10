@@ -11,7 +11,8 @@
 #define SLOTSBOXMALLOC_IMPLEMENTATION
 #include "slotsboxmalloc/slotsboxobj.h"
 #include "kvspace_shm.h"
-#include <kvspace/xvalue_head.h>
+#include <kvspace/kvspace.h>
+#include <kvspace/kvlang_xvalue.h>
 #include "xvalue_internal.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -47,7 +48,6 @@
 #define DATA_RESERVE (1ULL << 40)
 /* Values >= 64KB are level-3+ objects (32KB aligned): punch pages on delete. */
 #define SBO_PUNCH_MIN (64UL * 1024)
-#define WATCH_TABLE_SZ 256
 
 static int reserved_meta_path(const char *key) {
     static const char root[] = "/.kvspace-meta";
@@ -207,15 +207,6 @@ typedef struct {
     size_t reserve;
 } shm_region_t;
 
-typedef struct {
-    char key[256];
-    pthread_cond_t cond;
-    pthread_mutex_t mtx;
-    uint8_t *val;
-    int32_t val_len;
-    bool ready;
-} watch_t;
-
 struct kvspace {
     shm_region_t r_art, r_head, r_data, r_gen, r_garb;
     garb_ent_t *garb;             /* .garb 映射（GARB_CAP 条） */
@@ -235,19 +226,6 @@ struct kvspace {
     uint8_t *art_data;
     sbo_meta_t *sbo_meta;
     uint8_t *sbo_data;
-    watch_t watches[WATCH_TABLE_SZ];
-    pthread_mutex_t wlock;
-    /* Per-handle List cache (see list_cached): ListLen + indexed ListAt scans only once.
-     * Hits when (prefix, ex, resolve), resolved target, extindex mount, and hdr->list_gen
-     * all match, producing identical results to a fresh scan. */
-    pthread_mutex_t lc_mtx;
-    char *lc_prefix;
-    char *lc_target;    /* resolved target directory (equals prefix when resolve=0) */
-    char *lc_ext;       /* extindex mount source when ex=1; "" if unmounted */
-    char **lc_names;
-    int32_t lc_count;
-    uint8_t lc_ex, lc_res;
-    uint64_t lc_gen;
 };
 /* Bump after key-set changes (insert/revive/delete) to invalidate List caches across processes.
  * Ptr/@ext value changes do not bump this since list_cached re-checks target and mount each call. */
@@ -299,7 +277,6 @@ static int pfx_shared(const uint8_t *a, int al, const uint8_t *b, int bl);
 static int32_t art_walk(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
                         int d, int32_t *par, int *pard);
 static int32_t art_follow(kvspace_t *kv, int32_t id);
-static int32_t ref_leaf(kvspace_t *kv, kvspaceRef_t *ref, const char *key);
 
 /* 每节点 8B：{struct_gen, value_gen}（v2.2 删 pin 后不再有 refcount 位）。 */
 typedef struct {
@@ -348,7 +325,6 @@ static int64_t gen_alloc_epoch(kvspace_t *kv) {
 static int p2_maint_start(kvspace_t *kv);   /* 懒启动（阈值触发） */
 static bool p2_claim_alive(kvspace_t *kv, uint32_t claim);
 static int kv_sync(kvspace_t *kv);
-static void list_cache_drop(kvspace_t *kv);
 
 /* 阈值：生产固定 64MiB；测试构建可用 P2_TEST_GARB_THRESHOLD_MB 调低。 */
 static uint64_t p2_garb_threshold(void) {
@@ -661,7 +637,7 @@ static int head_of(const uint8_t *val, int32_t val_len, kvspaceXvalueHead *out) 
     {
         const uint8_t *langtype = NULL;
         uint16_t langtype_len = 0;
-        if (kvspaceXvalueHeadScan(val, total, &langtype, &langtype_len) != 0)
+        if (kvspace_c_scan_attrs(val, total, &langtype, &langtype_len) != 0)
             return -1;
     }
     return 0;
@@ -676,208 +652,13 @@ static int value_ok(const uint8_t *val, int32_t val_len,
     return 0;
 }
 
-int kvspaceShmViewFromRef(kvspace_t *kv, const kvspaceRef_t *ref,
-                           const char *key_fallback, kvspaceViewToken_t *tok) {
-    (void)key_fallback;
-    if (!kv || !ref || !tok || ref->gen != 0 || P2_VIEW_GUARD(kv))
-        return -1;
-    int32_t id = art_follow(kv, (int32_t)ref->block_id);
-    art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
-    if (!h)
-        return -1;
-    uint64_t hv = art_val_load(h);
-    if (!AV_HAS(hv))
-        return -1;
-    uint64_t cap = sbo_allocated_size(kv->sbo_meta, AV_OFF(hv));
-    if (cap < 1)
-        return -1;
-    uint8_t *raw = kv->sbo_data + AV_OFF(hv);
-    kvspaceXvalueHead w;
-    if (head_of(raw, (int32_t)cap, &w) != 0 ||
-        kvspace_c_reference_of(raw, cap) != KVSPACE_XVALUE_REFERENCE_INLINE)
-        return -1;
-    kv_gens_t *g = gens_at(kv, id);
-    if (!g)
-        return -1;
-    /* `value_len` 就是 `bodylen`：wire 里不再有「容量」这回事（物理容量是后端
-       的分配属性）。仍然过一遍 `EffectiveLen`，好让畸形 wire 在建立 token 时
-       就失败，而不是等到写。 */
-    uint64_t effective = 0;
-    if (kvspace_c_effective_len(raw, cap, &effective) != 0 ||
-        effective > UINT32_MAX)
-        return -1;
-    uint32_t gen = __atomic_load_n(&g->struct_gen, __ATOMIC_ACQUIRE);
-    tok->head = raw;
-    tok->body = raw + KVSPACE_XVALUE_HEAD_LEN;
-    tok->headlen = KVSPACE_XVALUE_HEAD_LEN;
-    tok->value_len = (uint32_t)effective;
-    tok->cap = cap;
-    tok->body_cap = cap - KVSPACE_XVALUE_HEAD_LEN;
-    tok->struct_gen = gen;
-    tok->value_gen = __atomic_load_n(&g->value_gen, __ATOMIC_ACQUIRE);
-    tok->store_id = kv->store_id;
-    tok->node_id = (uint32_t)id;
-    tok->_pad = __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE);
-    return 0;
-}
-
-int kvspaceShmViewResolve(kvspace_t *kv, const char *key, kvspaceViewToken_t *tok) {
-    kvspaceRef_t ref;
-    if (!kv || !key || !tok || P2_VIEW_GUARD(kv) ||
-        kvspaceShmResolveRef(kv, key, &ref) != 0)
-        return -1;
-    return kvspaceShmViewFromRef(kv, &ref, key, tok);
-}
-
 /* 前缀解析：path 的最后一个字节落在哪个节点；depth = 该节点压缩前缀被 path 覆盖的字节数
  * （可能 < prefix_len，即边界落在前缀内部）。用于 short 键（整键就是一个节点的前缀）。 */
-int kvspaceShmResolvePrefix(kvspace_t *kv, const char *path, kvspaceRef_t *ref) {
-    if (!kv || !path || !ref || P2_VIEW_GUARD(kv))
-        return -1;
-    memset(ref, 0, sizeof(*ref));
-    int klen = (int)strlen(path);
-    int d = 0;
-    int32_t nid = kv->hdr->art_root;
-    while (nid >= 0) {
-        art_hdr_t *h = art_hdr(kv, nid);
-        if (!h || h->type == ART_MOVED)
-            return -1;
-        int s = 0;
-        if (h->prefix_len) {
-            s = pfx_shared(h->prefix, h->prefix_len,
-                           (const uint8_t *)path + d, klen - d);
-            if (s != h->prefix_len && d + s != klen)
-                return -1;
-            d += s;
-        }
-        /* path may end at a node with prefix_len == 0 (e.g. "/vthread/1/" next to
-         * "/vthread/10/"); return here before reading path[klen]. */
-        if (d == klen) {
-            ref->block_id = (uint32_t)nid;
-            ref->depth = (uint32_t)s;       /* bytes of this node's prefix covered by path */
-            return 0;
-        }
-        nid = art_child(kv, h, (uint8_t)path[d]);
-        d++;
-    }
-    return -1;
-}
-
 /* 前缀形态：parent_ref 的 block_id/depth 指向目录节点；只走 rel。 */
-int kvspaceShmViewResolveFrom(kvspace_t *kv, const kvspaceRef_t *parent,
-                              const char *rel, kvspaceViewToken_t *tok) {
-    if (!kv || !parent || !rel || !tok || P2_VIEW_GUARD(kv))
-        return -1;
-    int32_t pid = art_follow(kv, (int32_t)parent->block_id);
-    art_hdr_t *ph = pid >= 0 ? art_hdr(kv, pid) : NULL;
-    if (!ph)
-        return -1;
-    /* 边界落在节点压缩前缀内部时，先把该节点前缀的剩余字节与 rel 对掉。 */
-    const uint8_t *p = (const uint8_t *)rel;
-    int rem = (int)strlen(rel);
-    int32_t covered = (int32_t)parent->depth;
-    while (covered < (int32_t)ph->prefix_len && rem > 0) {
-        if (p[0] != ph->prefix[covered])
-            return -1;
-        p++; rem--; covered++;
-    }
-    int32_t id;
-    if (rem == 0) {
-        id = pid;                        /* 空 rel = 前缀自身 */
-    } else {
-        int32_t cid = art_child(kv, ph, p[0]);
-        id = art_walk(kv, cid, p, rem, 1, NULL, NULL);
-    }
-    if (id < 0)
-        return -1;
-    kvspaceRef_t leaf = {0};
-    leaf.block_id = (uint32_t)id;
-    leaf.gen = 0;
-    return kvspaceShmViewFromRef(kv, &leaf, rel, tok);
-}
-
-int kvspaceShmViewCheck(kvspace_t *kv, const kvspaceViewToken_t *tok) {
-    if (!kv || !tok || P2_VIEW_GUARD(kv))
-        return -1;
-    if (tok->store_id != kv->store_id)
-        return 1;
-    if (tok->_pad != __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE))
-        return 1;
-    kv_gens_t *g = gens_at(kv, (int32_t)tok->node_id);
-    if (!g)
-        return 1;
-    if (__atomic_load_n(&g->struct_gen, __ATOMIC_ACQUIRE) != tok->struct_gen)
-        return 1;
-    art_hdr_t *h = art_hdr(kv, (int32_t)tok->node_id);
-    if (!h)
-        return 1;
-    uint64_t hv = art_val_load(h);
-    if (!AV_HAS(hv))
-        return 1;
-    if (tok->head != kv->sbo_data + AV_OFF(hv))
-        return 1;
-    return 0;
-}
-
 /* Hot-path write: in-place same-length body write. Returns 0 on success, 1 to fall back.
  * The attr region immediately follows body (at 8+len), so only writes matching the current
  * header len are accepted; variable-length writes fall back to full-value write. */
-int kvspaceShmViewWrite(kvspace_t *kv, kvspaceViewToken_t *tok,
-                        const uint8_t *data, uint32_t len) {
-    if (!kv || P2_VIEW_GUARD(kv))
-        return -1;
-    if (kvspaceShmViewCheck(kv, tok) != 0)
-        return 1;
-    /* 判据是 `bodylen`（= 有效长度）：等长原地写，短于 body_cap 只是物理余量。 */
-    kvspaceXvalueHead cur;
-    memcpy(&cur, tok->head, sizeof cur);
-    if ((uint64_t)len != kvspaceXvalueHeadLen(&cur) || len > tok->body_cap)
-        return 1;
-    kv_gens_t *g = gens_at(kv, (int32_t)tok->node_id);
-    if (!g)
-        return 1;
-    __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL); /* 奇：写中 */
-    memcpy(tok->body, data, len);
-    __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL); /* 偶：写完 */
-    tok->value_len = len;
-    return 0;
-}
-
 /* 热路径删：tombstone + value_gen++（box 释放走延迟队列）。 */
-int kvspaceShmViewDel(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key) {
-    if (!kv || P2_VIEW_GUARD(kv))
-        return -1;
-    if (kvspaceShmViewCheck(kv, tok) != 0)
-        return 1;
-    kv_gens_t *g = gens_at(kv, (int32_t)tok->node_id);
-    art_hdr_t *h = art_hdr(kv, (int32_t)tok->node_id);
-    if (!g || !h)
-        return 1;
-    /* 叶子级逻辑墓碑：CAS 一次原子清零 has_value+box；不 bump struct_gen。 */
-    uint64_t hv = art_val_load(h);
-    if (!AV_HAS(hv))
-        return 1;
-    uint64_t gidx;
-    if (garb_reserve(kv, &gidx) != 0)
-        return -1;                      /* 表满：硬错误，未变更 */
-#ifdef P2_TEST_HOOKS
-    {
-        const char *v = getenv("P2_TEST_HOLD_DELCAS_MS");
-        if (v && atoi(v) > 0)
-            usleep((useconds_t)atoi(v) * 1000);
-    }
-#endif
-    if (!art_val_cas(h, &hv, 0)) {
-        garb_cancel(kv, gidx);
-        return 1;
-    }
-    __atomic_add_fetch(&g->value_gen, 2u, __ATOMIC_ACQ_REL); /* 静止态保持偶数 */
-    garb_commit(kv, gidx, AV_OFF(hv), tok->cap);
-    list_gen_bump(kv);                  /* bump after key removal */
-    (void)key;
-    return 0;
-}
-
 /* ── 第 3 步：屏障轮 / 维护线程 / Q1-Q2 ─────────────────────────── */
 
 static long long p2_now_ms(void) {
@@ -1185,49 +966,9 @@ static void p2_maint_stop(kvspace_t *kv) {
 }
 
 /* Q1：op 边界 ack。0 = 已 ack；1 = epoch 变了（先作废 token 再来）；-1 = 非法。 */
-int kvspaceShmViewAck(kvspace_t *kv, uint32_t *epoch) {
-    if (!kv || !epoch || kv->p2_slot < 0 || P2_FORK_GUARD(kv))
-        return -1;
-    uint32_t cur = __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE);
-    if (*epoch != cur) {
-        *epoch = cur;
-        return 1;
-    }
-    p2_ack_slot(kv, cur);
-    return 0;
-}
-
 /* Q2：显式静默声明。on 只接受 0/1；幂等；状态变化唤醒 leader。
  * 前置：调用线程已作废本进程全部 view token。声明期间 View* 一律 -1。 */
-int kvspaceShmViewQuiesce(kvspace_t *kv, int on) {
-    if (!kv || (on != 0 && on != 1) || kv->p2_slot < 0 || P2_FORK_GUARD(kv))
-        return -1;
-    p2_slot_t *s = &kv->hdr->slots[kv->p2_slot];
-    if (__atomic_load_n(&s->quiesced, __ATOMIC_ACQUIRE) != (uint32_t)on) {
-        __atomic_store_n(&s->quiesced, (uint32_t)on, __ATOMIC_RELEASE);
-        __atomic_add_fetch(&kv->hdr->ack_seq, 1u, __ATOMIC_RELEASE);
-        if (__atomic_load_n(&kv->hdr->barrier_state, __ATOMIC_ACQUIRE))
-            p2_futex_wake(&kv->hdr->ack_seq);
-    }
-    kv->quiesced = (uint32_t)on;
-    return 0;
-}
-
 #ifdef P2_TEST_HOOKS
-void kvspaceShmViewRoundStats(kvspace_t *kv, uint64_t *ok, uint64_t *aborted,
-                              uint64_t *leaks) {
-    *ok = kv ? __atomic_load_n(&kv->hdr->round_ok, __ATOMIC_ACQUIRE) : 0;
-    *aborted = kv ? __atomic_load_n(&kv->hdr->round_aborted, __ATOMIC_ACQUIRE) : 0;
-    *leaks = kv ? __atomic_load_n(&kv->hdr->leak_boxes, __ATOMIC_ACQUIRE) : 0;
-}
-
-uint64_t kvspaceShmViewGarbBytes(kvspace_t *kv) {
-    return kv && kv->hdr
-               ? kv->hdr->committed_bytes -
-                     __atomic_load_n(&kv->hdr->freed_bytes, __ATOMIC_ACQUIRE)
-               : 0;
-}
-
 /* 对齐验收：块头 8、stride 8 倍数，且每个块的 val（偏移 16）不跨 64B 行。
  * 返回 -1 = 通过；>=0 = 第一个坏块 id；-2 = 块头宽度不是 8。 */
 int64_t kvspaceShmArtAlignCheck(kvspace_t *kv) {
@@ -1254,23 +995,10 @@ void kvspaceShmTestSetFormatVersion(kvspace_t *kv, uint32_t v) {
     if (kv && kv->hdr)
         kv->hdr->format_version = v;
 }
+
 #endif
 
 /* 同步强制一轮：返回释放条数；-1 = 别人持有；-2 = 超时放弃（零 free）。 */
-int kvspaceShmViewSweep(kvspace_t *kv) {
-    if (!kv || kv->hdr->art_root < 0)
-        return 0;
-    return p2_round(kv);
-}
-
-int kvspaceShmViewRefresh(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key) {
-    kvspaceViewToken_t t;
-    if (kvspaceShmViewResolve(kv, key, &t) != 0)
-        return -1;
-    *tok = t;
-    return 0;
-}
-
 static int kv_sync(kvspace_t *kv) {
     if (region_map(&kv->r_art, ART_OFF + (size_t)kv->hdr->art_slab_size) != 0)
         return -1;
@@ -2592,12 +2320,6 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
         p2_maint_start(kv) != 0)
         goto fail;                  /* 已有大量垃圾且建不了线程：open 硬失败 */
 
-    pthread_mutex_init(&kv->wlock, NULL);
-    pthread_mutex_init(&kv->lc_mtx, NULL);
-    for (int i = 0; i < WATCH_TABLE_SZ; i++) {
-        pthread_cond_init(&kv->watches[i].cond, NULL);
-        pthread_mutex_init(&kv->watches[i].mtx, NULL);
-    }
     return kv;
 
 fail:
@@ -2665,14 +2387,6 @@ void kvspaceShmClose(kvspace_t *kv) {
     }
     p2_maint_stop(kv);
     p2_reg_release(kv);
-    for (int i = 0; i < WATCH_TABLE_SZ; i++) {
-        pthread_cond_destroy(&kv->watches[i].cond);
-        pthread_mutex_destroy(&kv->watches[i].mtx);
-        free(kv->watches[i].val);
-    }
-    pthread_mutex_destroy(&kv->wlock);
-    list_cache_drop(kv);
-    pthread_mutex_destroy(&kv->lc_mtx);
     region_close(&kv->r_art);
     region_close(&kv->r_head);
     region_close(&kv->r_data);
@@ -2848,181 +2562,6 @@ uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
     return raw;
 }
 
-/* gen>0: block_id is parent at depth gen; key must share that prefix. */
-static int32_t ref_leaf(kvspace_t *kv, kvspaceRef_t *ref, const char *key) {
-    int32_t id = art_follow(kv, (int32_t)ref->block_id);
-    if (id < 0)
-        return -1;
-    ref->block_id = (uint32_t)id;
-    if (ref->gen == 0)
-        return id;
-    if (!key)
-        return -1;
-    int klen = (int)strlen(key);
-    int d = (int)ref->gen;
-    if (d < 0 || d > klen)   /* P2: d == klen 表示前缀节点就是全部路径 */
-        return -1;
-    if (d == klen)
-        return art_follow(kv, (int32_t)ref->block_id);
-    art_hdr_t *h = art_hdr(kv, id);
-    if (!h || h->type == ART_MOVED)
-        return -1;
-    int32_t cid = art_child(kv, h, (uint8_t)key[d]);
-    if (cid < 0)
-        return -1;
-    return art_walk(kv, cid, (const uint8_t *)key, klen, d + 1, NULL, NULL);
-}
-
-int kvspaceShmResolveRef(kvspace_t *kv, const char *key, kvspaceRef_t *ref) {
-    if (!kv || !key || !ref || reserved_meta_path(key))
-        return -1;
-    memset(ref, 0, sizeof(*ref));
-    if (kv_sync(kv) != 0)
-        return -1;
-    int klen = (int)strlen(key);
-    int seplen = 0;
-    int sep = last_key_sep((const uint8_t *)key, klen, &seplen);
-    int dir_d = 0;
-    int32_t dn = -1;
-    int32_t id = art_find_dir(kv, kv->hdr->art_root, (const uint8_t *)key, klen,
-                              sep, seplen, &dn, &dir_d);
-    if (id < 0)
-        return -1;
-    ref->block_id = (uint32_t)id;
-    ref->gen = 0;
-    if (dn >= 0 && dir_d > 0) {
-        ref->parent_id = (uint32_t)dn;
-        ref->depth = (uint32_t)dir_d;
-    } else {
-        ref->parent_id = 0;
-        ref->depth = 0;
-    }
-    return 0;
-}
-
-uint8_t *kvspaceShmGetByRef(kvspace_t *kv, kvspaceRef_t *ref,
-                            const char *key_fallback, int32_t *ol) {
-    if (!kv || !ref || !ol)
-        return NULL;
-    *ol = 0;
-    if (kv_sync(kv) != 0)
-        return NULL;
-    int32_t id = ref_leaf(kv, ref, key_fallback);
-    art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
-    uint64_t hv = h ? art_val_load(h) : 0;
-    if (h && AV_HAS(hv)) {
-        uint8_t *raw;
-        int32_t rl;
-        if (read_value_ro(kv, AV_OFF(hv), &raw, &rl) == 0) {
-            *ol = rl;
-            return raw;
-        }
-    }
-    /* gen>0: parent walk miss — do not full-Get; caller falls back. */
-    if (ref->gen != 0)
-        return NULL;
-    if (!key_fallback)
-        return NULL;
-    uint8_t *raw = kvspaceShmGet(kv, key_fallback, 0, ol);
-    if (raw)
-        kvspaceShmResolveRef(kv, key_fallback, ref);
-    return raw;
-}
-
-int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
-                           const char *key_fallback, uint32_t offset,
-                           const uint8_t *buf, uint32_t buf_len) {
-    if (!kv || !ref || !buf)
-        return -1;
-    if (kv_sync(kv) != 0)
-        return -1;
-    int32_t id = ref_leaf(kv, ref, key_fallback);
-    art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
-    /* part-write 快路径：head 直读 + per-box 物理容量校验后写正文。
-     * 任何不自洽（gen>0、无值、是引用、offset/buf_len 越过有效长度、
-     * 超出 box 物理容量）一律回退现有路径，行为不变。不修改 head。 */
-    uint64_t hv = h ? art_val_load(h) : 0;
-    if (h && AV_HAS(hv) && ref->gen == 0) {
-        uint64_t data_size = kv->hdr->sbo_data_size;
-        uint64_t off = AV_OFF(hv);
-        if (off <= data_size && data_size - off >= KVSPACE_XVALUE_HEAD_LEN) {
-            const uint8_t *hs = kv->sbo_data + off;
-            kvspaceXvalueHead w;
-            memcpy(&w, hs, sizeof w);
-            /*
-             * 快路径前置：**不是引用**（旧模型用 `storetype == SLACK` 表达，
-             * 新模型里「变长/定宽」不再是 head 的事实——它由 langtype 决定）。
-             * 这里只判引用性；「能否原地写」的最终判据在下面那段容量检查里，
-             * 而**类型不得改变**由调用方（`kvspaceShmSetPart` 的 `same_shape`）
-             * 保证。
-             */
-            if (kvspace_c_reference_of(
-                    hs, sbo_allocated_size(kv->sbo_meta, off)) ==
-                KVSPACE_XVALUE_REFERENCE_INLINE) {
-                /* `len` 就是 `bodylen`：wire 里没有容量之说，容量是后端的物理
-                   分配属性。 */
-                uint64_t total_box = sbo_allocated_size(kv->sbo_meta, off);
-                uint64_t len = 0U;
-                if (kvspace_c_effective_len(hs, total_box, &len) != 0)
-                    len = kvspaceXvalueHeadLen(&w); /* 畸形：退回 bodylen 走保守判定 */
-                /* per-box 物理容量：损坏 head 的 len 可能大于 box 但仍在全局内，
-                 * 不做这一步会跨 box 写坏相邻值。 */
-                uint64_t cap = total_box;
-                /* `offset` 是**整条 wire 的绝对偏移**（与 SetPart 同约定），
-                 * 所以上界是 `head + 有效长度`，不是有效长度本身。 */
-                if (cap <= data_size - off && len <= cap - KVSPACE_XVALUE_HEAD_LEN &&
-                    (uint64_t)offset <= KVSPACE_XVALUE_HEAD_LEN + len &&
-                    (uint64_t)buf_len <=
-                        KVSPACE_XVALUE_HEAD_LEN + len - (uint64_t)offset) {
-                    kv_gens_t *g = gens_at(kv, id);
-                    if (g)
-                        __atomic_add_fetch(&g->value_gen, 1u,
-                                           __ATOMIC_ACQ_REL);
-                    memcpy(kv->sbo_data + off + offset, buf, buf_len);
-                    if (g)
-                        __atomic_add_fetch(&g->value_gen, 1u,
-                                           __ATOMIC_ACQ_REL);
-                    return 0;
-                }
-            }
-        }
-    }
-    if (!h || !AV_HAS(hv)) {
-        if (ref->gen != 0)
-            return -1;
-        if (!key_fallback)
-            return -1;
-        int32_t rl = 0;
-        uint8_t *d = kvspaceShmGet(kv, key_fallback, 0, &rl);
-        /* Re-bound by physical box capacity before writing; use u64 to prevent u32 wraparound. */
-        if (!d || read_value(kv, (uint64_t)(d - kv->sbo_data), &d, &rl) != 0 ||
-            (uint64_t)offset + buf_len > (uint64_t)rl)
-            return -1;
-        kvspaceShmResolveRef(kv, key_fallback, ref);
-        kv_gens_t *g = gens_at(kv, (int32_t)ref->block_id);
-        if (g)
-            __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
-        memcpy(d + offset, buf, buf_len);
-        if (g)
-            __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
-        return 0;
-    }
-    uint8_t *raw;
-    int32_t rl;
-    uint64_t bound = 0U;
-    if (read_value(kv, AV_OFF(hv), &raw, &rl) < 0 ||
-        kvspace_c_effective_len(raw, (uint64_t)rl, &bound) != 0 ||
-        (uint64_t)offset + buf_len > (uint64_t)KVSPACE_XVALUE_HEAD_LEN + bound)
-        return -1;
-    kv_gens_t *g2 = gens_at(kv, id);
-    if (g2)
-        __atomic_add_fetch(&g2->value_gen, 1u, __ATOMIC_ACQ_REL);
-    memcpy(raw + offset, buf, buf_len);
-    if (g2)
-        __atomic_add_fetch(&g2->value_gen, 1u, __ATOMIC_ACQ_REL);
-    return 0;
-}
-
 /* Partial write by key (follows links and extindex fallback like Get with resolve=1).
  * Locates via lock-free read, then re-bounds by physical box capacity before writing. */
 int kvspaceShmSetPart(kvspace_t *kv, const char *key, uint32_t offset,
@@ -3070,61 +2609,6 @@ static int is_char_langtype(const uint8_t *langtype, uint16_t length) {
     }
     return (uint16_t)(length - at) >= 5 &&
            memcmp(langtype + at, "char/", 5) == 0;
-}
-
-int kvspaceShmXvalueBodyView(kvspace_t *kv, const kvspaceRef_t *ref,
-                       const char *key_fallback, kvspaceXvalueBodyView_t *out) {
-    /* status 识别依赖 key_fallback；view 一律要求非 NULL（runtime 必须传）。 */
-    if (!kv || !ref || !out || !key_fallback)
-        return -1;
-    if (ref->gen != 0)
-        return -1;
-    if (kv_sync(kv) != 0)
-        return -1;
-    kvspaceRef_t r = *ref;
-    int32_t id = ref_leaf(kv, &r, key_fallback);
-    art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
-    if (!h)
-        return -1;
-    uint64_t hv = art_val_load(h);
-    if (!AV_HAS(hv))
-        return -1;
-    uint8_t *raw = NULL;
-    int32_t rl = 0;
-    if (read_value(kv, AV_OFF(hv), &raw, &rl) < 0 || !raw)
-        return -1;
-    kvspaceXvalueHead wire;
-    if (head_of(raw, rl, &wire) != 0)
-        return -1;
-    /* 引用槽（Ptr/Ext）不可视：没有稳定的 head/body 语义。 */
-    if (kvspace_c_reference_of(raw, (uint64_t)rl) !=
-        KVSPACE_XVALUE_REFERENCE_INLINE)
-        return -1;
-    uint64_t cap = sbo_allocated_size(kv->sbo_meta, AV_OFF(hv));
-    uint64_t effective = 0;
-    if (kvspaceXvalueHeadEffectiveLen(raw, (uint64_t)rl, &effective) != 0)
-        return -1;
-    if (cap < KVSPACE_XVALUE_HEAD_LEN ||
-        effective > cap - KVSPACE_XVALUE_HEAD_LEN)
-        return -1;
-    /* status: 文本形态（base kind 为 char）+ 有效长度 ≤16 + 物理容量 ≥80。
-       容量只看**物理分配尺寸**（`sbo_allocated_size`，就是上面的 `cap`），wire
-       里只有有效长度；`effective` 即 bodylen。 */
-    if (is_vthread_status_key(key_fallback)) {
-        const uint8_t *status_langtype = NULL;
-        const uint16_t status_langtype_len =
-            kvspaceXvalueHeadLangtypeBounded(raw, (uint64_t)rl, &status_langtype);
-        if (cap < KVSPACE_STATUS_MIN_CAP ||
-            effective > KVSPACE_STATUS_MAX_LEN ||
-            !is_char_langtype(status_langtype, status_langtype_len))
-            return -1;
-    }
-    out->head = raw;
-    out->headlen = KVSPACE_XVALUE_HEAD_LEN;
-    out->body = raw + KVSPACE_XVALUE_HEAD_LEN;
-    out->cap = cap;
-    out->body_cap = cap - KVSPACE_XVALUE_HEAD_LEN;
-    return 0;
 }
 
 /* Raw local write (internal helper without container/member semantics).
@@ -3327,154 +2811,6 @@ int kvspaceShmSetValue(kvspace_t *kv, const char *key, const uint8_t *val,
         value_ok(val, val_len, &head) != 0)
         return -2;
     return shm_set_validated(kv, key, val, val_len, &head);
-}
-
-int kvspaceShmSetValueByRef(kvspace_t *kv, kvspaceRef_t *ref,
-                            const char *key_fallback, const uint8_t *val,
-                            int32_t val_len) {
-    kvspaceXvalueHead head;
-    if (!kv || !ref || !key_fallback || !val || val_len <= 0 ||
-        value_ok(val, val_len, &head) != 0)
-        return -2;
-    if (kv_sync(kv) != 0)
-        return -1;
-    if (strlen(key_fallback) >= 1024 || strstr(key_fallback, "//") ||
-        reserved_meta_path(key_fallback))
-        return -1;
-    int32_t id = ref_leaf(kv, ref, key_fallback);
-    art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
-    if (h && AV_HAS(art_val_load(h)))
-        return shm_set_local(kv, key_fallback, val, val_len, h, 0);
-    /* ref 过期或尚无值：退回完整按 key 写（含 extindex 检查），成功后重解析。 */
-    int rc = shm_set_validated(kv, key_fallback, val, val_len, &head);
-    if (rc == 0)
-        kvspaceShmResolveRef(kv, key_fallback, ref);
-    return rc;
-}
-
-int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
-                           int32_t body_len, uint8_t **body) {
-    if (!kv || !key || !body || body_len < 0 || reserved_meta_path(key))
-        return -1;
-    if (kv_sync(kv) != 0)
-        return -1;
-    char kbuf[1024];
-    if (strlen(key) >= sizeof kbuf)
-        return -1;                  /* reject rather than truncating to another key */
-    uint8_t *raw;
-    int32_t rl;
-    int fetched = 0;
-    art_hdr_t *h;
-    if (resolve)
-        h = resolve_fetch(kv, key, kbuf, sizeof(kbuf), &raw, &rl, &fetched);
-    else {
-        strcpy(kbuf, key);
-        h = art_search(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
-                       (int)strlen(kbuf));
-    }
-    if (!h)
-        return -1;
-    uint64_t hv = art_val_load(h);
-    if (!AV_HAS(hv))
-        return -1;
-    /* Re-bound by physical box capacity before returning writable pointer. */
-    (void)fetched;
-    if (read_value(kv, AV_OFF(hv), &raw, &rl) < 0 || rl <= 0)
-        return -1; /* None or read failure -> require WriteNewPlace */
-    kvspaceXvalueHead wire;
-    if (head_of(raw, rl, &wire) == 0) {
-        if (kvspaceXvalueHeadLen(&wire) != (uint64_t)body_len)
-            return -1;
-        *body = raw + KVSPACE_XVALUE_HEAD_LEN;
-        return 0;
-    }
-    return -1;
-}
-
-int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
-                            int32_t body_len, uint64_t body_cap,
-                            const char *langtype, uint8_t **body) {
-    if (!kv || !key || !body || body_len < 0)
-        return -1;
-    if (body_cap > INT32_MAX - 32 || body_cap < (uint64_t)body_len)
-        return -1;
-    *body = NULL;
-    if (kv_sync(kv) != 0)
-        return -1;
-    size_t key_len = strlen(key);
-    if (key_len >= 1024 || strstr(key, "//") || reserved_meta_path(key))
-        return -1;
-    /*
-     * 构造器分派：**引用性由构造器决定**，不再由 `storetype` 参数决定。
-     *
-     * 上游头把这件事定死了：`NewPtr`/`NewExt` 是唯一知道「这个值是引用」的构造点，
-     * 它们替调用方补 `*`/`@` 前缀（`xvalue_head.h:221-223`）；`Reserve` 不补前缀，
-     * 只做「占位 + 容量推导」。所以 ref≠0 时必须走 NewPtr/NewExt，不能拿
-     * Reserve 造一条普通值再假装它是引用——那样 langtype 里没有前缀，读侧会把它
-     * 当普通值处理。
-     *
-     * 容量不是 wire 的属性（wire 只有 bodylen = 有效长度），物理容量由本函数的
-     * `reserve` 参数交给存储后端；本函数不传 storetype。
-     */
-    if (ref > 2U)
-        return -1;
-    /*
-     * 三种 ref 都走**占位构造**（`Reserve`）：它的 body 是**调用方待填的缓冲区**，
-     * 本函数的契约是「返回 body 指针给调用方写」。
-     *
-     * 引用性由 langtype 的 `*`/`@` 前缀表达，而 `Reserve` 不补前缀——所以这里
-     * 由**本函数**补（与 `NewPtr`/`NewExt` 的构造规则同源：空 langtype → 裸
-     * `*`/`@`；已带前缀 → 拒绝，双重前缀说明两处对格式理解不一致）。
-     *
-     * 为什么不直接调 `NewPtr`/`NewExt`：它们把 body 当作**已经写好的路径**来接收
-     * （参数就叫 `path`/`locator`），而这里的 body 是空的、等着调用方填。两者
-     * 的前置条件不同，借用会静默写出一段「内容是路径长度那么多零字节」的值。
-     */
-    char prefixed_langtype[256];
-    const char *effective_langtype = langtype;
-    if (ref != 0U) {
-        const char prefix = ref == 1U ? '*' : '@';
-        const size_t inner = langtype ? strlen(langtype) : 0U;
-        if (langtype && (langtype[0] == '*' || langtype[0] == '@'))
-            return -1; /* 双重前缀 */
-        if (inner + 2U > sizeof(prefixed_langtype))
-            return -1;
-        prefixed_langtype[0] = prefix;
-        if (inner)
-            memcpy(prefixed_langtype + 1, langtype, inner);
-        prefixed_langtype[inner + 1] = '\0';
-        effective_langtype = prefixed_langtype;
-    }
-    uint8_t *value = NULL;
-    uint64_t total = 0;
-    if (kvspaceXvalueHeadReserve((uint64_t)body_len, effective_langtype,
-                                 &value, &total) != 0)
-        return -1;
-    if (total > INT32_MAX) {
-        free(value);
-        return -1;
-    }
-    /*
-     * 不再 patch `ptr` 字节：新布局没有这个字段，引用性由**构造器**写进
-     * langtype 前缀（上面已按 ref 分派到 NewPtr/NewExt/Reserve）。
-     */
-    /* 16 字节 head（body offset = 16）+ attr 紧随 body，单 key 一次写。
-     * 预留物理 box 容量 (16 + body_cap + attr)，让 body 能在原地长。 */
-    uint64_t attr_len = total - KVSPACE_XVALUE_HEAD_LEN - (uint64_t)body_len;
-    size_t reserve = (size_t)(KVSPACE_XVALUE_HEAD_LEN + body_cap + attr_len);
-    int rc = shm_set_raw(kv, key, value, (int32_t)total, reserve);
-    free(value);
-    if (rc != 0)
-        return -1;
-    art_hdr_t *node = art_search(kv, kv->hdr->art_root,
-                                 (const uint8_t *)key, (int)key_len);
-    if (!node)
-        return -1;
-    uint64_t nv = art_val_load(node);
-    if (!AV_HAS(nv))
-        return -1;
-    *body = kv->sbo_data + AV_OFF(nv) + KVSPACE_XVALUE_HEAD_LEN;
-    return 0;
 }
 
 /* Delete a single key directly (without following links) and without bumping
@@ -3890,63 +3226,7 @@ int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
         return rc > 0 ? 0 : -1;
     return list_scan(kv, target, ext, on, oc);
 }
-/* Caller holds lc_mtx (or handle is unshared, e.g. Close). */
-static void list_cache_drop(kvspace_t *kv) {
-    for (int32_t i = 0; i < kv->lc_count; i++)
-        free(kv->lc_names[i]);
-    free(kv->lc_names);
-    free(kv->lc_prefix);
-    free(kv->lc_target);
-    free(kv->lc_ext);
-    kv->lc_names = NULL;
-    kv->lc_prefix = kv->lc_target = kv->lc_ext = NULL;
-    kv->lc_count = 0;
-}
-/* Cached name list for ListLen/ListAt; caller holds lc_mtx. On return 0,
- * kv->lc_names/lc_count hold the result. A hit requires matching (prefix, ex,
- * resolve), unchanged resolved target/ext, and unchanged list_gen (read before
- * resolve/scan so any concurrent key-set mutation forces a rescan next time). */
-static int list_cached(kvspace_t *kv, const char *prefix, bool ex, int resolve) {
-    uint64_t g = __atomic_load_n(&kv->hdr->list_gen, __ATOMIC_ACQUIRE);
-    char target[4096], ext[1024];
-    int rc = list_target(kv, prefix, ex, resolve, target, sizeof target, ext,
-                         sizeof ext);
-    if (rc < 0)
-        return -1;
-    if (rc > 0) {
-        list_cache_drop(kv);
-        return 0;
-    }
-    if (kv->lc_prefix && kv->lc_gen == g && kv->lc_ex == (uint8_t)ex &&
-        kv->lc_res == (uint8_t)(resolve != 0) &&
-        strcmp(kv->lc_prefix, prefix) == 0 &&
-        strcmp(kv->lc_target, target) == 0 && strcmp(kv->lc_ext, ext) == 0)
-        return 0;
-    list_cache_drop(kv);
-    char **names = NULL;
-    int32_t count = 0;
-    if (list_scan(kv, target, ext, &names, &count) != 0)
-        return -1;
-    char *p = strdup(prefix), *t = strdup(target), *e = strdup(ext);
-    if (!p || !t || !e) {
-        free(p);
-        free(t);
-        free(e);
-        for (int32_t i = 0; i < count; i++)
-            free(names[i]);
-        free(names);
-        return -1;
-    }
-    kv->lc_prefix = p;
-    kv->lc_target = t;
-    kv->lc_ext = e;
-    kv->lc_names = names;
-    kv->lc_count = count;
-    kv->lc_ex = (uint8_t)ex;
-    kv->lc_res = (uint8_t)(resolve != 0);
-    kv->lc_gen = g;
-    return 0;
-}
+/* 直接扫描，不复用上一次结果：调用方每次拿到的都是当次 key 集合。 */
 int kvspaceShmListLen(kvspace_t *kv, const char *prefix, bool ex, int resolve,
                       int32_t *out_count) {
     if (!out_count)
@@ -3954,39 +3234,20 @@ int kvspaceShmListLen(kvspace_t *kv, const char *prefix, bool ex, int resolve,
     *out_count = 0;
     if (!kv || !prefix)
         return -1;
-    pthread_mutex_lock(&kv->lc_mtx);
-    int rc = list_cached(kv, prefix, ex, resolve);
-    if (rc == 0)
-        *out_count = kv->lc_count;
-    pthread_mutex_unlock(&kv->lc_mtx);
-    return rc;
-}
-/* Copy the idx-th direct child name into buf (without NUL). *out_len is set to
- * the name length; returns non-zero if out of range or buf is too small. Shares
- * cache with ListLen so ListLen + indexed ListAt scans the directory once. */
-int kvspaceShmListAt(kvspace_t *kv, const char *prefix, bool ex, int resolve,
-                     int32_t idx, uint8_t *buf, uint32_t buf_cap,
-                     uint32_t *out_len) {
-    if (!out_len)
+    char target[4096], ext[1024];
+    int rc = list_target(kv, prefix, ex, resolve, target, sizeof target, ext,
+                         sizeof ext);
+    if (rc != 0)
+        return rc > 0 ? 0 : -1;
+    char **names = NULL;
+    int32_t count = 0;
+    if (list_scan(kv, target, ext, &names, &count) != 0)
         return -1;
-    *out_len = 0;
-    if (!kv || !prefix)
-        return -1;
-    pthread_mutex_lock(&kv->lc_mtx);
-    int rc = list_cached(kv, prefix, ex, resolve);
-    if (rc == 0) {
-        rc = -1;
-        if (idx >= 0 && idx < kv->lc_count) {
-            size_t l = strlen(kv->lc_names[idx]);
-            *out_len = (uint32_t)l;
-            if (buf && l <= buf_cap) {
-                memcpy(buf, kv->lc_names[idx], l);
-                rc = 0;
-            }
-        }
-    }
-    pthread_mutex_unlock(&kv->lc_mtx);
-    return rc;
+    for (int32_t i = 0; i < count; i++)
+        free(names[i]);
+    free(names);
+    *out_count = count;
+    return 0;
 }
 int kvspaceShmExtindex(kvspace_t *kv, const char *p, const char *ep,
                        char *err, uint32_t err_cap) {
@@ -4039,65 +3300,664 @@ int kvspaceShmDelextindex(kvspace_t *kv, const char *p) {
     return kvspaceShmDel(kv, p);
 }
 
-/* ============ Watch/Notify ============ */
-static int wslot(const char *k) {
-    uint32_t h = 5381;
-    for (const char *p = k; *p; p++)
-        h = ((h << 5) + h) + (uint8_t)*p;
-    return (int)(h % WATCH_TABLE_SZ);
+/* ============ 存储层 ABI 原语（<kvspace/kvspace.h>） ============
+ *
+ * 原语只被本文件的 12 个公共函数使用，直接返回 KVSPACE_*，没有第二套
+ * 内部状态码，也没有映射层。 */
+
+/* 与旧指针式接口的差别只有三条，都是 kvspace.h 的契约：
+ *   1. 定位只按 key，不跟 Ptr（旧 Get(resolve=1) 会跟）；
+ *   2. 不认 extindex（旧 List 会展开挂载源）；
+ *   3. 返回**偏移**而非指针（调用方用「本进程基址 + 偏移」自己读写）。
+ *
+ * 写原语统一走 box 生命周期（garb_reserve/garb_commit，与旧 shm_set_local 同源），
+ * 只是把「调用方先备好整条 wire」换成「先给容量，再由调用方填 body」。 */
+
+/* 定位 key 的**值**节点；不跟 Ptr、不跟 ext。 */
+static int storage_locate(kvspace_t *kv, const char *key, int32_t *out_id,
+                          uint64_t *out_offset) {
+    art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
+                              (int)strlen(key));
+    if (!h)
+        return KVSPACE_MISSING;
+    uint64_t hv = art_val_load(h);
+    if (!AV_HAS(hv))
+        return KVSPACE_MISSING;
+    *out_id = art_id_of(kv, h);
+    *out_offset = AV_OFF(hv);
+    return KVSPACE_OK;
 }
-int kvspaceShmNotify(kvspace_t *kv, const char *k, const uint8_t *v,
-                     int32_t vl) {
-    if (!kv || !k)
+
+/* 公共 int64 偏移 → 引擎 anchor 结构。偏移必须落在 ART key 区内、且能反算
+ * 到合法块号；任何越界/错位都拒绝，不猜。 */
+static int anchor_from_offset(kvspace_t *kv, int64_t key_offset,
+                              kvspaceAnchor_t *out) {
+    if (!kv || !out || key_offset <= 0)
         return -1;
-    int s = wslot(k);
-    pthread_mutex_lock(&kv->wlock);
-    watch_t *w = &kv->watches[s];
-    if (w->key[0] && strcmp(w->key, k) == 0) {
-        pthread_mutex_lock(&w->mtx);
-        free(w->val);
-        w->val = v ? memcpy(malloc(vl), v, vl) : NULL;
-        w->val_len = vl;
-        w->ready = true;
-        pthread_cond_signal(&w->cond);
-        pthread_mutex_unlock(&w->mtx);
-    }
-    pthread_mutex_unlock(&kv->wlock);
+    if ((uint64_t)key_offset >= kv->art_meta->total_size)
+        return -1;
+    int64_t block_id = blockid_bydataoffset(kv->art_meta, (uint64_t)key_offset);
+    if (block_id < 0 || (uint64_t)block_id >= kv->art_meta->used_blocks)
+        return -1;
+    out->key_offset = key_offset;
+    out->block_id = (int32_t)block_id;
     return 0;
 }
-uint8_t *kvspaceShmWatch(kvspace_t *kv, const char *k, int32_t to,
-                         int32_t *ol) {
-    if (!kv || !k || !ol)
-        return NULL;
-    *ol = 0;
-    int s = wslot(k);
-    pthread_mutex_lock(&kv->wlock);
-    watch_t *w = &kv->watches[s];
-    strncpy(w->key, k, 255);
-    w->key[255] = '\0';
-    w->ready = false;
-    free(w->val);
-    w->val = NULL;
-    pthread_mutex_unlock(&kv->wlock);
-    pthread_mutex_lock(&w->mtx);
-    if (!w->ready) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += to / 1000;
-        ts.tv_nsec += (to % 1000) * 1000000L;
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
+
+/* anchor 校验：指向的 ART 节点必须仍在 slab 内、且不是 MOVED。
+ *
+ * `art_blk` 只挡 id < 0，越界 id 会算到映射之外——所以这里必须先按 slab 的
+ * 块数自证 id 在范围内，再取节点。anchor 来自调用方（可能是跨进程传的旧值），
+ * 不能假设它可信。
+ *
+ * **两层哨兵别混**：公共 ABI 的 `anchor == 0` 是 root 哨兵，由 `kvspaceResolve`
+ * 在进 `ResolveFrom` 之前就分流掉，根本不会走到这里；到了这里的 `block_id`
+ * 是引擎块号，**0 是合法节点**（`art_id_of` 的失败值才是 -1）。曾经这里写
+ * `<= 0`，于是空库中落在 block 0 的父节点拿到锚点也被判 ANCHOR_INVALID——
+ * 合法值被当成哨兵。 */
+static int storage_anchor_ok(kvspace_t *kv, const kvspaceAnchor_t *anchor) {
+    if (!kv || !anchor || anchor->block_id < 0)
+        return 0;
+    if ((uint64_t)anchor->block_id >= kv->art_meta->used_blocks)
+        return 0;
+    art_hdr_t *h = art_hdr(kv, anchor->block_id);
+    if (!h || h->type == ART_MOVED)
+        return 0;
+    return 1;
+}
+
+int kvspaceShmStorageResolveFrom(kvspace_t *kv, const char *key,
+                                 kvspaceAnchor_t anchor, uint64_t *out_offset) {
+    int32_t id = -1;
+    if (!kv || !key || !out_offset)
+        return KVSPACE_INVALID;
+    *out_offset = 0;
+    if (reserved_meta_path(key))
+        return KVSPACE_INVALID;
+    if (kv_sync(kv) != 0)
+        return KVSPACE_BACKEND;
+    if (!storage_anchor_ok(kv, &anchor))
+        return KVSPACE_ANCHOR_INVALID;
+    return storage_locate(kv, key, &id, out_offset);
+}
+
+/* 进程内值区基址（地址空间访问器）。地址 = 基址 + value_offset。
+ * 基址在进程生命周期内稳定：region_attach 先预留 VA，region_grow 用
+ * MAP_FIXED 在同一 VA 上扩，故扩容前后 base 不变。
+ * 跨进程只传 offset，不传 base（各进程 VA 不同）。 */
+uint8_t *kvspaceShmStorageDataBase(kvspace_t *kv) {
+    return kv ? kv->sbo_data : NULL;
+}
+
+int kvspaceShmStorageResolve(kvspace_t *kv, const char *key,
+                             uint64_t *out_offset) {
+    int32_t id = -1;
+    if (!kv || !key || !out_offset)
+        return KVSPACE_INVALID;
+    *out_offset = 0;
+    if (reserved_meta_path(key))
+        return KVSPACE_INVALID;
+    if (kv_sync(kv) != 0)
+        return KVSPACE_BACKEND;
+    return storage_locate(kv, key, &id, out_offset);
+}
+
+#ifdef P2_TEST_HOOKS
+/* benchmark-only：已存在父节点 key → 公共 int64 anchor（= ART key 区字节偏移）。
+ *
+ * 锚点就是 `blockdata_offset(art_meta, block_id)`——与 `anchor_from_offset` 的
+ * 反算互逆。三条拒绝路径各自对应一种「锚点不可用」：节点不在（MISSING）、
+ * 节点存在但值槽为空（MISSING，与 storage_locate 同判据）、反算不出合法块号
+ * （BACKEND）。**不造值**：算不出来就失败，让调用方看到真实状态。 */
+int kvspaceShmTestAnchorOf(kvspace_t *kv, const char *parent_key,
+                           int64_t *out_anchor) {
+    if (!kv || !parent_key || !out_anchor)
+        return KVSPACE_INVALID;
+    /* 不在入口清零：失败时调用方看到的是「没被写过」而不是「写了个 0」。
+     * 0 是合法偏移语义里的根锚点，用它当失败标志会把两件事混成一件。 */
+    if (reserved_meta_path(parent_key))
+        return KVSPACE_INVALID;
+    if (kv_sync(kv) != 0)
+        return KVSPACE_BACKEND;
+    art_hdr_t *h = art_search(kv, kv->hdr->art_root,
+                              (const uint8_t *)parent_key,
+                              (int)strlen(parent_key));
+    if (!h || !AV_HAS(art_val_load(h)))
+        return KVSPACE_MISSING;
+    /* 块号 0 合法（`art_id_of` 的失败值是 -1），故判 `id < 0` 而非 `id <= 0`。 */
+    int32_t id = art_id_of(kv, h);
+    if (id < 0)
+        return KVSPACE_BACKEND;
+    if ((uint64_t)id >= kv->art_meta->used_blocks)
+        return KVSPACE_BACKEND;
+    if (art_hdr(kv, id)->type == ART_MOVED)
+        return KVSPACE_BACKEND;
+    int64_t offset = (int64_t)blockdata_offset(kv->art_meta, (uint64_t)id);
+    if (offset <= 0)
+        return KVSPACE_BACKEND;
+    *out_anchor = offset;
+    return KVSPACE_OK;
+}
+#endif
+
+/* 写 head（bodylen/attrslen/padding）。attr 与 body 的内容是调用方的。 */
+static void storage_write_head(uint8_t *dst, uint64_t body_len,
+                               uint64_t attr_len) {
+    kvspaceXvalueHead h;
+    memset(&h, 0, sizeof h);
+    kvspaceXvalueHeadSetLen(&h, body_len);
+    kvspaceXvalueHeadSetAttrsLen(&h, (uint16_t)attr_len);
+    memcpy(dst, &h, sizeof h);
+}
+
+/* 唯一写原语的内核：不存在则创建（清零）；存在则容量内原地、超容量搬移。
+ * 返回 KVSPACE_*，成功时 *out_offset 是新偏移。 */
+int kvspaceShmStorageRealloc(kvspace_t *kv, const char *key,
+                             uint64_t body_len, uint64_t attr_len,
+                             uint64_t *out_offset) {
+    if (!kv || !key || !out_offset)
+        return KVSPACE_INVALID;
+    *out_offset = 0;
+    if (reserved_meta_path(key) || strstr(key, "//") ||
+        strlen(key) >= 1024)
+        return KVSPACE_INVALID;
+    if (attr_len > UINT16_MAX)
+        return KVSPACE_INVALID;
+    uint64_t need = KVSPACE_XVALUE_HEAD_LEN + body_len;
+    if (need < body_len || need > UINT64_MAX - attr_len)
+        return KVSPACE_INVALID;
+    need += attr_len;
+    if (need > INT32_MAX)
+        return KVSPACE_INVALID;
+    if (kv_sync(kv) != 0)
+        return KVSPACE_BACKEND;
+
+    art_hdr_t *node = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
+                                 (int)strlen(key));
+    uint64_t ohv = node ? art_val_load(node) : 0;
+    bool retiring = node && AV_HAS(ohv);
+    uint64_t gidx = 0;
+    uint64_t old_cap = 0;
+    if (retiring) {
+        uint64_t off = AV_OFF(ohv);
+        old_cap = sbo_allocated_size(kv->sbo_meta, off);
+        if (need <= old_cap) {
+            /* 容量内原地：只重写 head，body/attr 由调用方按新 head 覆盖。
+               旧偏移继续有效——这正是契约允许的「原地」分支。 */
+            kv_gens_t *g = gens_at(kv, art_id_of(kv, node));
+            if (g)
+                __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
+            storage_write_head(kv->sbo_data + off, body_len, attr_len);
+            if (g)
+                __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
+            *out_offset = off;
+            return KVSPACE_OK;
         }
-        pthread_cond_timedwait(&w->cond, &w->mtx, &ts);
+        if (garb_reserve(kv, &gidx) != 0)
+            return KVSPACE_BACKEND;
     }
-    uint8_t *r = NULL;
-    if (w->ready && w->val) {
-        r = w->val;
-        *ol = w->val_len;
-        w->val = NULL;
+    uint64_t off = kv_sbo_alloc(kv, (size_t)need);
+    if (off == (uint64_t)-1) {
+        if (retiring)
+            garb_cancel(kv, gidx);
+        return KVSPACE_BACKEND;
     }
-    w->ready = false;
-    pthread_mutex_unlock(&w->mtx);
-    return r;
+    /* 新建与搬移都清零：契约写明「不存在则创建清零」，搬移也走同一条路径，
+       省掉「新盒子里有上一手残留」这种只在一半用例里出现的行为。
+       清零之后立刻写 head——body/attr 的内容是调用方的，但 head 是本原语的
+       职责，漏写就会读出一份全零的 head。 */
+    memset(kv->sbo_data + off, 0, (size_t)need);
+    storage_write_head(kv->sbo_data + off, body_len, attr_len);
+    int32_t root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)key,
+                           (int)strlen(key), 0, off);
+    if (root < 0) {
+        if (retiring)
+            garb_cancel(kv, gidx);
+        kv_sbo_free(kv, off);
+        return KVSPACE_BACKEND;
+    }
+    kv->hdr->art_root = root;
+    {
+        int32_t nid = p2_node_at(kv, key);
+        kv_gens_t *g = gens_at(kv, nid);
+        if (g) {
+            gen_bump_struct(kv, nid);
+            gen_bump_value(kv, nid);
+        }
+    }
+    if (retiring)
+        garb_commit(kv, gidx, AV_OFF(ohv), old_cap);
+    else
+        list_gen_bump(kv);
+    *out_offset = off;
+    return KVSPACE_OK;
+}
+
+/* 是否索引 key：尾 `/` 或 U+00B7（`·`）。目录身份 = key 形状，不靠元数据。 */
+static int storage_is_index_key(const char *key) {
+    size_t n = strlen(key);
+    if (n == 0)
+        return 0;
+    if (key[n - 1] == '/')
+        return 1;
+    return n >= 2 && (unsigned char)key[n - 2] == 0xC2 &&
+           (unsigned char)key[n - 1] == 0xB7;
+}
+
+/* 该索引是否还有直接物理子项（不看 extindex）。 */
+static int storage_has_children(kvspace_t *kv, const char *key) {
+    keyscan_t children = {0};
+    char buf[4096];
+    int rc = 0;
+    if (kv->hdr->art_root < 0)
+        return KVSPACE_OK;
+    if (art_scan_pfx(kv, key, (int)strlen(key), buf, (int)sizeof buf,
+                     &children) != 0) {
+        keyscan_free(&children);
+        return KVSPACE_BACKEND;
+    }
+    if (children.count > 0)
+        rc = KVSPACE_HAS_CHILDREN;
+    keyscan_free(&children);
+    return rc;
+}
+
+int kvspaceShmStorageFree(kvspace_t *kv, const char *key) {
+    if (!kv || !key)
+        return KVSPACE_INVALID;
+    if (reserved_meta_path(key) || strlen(key) >= 1024)
+        return KVSPACE_INVALID;
+    if (kv_sync(kv) != 0)
+        return KVSPACE_BACKEND;
+    /* 索引：有子项就拒（ENOTEMPTY），空索引连节点一起删。 */
+    if (storage_is_index_key(key)) {
+        char *d = edir(key);
+        int child_rc = storage_has_children(kv, d);
+        free(d);
+        if (child_rc != KVSPACE_OK)
+            return child_rc;
+    }
+    int rc = shm_del_key(kv, key);
+    if (rc < 0)
+        return KVSPACE_BACKEND;
+    if (rc == 0)
+        return KVSPACE_MISSING;
+    list_gen_bump(kv);
+    return KVSPACE_OK;
+}
+
+/* 建 index 位置：key 必须尾 `/` 或 `·`；幂等；只保证位置存在，body/langtype
+ * 由上层用 realloc 填。无 capacity 参数。 */
+int kvspaceShmStorageMakeindex(kvspace_t *kv, const char *key) {
+    if (!kv || !key)
+        return KVSPACE_INVALID;
+    if (reserved_meta_path(key) || strlen(key) >= 1024 ||
+        strstr(key, "//"))
+        return KVSPACE_INVALID;
+    if (!storage_is_index_key(key))
+        return KVSPACE_INVALID;
+    uint64_t off = 0;
+    int rc = kvspaceShmStorageResolve(kv, key, &off);
+    if (rc == KVSPACE_OK)
+        return KVSPACE_OK; /* 幂等：已存在即成功，不覆盖上层写过的 body */
+    if (rc != KVSPACE_MISSING)
+        return rc;
+    /* 新尺度：0 字节 body + 0 attr —— 上层随后用 realloc 写 body/langtype。 */
+    rc = kvspaceShmStorageRealloc(kv, key, 0, 0, &off);
+    return rc;
+}
+
+/* key（两种形态都查）是否还有 live value：
+ * 带尾 `/` 的目录形态，或去掉尾分隔符的值形态。deltree 两种都会删，
+ * 所以存在性判断必须两种都看。 */
+/* 判「这个 key 存不存在」，**按 key 形态分开问**：
+ *
+ *   - 索引形态（尾 `/` 或 `·`）：问的是「这里有没有一个目录」。有根值、
+ *     **或者有后代**，都算存在——`/only/child/` 存在就意味着 `/only/` 这个
+ *     目录存在（即便它自己没有根值）。目录身份由 key 形状决定，不靠根值。
+ *   - 值形态（无尾分隔符）：问的是「这里有没有一个值」。只查 key 自身与其
+ *     目录形态；**不把后代算作存在**——`/only` 与 `/only/` 是两个不同的 key
+ *     形态，前者没有值就是 NOT_INDEX，不能借着后者的后代说自己存在。
+ *
+ * 这个区分是 `resolve` 与 `listlen` 语义不同的根源：`resolve` 问值（索引无根值
+ * 时 MISSING 是对的），`listlen` 问子项（有后代就该 OK）。 */
+static int storage_key_exists(kvspace_t *kv, const char *key) {
+    if (!kv || !key)
+        return 0;
+    art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
+                              (int)strlen(key));
+    if (h && AV_HAS(art_val_load(h)))
+        return 1;
+
+    if (storage_is_index_key(key)) {
+        /* 索引形态：有后代即存在（空索引由调用方按 OK/0/0 处理）。 */
+        keyscan_t children = {0};
+        char buf[4096];
+        int rc = 0;
+        if (kv->hdr->art_root >= 0)
+            rc = art_scan_pfx(kv, key, (int)strlen(key), buf, (int)sizeof buf,
+                              &children);
+        int has = rc == 0 && children.count > 0;
+        keyscan_free(&children);
+        return has;
+    }
+
+    /* 值形态：再看同名目录形态有没有根值（deltree 两种都删）。 */
+    size_t n = strlen(key);
+    char dir[1024];
+    if (n == 0 || n + 2 > sizeof dir)
+        return 0;
+    memcpy(dir, key, n);
+    dir[n] = '/';
+    dir[n + 1] = 0;
+    h = art_search(kv, kv->hdr->art_root, (const uint8_t *)dir, (int)strlen(dir));
+    return h && AV_HAS(art_val_load(h));
+}
+
+/* 三态判据（listlen 与 list 共用），顺序不可交换：
+ *   1. key 不存在（按形态问，见 `storage_key_exists`）⇒ MISSING
+ *   2. key 存在但不是索引形态                        ⇒ NOT_INDEX
+ *   3. 其余交给 storage_children（空索引 ⇒ OK/0/0）
+ *
+ * **先存在性、后形态**：`listlen("/never")` 既不存在的 key 也不是索引，
+ * 报 MISSING 才是对的——「不存在」是更基本的事实，形态判断只对存在的 key 有意义。
+ * 反过来先判形态，会让「不存在的普通 key」得到 NOT_INDEX，调用方据此以为
+ * 「这个 key 存在但用错了接口」，从而掩盖真正的缺失。
+ *
+ * 注意值形态的存在性**包含**「它有根值，或它的目录形态有根值」：`/only` 自身
+ * 没值、但 `/only/` 有值（或反过来）时，`/only` 这个 key 是存在的，
+ * 于是走到这里得到 NOT_INDEX 而不是 MISSING。 */
+static int storage_index_state(kvspace_t *kv, const char *key) {
+    if (!storage_is_index_key(key))
+        return storage_key_exists(kv, key) ? KVSPACE_NOT_INDEX : KVSPACE_MISSING;
+    if (!storage_key_exists(kv, key))
+        return KVSPACE_MISSING;
+    return KVSPACE_OK;
+}
+
+/* 直接子项原始列表：后端顺序（不排序），名字按 list 的同一字节串计
+ * （目录项带尾 `/`）。只列物理子项，不展开 extindex。
+ *
+ * **索引不存在 ≠ 空索引**：key 没有 live value 且没有子项 ⇒ MISSING；
+ * 只有 key 存在（有值）但没有成员，才是 OK + 空列表。这条判据不靠「扫出来
+ * 0 条」推断——ART 删值后节点还在（墓碑），扫出 0 条既可能是空目录，
+ * 也可能是整个 key 都不存在，必须回头查 key 本身。 */
+static int storage_children(kvspace_t *kv, const char *key, keyscan_t *out) {
+    char buf[4096];
+    if (kv->hdr->art_root >= 0 &&
+        art_scan_pfx(kv, key, (int)strlen(key), buf, (int)sizeof buf, out) != 0) {
+        keyscan_free(out);
+        return KVSPACE_BACKEND;
+    }
+    if (out->count == 0 && !storage_key_exists(kv, key))
+        return KVSPACE_MISSING;
+    return KVSPACE_OK;
+}
+
+/* 索引键归一化为枚举前缀（尾 `·` 换成 `·` 本身即可，尾 `/` 原样）。 */
+static int storage_list_prefix(const char *key, char *out, size_t cap) {
+    size_t n = strlen(key);
+    if (n == 0 || n >= cap)
+        return KVSPACE_INVALID;
+    memcpy(out, key, n + 1);
+    return KVSPACE_OK;
+}
+
+int kvspaceShmStorageListlen(kvspace_t *kv, const char *key, int64_t *out_count,
+                             uint32_t *out_max_name_length) {
+    if (!kv || !key || !out_count || !out_max_name_length)
+        return KVSPACE_INVALID;
+    *out_count = 0;
+    *out_max_name_length = 0;
+    if (reserved_meta_path(key) || strlen(key) >= 1024)
+        return KVSPACE_INVALID;
+    if (kv_sync(kv) != 0)
+        return KVSPACE_BACKEND;
+    int rc = storage_index_state(kv, key);
+    if (rc != KVSPACE_OK)
+        return rc;
+    char pfx[1024];
+    rc = storage_list_prefix(key, pfx, sizeof pfx);
+    if (rc != KVSPACE_OK)
+        return rc;
+    keyscan_t children = {0};
+    rc = storage_children(kv, pfx, &children);
+    if (rc != KVSPACE_OK)
+        return rc;
+    uint32_t max_len = 0;
+    for (int32_t i = 0; i < children.count; i++) {
+        size_t n = strlen(children.keys[i]);
+        if (n > max_len)
+            max_len = (uint32_t)n;
+    }
+    *out_count = children.count;
+    *out_max_name_length = max_len;
+    keyscan_free(&children);
+    return KVSPACE_OK;
+}
+
+int kvspaceShmStorageList(kvspace_t *kv, const char *key, char *out_names,
+                          uint32_t out_capacity, uint32_t *out_length,
+                          uint32_t *out_count, uint64_t *out_generation) {
+    if (!kv || !key)
+        return KVSPACE_INVALID;
+    if (out_length)
+        *out_length = 0;
+    if (out_count)
+        *out_count = 0;
+    if (out_generation)
+        *out_generation = 0;
+    if (reserved_meta_path(key) || strlen(key) >= 1024)
+        return KVSPACE_INVALID;
+    if (kv_sync(kv) != 0)
+        return KVSPACE_BACKEND;
+    int rc = storage_index_state(kv, key);
+    if (rc != KVSPACE_OK)
+        return rc;
+    char pfx[1024];
+    rc = storage_list_prefix(key, pfx, sizeof pfx);
+    if (rc != KVSPACE_OK)
+        return rc;
+    keyscan_t children = {0};
+    rc = storage_children(kv, pfx, &children);
+    if (rc != KVSPACE_OK)
+        return rc;
+    uint64_t total = 0;
+    for (int32_t i = 0; i < children.count; i++)
+        total += (uint64_t)strlen(children.keys[i]) + 1;
+    if (out_generation)
+        *out_generation = __atomic_load_n(&kv->hdr->list_gen, __ATOMIC_ACQUIRE);
+    if (out_count)
+        *out_count = (uint32_t)children.count;
+    if (out_length)
+        *out_length = (uint32_t)total;
+    /* out_names == NULL：只回报长度/个数/generation。 */
+    if (out_names != NULL) {
+        if (total > out_capacity) {
+            /* 容量不足：仍写出所需值，不截断。 */
+            keyscan_free(&children);
+            return KVSPACE_CAPACITY;
+        }
+        char *p = out_names;
+        for (int32_t i = 0; i < children.count; i++) {
+            size_t n = strlen(children.keys[i]) + 1;
+            memcpy(p, children.keys[i], n);
+            p += n;
+        }
+    }
+    keyscan_free(&children);
+    return KVSPACE_OK;
+}
+
+
+/* ================================================================
+ * 公共存储 ABI：<kvspace/kvspace.h>
+ *
+ * 本文件是 kvspace-c 的参考实现，只暴露头里声明的符号；内部原语
+ * （kvspaceShm 系列与 storage 系列）不新增公共面。
+ * ================================================================ */
+
+#define KVSPACE_SHM_DEFAULT_SIZE (8ULL * 64 * 64 * 64 * 64)
+
+#if defined(__GNUC__)
+#define KVSPACE_PUBLIC __attribute__((visibility("default")))
+#else
+#define KVSPACE_PUBLIC
+#endif
+
+static int kvspace_dsn_path(const char *dsn, char *out, size_t out_size) {
+    if (!dsn)
+        return -1;
+    const char *separator = strstr(dsn, "://");
+    if (!separator || separator - dsn != 3 || strncmp(dsn, "shm", 3) != 0)
+        return -1;
+    int written = snprintf(out, out_size, "%s", separator + 3);
+    return written > 0 && (size_t)written < out_size ? 0 : -1;
+}
+
+static int kvspace_fail(int status, char *err, uint32_t err_cap,
+                        const char *operation, const char *key) {
+    if (err && err_cap)
+        snprintf(err, err_cap, "kvspace: %s failed at %s", operation,
+                 key ? key : "(null)");
+    return status;
+}
+
+KVSPACE_PUBLIC void *kvspaceConnect(const char *dsn) {
+    char path[1024];
+    if (kvspace_dsn_path(dsn, path, sizeof path) != 0)
+        return NULL;
+    return (void *)kvspaceShmOpen(path, KVSPACE_SHM_DEFAULT_SIZE);
+}
+
+KVSPACE_PUBLIC void kvspaceClose(void *handle) {
+    if (handle)
+        kvspaceShmClose((kvspace_t *)handle);
+}
+
+KVSPACE_PUBLIC uint8_t *kvspaceXvalueInProcessAddress(void *handle) {
+    if (!handle)
+        return NULL;
+    return kvspaceShmStorageDataBase((kvspace_t *)handle);
+}
+
+KVSPACE_PUBLIC int kvspaceResolve(void *handle, const char *key,
+                                 int64_t parent_key_anchor,
+                                 uint64_t *out_value_offset, char *err,
+                                 uint32_t err_cap) {
+    if (!handle || !key || !out_value_offset)
+        return KVSPACE_INVALID;
+    *out_value_offset = 0;
+    int internal;
+    if (parent_key_anchor == KVSPACE_ANCHOR_ROOT) {
+        internal = kvspaceShmStorageResolve((kvspace_t *)handle, key,
+                                            out_value_offset);
+    } else {
+        kvspaceAnchor_t anchor;
+        if (anchor_from_offset((kvspace_t *)handle, parent_key_anchor,
+                               &anchor) != 0)
+            return kvspace_fail(KVSPACE_ANCHOR_INVALID, err, err_cap,
+                                "resolve", key);
+        internal = kvspaceShmStorageResolveFrom((kvspace_t *)handle, key,
+                                                anchor, out_value_offset);
+    }
+    if (internal == KVSPACE_OK)
+        return KVSPACE_OK;
+    return kvspace_fail(internal, err, err_cap, "resolve", key);
+}
+
+KVSPACE_PUBLIC int kvspaceRealloc(void *handle, const char *key,
+                                 uint64_t body_length, uint64_t attr_length,
+                                 uint64_t *out_value_offset, char *err,
+                                 uint32_t err_cap) {
+    if (!handle || !key || !out_value_offset)
+        return KVSPACE_INVALID;
+    *out_value_offset = 0;
+    int internal = kvspaceShmStorageRealloc((kvspace_t *)handle, key,
+                                            body_length, attr_length,
+                                            out_value_offset);
+    if (internal == KVSPACE_OK)
+        return KVSPACE_OK;
+    return kvspace_fail(internal, err, err_cap, "realloc",
+                        key);
+}
+
+KVSPACE_PUBLIC int kvspaceFree(void *handle, const char *key, char *err,
+                               uint32_t err_cap) {
+    if (!handle || !key)
+        return KVSPACE_INVALID;
+    int internal = kvspaceShmStorageFree((kvspace_t *)handle, key);
+    if (internal == KVSPACE_OK)
+        return KVSPACE_OK;
+    return kvspace_fail(internal, err, err_cap, "free", key);
+}
+
+KVSPACE_PUBLIC int kvspaceCp(void *handle, const char *old_key,
+                             const char *new_key, char *err,
+                             uint32_t err_cap) {
+    if (!handle || !old_key || !new_key)
+        return KVSPACE_INVALID;
+    if (kvspaceShmCp((kvspace_t *)handle, old_key, new_key) != 0)
+        return kvspace_fail(KVSPACE_BACKEND, err, err_cap, "cp", old_key);
+    return KVSPACE_OK;
+}
+
+KVSPACE_PUBLIC int kvspaceMkindex(void *handle, const char *key, char *err,
+                                  uint32_t err_cap) {
+    if (!handle || !key)
+        return KVSPACE_INVALID;
+    int internal = kvspaceShmStorageMakeindex((kvspace_t *)handle, key);
+    if (internal == KVSPACE_OK)
+        return KVSPACE_OK;
+    return kvspace_fail(internal, err, err_cap, "mkindex",
+                        key);
+}
+
+KVSPACE_PUBLIC int kvspaceDeltree(void *handle, const char *key, char *err,
+                                  uint32_t err_cap) {
+    if (!handle || !key)
+        return KVSPACE_INVALID;
+    if (kvspaceShmDeltree((kvspace_t *)handle, key) != 0)
+        return kvspace_fail(KVSPACE_BACKEND, err, err_cap, "deltree", key);
+    return KVSPACE_OK;
+}
+
+KVSPACE_PUBLIC int kvspaceCpdir(void *handle, const char *source_key,
+                                const char *destination_key, char *err,
+                                uint32_t err_cap) {
+    if (!handle || !source_key || !destination_key)
+        return KVSPACE_INVALID;
+    if (kvspaceShmCptree((kvspace_t *)handle, source_key, destination_key) != 0)
+        return kvspace_fail(KVSPACE_BACKEND, err, err_cap, "cpdir", source_key);
+    return KVSPACE_OK;
+}
+
+KVSPACE_PUBLIC int kvspaceListlen(void *handle, const char *key,
+                                  int64_t *out_count,
+                                  uint32_t *out_max_name_length, char *err,
+                                  uint32_t err_cap) {
+    if (!handle || !key || !out_count || !out_max_name_length)
+        return KVSPACE_INVALID;
+    *out_count = 0;
+    *out_max_name_length = 0;
+    int internal = kvspaceShmStorageListlen((kvspace_t *)handle, key, out_count,
+                                            out_max_name_length);
+    if (internal == KVSPACE_OK)
+        return KVSPACE_OK;
+    return kvspace_fail(internal, err, err_cap, "listlen",
+                        key);
+}
+
+KVSPACE_PUBLIC int kvspaceList(void *handle, const char *key, char *out_names,
+                               uint32_t out_capacity, uint32_t *out_length,
+                               uint32_t *out_count, uint64_t *out_generation,
+                               char *err, uint32_t err_cap) {
+    if (!handle || !key)
+        return KVSPACE_INVALID;
+    int internal = kvspaceShmStorageList((kvspace_t *)handle, key, out_names,
+                                         out_capacity, out_length, out_count,
+                                         out_generation);
+    if (internal == KVSPACE_OK)
+        return KVSPACE_OK;
+    return kvspace_fail(internal, err, err_cap, "list", key);
 }

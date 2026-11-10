@@ -2,7 +2,7 @@
 
 #define _GNU_SOURCE
 #include "kvspace_shm.h"
-#include <kvspace/xvalue_head.h>
+#include <kvspace/kvlang_xvalue.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +10,9 @@
 #include <unistd.h>
 
 #define SBO_DATA_SIZE (8UL * 64 * 64 * 64 * 64)
+
+static int write_new_body(kvspace_t *kv, const char *key, uint64_t body_len,
+                          uint8_t **body);
 
 static int failures = 0;
 #define CHECK(cond, ...)                                                       \
@@ -166,7 +169,7 @@ static void t_correct(const char *db) {
 
   CHECK(set_int32(kv, "/private", 8) == 0, "overwrite permitted value");
   uint8_t *body = NULL;
-  CHECK(kvspaceShmWriteNewPlace(kv, "/private", 0, 4, 4, "", &body) == 0,
+  CHECK(write_new_body(kv, "/private", 4, &body) == 0,
         "write new permitted place");
   if (body)
     memcpy(body, raw, 4);
@@ -388,6 +391,15 @@ static void t_direct_children(const char *db) {
   expect_children(kv, "/local/", true, extended, 2);
   expect_children(kv, "/dead/", false, NULL, 0);
   kvspaceShmClose(kv);
+}
+
+static int write_new_body(kvspace_t *kv, const char *key, uint64_t body_len,
+                          uint8_t **body) {
+    uint64_t offset = 0;
+    if (kvspaceShmStorageRealloc(kv, key, body_len, 0, &offset) != 0)
+        return -1;
+    *body = kvspaceShmStorageDataBase(kv) + offset + KVSPACE_XVALUE_HEAD_LEN;
+    return 0;
 }
 
 int main(int argc, char **argv) {
